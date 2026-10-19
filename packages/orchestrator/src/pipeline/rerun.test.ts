@@ -64,6 +64,25 @@ vi.mock('./dispatch-matched-workflow.js', async (importOriginal) => {
   };
 });
 
+// Stubs the internal-event pipeline a payload-less re-run dispatches through
+// (it has its own suite), so tests observe the event, context and overrides.
+const internalPipeline = vi.hoisted(() => ({
+  spy: null as null | ((...args: unknown[]) => Promise<unknown>),
+}));
+
+vi.mock('./internal-event-pipeline.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./internal-event-pipeline.js')>();
+  return {
+    ...actual,
+    dispatchInternalEventViaPipeline: (
+      ...args: Parameters<typeof actual.dispatchInternalEventViaPipeline>
+    ) =>
+      internalPipeline.spy
+        ? internalPipeline.spy(...args)
+        : actual.dispatchInternalEventViaPipeline(...args),
+  };
+});
+
 // --- Mock helpers ---
 
 function makeMockDb(run?: Record<string, unknown>) {
@@ -170,6 +189,7 @@ function createMockAgentRegistry() {
 const TERMINAL_RUN = {
   id: 'gen-id',
   run_id: 'original-run-123',
+  customer_id: 'org-7',
   routing_key: 'github:42',
   workflow_name: 'ci',
   status: 'success',
@@ -189,6 +209,14 @@ const TERMINAL_RUN = {
   triggered_by: null,
   cancelled_by: null,
   created_at: new Date('2026-01-01'),
+  original_run_id: null,
+  trigger_event: 'push',
+  subject_trigger_event: null,
+  // The delivery's `event_log` columns: the mock DB serves this row to every
+  // select whose predicates it satisfies, the delivery lookup included.
+  org_id: 'org-7',
+  event: 'push',
+  action: null,
 };
 
 const LOCK_FILE = {
@@ -212,6 +240,13 @@ const LOCK_FILE = {
   ],
 };
 
+const PUSH_EVENT = {
+  type: 'push',
+  payload: {},
+  targetBranch: 'main',
+  provider: 'github',
+};
+
 const PAYLOAD = {
   repository: { full_name: 'owner/repo' },
   ref: 'refs/heads/main',
@@ -227,6 +262,8 @@ describe('handleRerun', () => {
   let executionTracker: ReturnType<typeof createMockExecutionTracker>;
   let platformClient: ReturnType<typeof createMockPlatformClient>;
   let eventRouter: { emit: ReturnType<typeof vi.fn> };
+  let getAllByOrgAndRepo: Mock;
+  let dispatched: Mock<(ctx: Record<string, unknown>) => Promise<unknown>>;
 
   beforeEach(() => {
     idempotency.reset();
@@ -257,32 +294,57 @@ describe('handleRerun', () => {
       buildCoordinator: null,
       pendingBuilds: null,
       coldStore: null,
+      processingDeps: () => ({ registrationIndex: { getAllByOrgAndRepo } }) as any,
     };
+    providerBundle.normalizer.normalizeEvent.mockReturnValue(PUSH_EVENT);
+    getAllByOrgAndRepo = vi.fn(() => []);
+    dispatched = vi.fn<(ctx: Record<string, unknown>) => Promise<unknown>>().mockResolvedValue({});
+    pipeline.spy = dispatched;
   });
 
-  it('loads original run from DB, reads payload, re-fetches lock file, dispatches jobs with parent_run_id', async () => {
-    const result = await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
+  afterEach(() => {
+    pipeline.spy = null;
+  });
 
-    expect(result.newRunId).toBeDefined();
-    expect(typeof result.newRunId).toBe('string');
+  /** The context the re-run handed the shared pipeline. */
+  function dispatchedCtx(): Record<string, any> {
+    expect(dispatched).toHaveBeenCalledTimes(1);
+    return dispatched.mock.calls[0][0] as Record<string, any>;
+  }
+
+  it("re-runs through the shared pipeline with the original run's org, repository, commit and lineage", async () => {
+    const result = await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
 
     expect(logStorage.read).toHaveBeenCalledWith(
       'executions/original-run-123/webhook-payload.json',
     );
-
-    // The lock file is re-fetched at the original SHA.
     expect(providerBundle.lockFileFetcher!.fetchLockFile).toHaveBeenCalledWith(
       'owner/repo',
       'abc123def',
       expect.objectContaining({ installationId: 42 }),
     );
-
-    expect(dispatcher.dispatch).toHaveBeenCalled();
-    const dispatchArg = dispatcher.dispatch.mock.calls[0][0];
-    expect(dispatchArg.workflowName).toBe('ci');
-    expect(dispatchArg.sha).toBe('abc123def');
-
-    expect(executionTracker.onExecutionStarted).toHaveBeenCalled();
+    // fails-when: the re-run hand-builds its own job config instead of going
+    // through the pipeline, which drops needs ordering, contexts, containers
+    // and the cache identity every artifact request is resolved against
+    const ctx = dispatchedCtx();
+    expect(ctx).toMatchObject({
+      runId: result.newRunId,
+      resolvedOrgId: 'org-7',
+      repoIdentifier: 'owner/repo',
+      workflowRepoIdentifier: 'owner/repo',
+      ref: 'abc123def',
+      triggerEventOverride: 'rerun',
+      triggeredBy: 'user@test.com',
+      rerunLineage: { parentRunId: 'original-run-123', originalRunId: 'original-run-123' },
+      subjectTriggerEvent: 'push',
+      securityDecision: { action: 'pass' },
+      decision: { workflowName: 'ci', matched: true },
+      info: { routingKey: 'github:42', event: 'push', deliveryId: `rerun:${result.newRunId}` },
+    });
+    // A push is trusted, so its jobs write the shared cache scope.
+    expect(ctx.trustResolution?.tier).toBe('trusted');
+    expect(ctx.workflow.jobs.map((j: { name: string }) => j.name)).toEqual(['test']);
+    expect(ctx.global).toBeUndefined();
   });
 
   it('is idempotent on requestId: a failover re-send returns the same run without a second dispatch', async () => {
@@ -290,75 +352,105 @@ describe('handleRerun', () => {
     const first = await handleRerun('original-run-123', 'user@test.com', null, deps, requestId);
     const second = await handleRerun('original-run-123', 'user@test.com', null, deps, requestId);
 
-    // Same run id, not a freshly-minted second run.
     expect(second.newRunId).toBe(first.newRunId);
-    // Only the first hop created + dispatched the run; the re-send short-circuits.
-    expect(dispatcher.dispatch).toHaveBeenCalledTimes(1);
-    expect(executionTracker.onExecutionStarted).toHaveBeenCalledTimes(1);
+    expect(dispatched).toHaveBeenCalledTimes(1);
   });
 
-  it('re-materializes a matrix job into N dispatches each carrying matrixValues', async () => {
+  it('re-runs only the declared static jobs, without evaluating the workflow filter again', async () => {
     providerBundle.lockFileFetcher!.fetchLockFile.mockResolvedValue({
       ...LOCK_FILE,
       workflows: [
         {
-          name: 'ci',
-          source: '.kici/workflows/ci.ts',
-          contentHash: 'content-hash-1',
-          triggers: [{ _type: 'push', branches: ['main'] }],
+          ...LOCK_FILE.workflows[0],
+          hasFilter: true,
           jobs: [
-            staticJob({
-              name: 'test',
-              runsOn: [{ kind: 'exact', value: 'default' }],
-              steps: [{ name: 'run tests', run: 'npm test' }],
-              matrix: { _type: 'static', values: { variant: ['a', 'b'] } },
-            }),
+            ...LOCK_FILE.workflows[0].jobs,
+            { _type: 'dynamic', name: 'gen', source: '.kici/workflows/ci.ts' },
           ],
         },
       ],
     });
 
-    await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
+    await handleRerun('original-run-123', null, null, deps, 'req-test');
 
-    expect(dispatcher.dispatch).toHaveBeenCalledTimes(2);
-    const calls = dispatcher.dispatch.mock.calls.map((c: any[]) => c[0]);
-    const byName = Object.fromEntries(calls.map((c: any) => [c.jobName, c]));
-    expect(Object.keys(byName).sort()).toEqual(['test (a)', 'test (b)']);
-    expect(byName['test (a)'].jobConfig.matrixValues).toEqual({ variant: 'a' });
-    expect(byName['test (b)'].jobConfig.matrixValues).toEqual({ variant: 'b' });
-    expect(byName['test (a)'].jobConfig.baseJobName).toBe('test');
-    expect(byName['test (a)'].jobConfig.matrix).toBeUndefined();
+    const ctx = dispatchedCtx();
+    expect(ctx.workflow.jobs.map((j: { name: string }) => j.name)).toEqual(['test']);
+    expect(ctx.workflow.hasFilter).toBeUndefined();
+    expect(ctx.fullLockFile.workflows).toEqual([ctx.workflow]);
   });
 
-  it("carries the lock job's declared gitCredentials into the re-run job config", async () => {
-    const declared = { default: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' } };
-    providerBundle.lockFileFetcher!.fetchLockFile.mockResolvedValue({
-      ...LOCK_FILE,
-      workflows: [
-        {
-          name: 'ci',
-          source: '.kici/workflows/ci.ts',
-          contentHash: 'content-hash-1',
-          triggers: [{ _type: 'push', branches: ['main'] }],
-          jobs: [
-            staticJob({
-              name: 'test',
-              runsOn: [{ kind: 'exact', value: 'default' }],
-              steps: [{ name: 'run tests', run: 'npm test' }],
-              gitCredentials: declared,
-            }),
-          ],
-        },
-      ],
+  /** A fork pull request run, in an org whose stored trust policy is `forkPolicy`. */
+  function forkPrRun(forkPolicy: 'hold' | 'ignore' | 'allow'): void {
+    (providerBundle as any).hasForkModel = true;
+    deps.processingDeps = () =>
+      ({
+        registrationIndex: { getAllByOrgAndRepo },
+        trustPolicyStore: { get: async () => ({ forkPolicy, approvalExpirySeconds: 3600 }) },
+      }) as any;
+    providerBundle.normalizer.normalizeEvent.mockReturnValue({
+      type: 'pull_request',
+      action: 'opened',
+      payload: {},
+      targetBranch: 'main',
+      baseBranch: 'main',
+      sourceBranch: 'patch-1',
+      headRepo: 'attacker/repo',
+      isForkPR: true,
+      senderUsername: 'mallory',
+      provider: 'github',
     });
+    deps.db = makeMockDb({
+      ...TERMINAL_RUN,
+      trigger_event: 'pull_request:opened',
+      event: 'pull_request',
+      action: 'opened',
+    }) as any;
+  }
 
-    await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
+  it("reads an untrusted fork pull request's lock file from its base branch, as the run did", async () => {
+    forkPrRun('hold');
 
-    // `routeOrDispatchJobs` persists the same map on the job row, which the
-    // credential relay authorizes against. Without it a re-run's map is empty:
-    // `credential: 'x'` throws and `default` silently uses the source credential.
-    const dispatched = dispatcher.dispatch.mock.calls[0][0];
-    expect(dispatched.jobConfig.gitCredentials).toEqual(declared);
+    await handleRerun('original-run-123', null, null, deps, 'req-fork');
+
+    // fails-when: the re-run reads the fork's own lock file at its head commit
+    expect(providerBundle.lockFileFetcher!.fetchLockFile).toHaveBeenCalledWith(
+      'owner/repo',
+      'main',
+      expect.anything(),
+    );
+    const ctx = dispatchedCtx();
+    expect(ctx.lockFileSource).toBe('base');
+    expect(ctx.trustResolution?.tier).not.toBe('trusted');
+    // Re-running is not approving: the org holds fork pull requests, so the
+    // re-run is held again, as its delivery was.
+    // fails-when: the re-run passes the trust-policy gate unconditionally
+    expect(ctx.securityDecision.action).toBe('hold');
+    // The commit under test is still the head the run built.
+    expect(ctx.ref).toBe('abc123def');
+    expect(ctx.subjectTriggerEvent).toBe('pull_request:opened');
+  });
+
+  it('refuses a fork pull request re-run the trust policy now ignores, before claiming a run id', async () => {
+    forkPrRun('ignore');
+
+    // fails-when: the re-run claims a run id the ignored dispatch never creates
+    await expect(handleRerun('original-run-123', null, null, deps, 'req-ignored')).rejects.toThrow(
+      /the organization trust policy ignores the event it ran for/,
+    );
+    expect(dispatched).not.toHaveBeenCalled();
+    // breaks-if-wrong: the same request id stays unclaimed, so a later re-run can use it
+    forkPrRun('allow');
+    await handleRerun('original-run-123', null, null, deps, 'req-ignored');
+    expect(dispatched).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a webhook run whose delivery is no longer in the event log', async () => {
+    deps.db = makeMockDb({ ...TERMINAL_RUN, org_id: 'another-org' }) as any;
+
+    await expect(handleRerun('original-run-123', null, null, deps, 'req-test')).rejects.toThrow(
+      /Cannot re-run run original-run-123: the event it ran for is no longer stored/,
+    );
+    expect(dispatched).not.toHaveBeenCalled();
   });
 
   it('fails with error if run is not in terminal state (running -> error)', async () => {
@@ -381,20 +473,192 @@ describe('handleRerun', () => {
     );
   });
 
-  it('succeeds with no payload (cron/schedule runs) — no payload stored for new run', async () => {
-    logStorage = createMockLogStorage(null);
-    logStorage.read.mockResolvedValue({ data: null, cursor: 0, complete: true });
-    deps.logStorage = logStorage as any;
+  describe('a run the orchestrator started', () => {
+    // The pipeline stores every run's payload, so these runs have one too: the
+    // harness default serves PAYLOAD. Their delivery is not in the event log.
+    let internalDispatched: Mock<(...args: unknown[]) => Promise<unknown>>;
 
-    const result = await handleRerun('original-run-123', null, null, deps, 'req-test');
+    beforeEach(() => {
+      internalDispatched = vi.fn<(...args: unknown[]) => Promise<unknown>>().mockResolvedValue({});
+      internalPipeline.spy = internalDispatched;
+    });
 
-    expect(result.newRunId).toBeDefined();
-    expect(logStorage.append).not.toHaveBeenCalled();
-    expect(dispatcher.dispatch).toHaveBeenCalled();
+    afterEach(() => {
+      internalPipeline.spy = null;
+    });
 
-    const trackerCall = executionTracker.onExecutionStarted.mock.calls[0];
-    // commitMessage (arg 13, 0-indexed) is undefined: no payload to extract from.
-    expect(trackerCall[13]).toBeUndefined();
+    /** The (lock file, context, overrides) the re-run handed the internal-event pipeline. */
+    function internalCall(): { lockFile: any; ctx: any; overrides: any } {
+      expect(internalDispatched).toHaveBeenCalledTimes(1);
+      const [, lockFile, ctx, , overrides] = internalDispatched.mock.calls[0];
+      return { lockFile, ctx, overrides };
+    }
+
+    it("fires a schedule again at the recorded commit, on the registration's default branch", async () => {
+      deps.db = makeMockDb({ ...TERMINAL_RUN, trigger_event: 'schedule' }) as any;
+      getAllByOrgAndRepo.mockReturnValue([{ workflowName: 'ci', defaultBranch: 'trunk' }]);
+
+      // fails-when: the stored payload sends a cron run down the webhook path,
+      // which finds no event log row and refuses
+      const result = await handleRerun('original-run-123', null, null, deps, 'req-cron');
+
+      expect(getAllByOrgAndRepo).toHaveBeenCalledWith('org-7', 'owner/repo');
+      const { lockFile, ctx, overrides } = internalCall();
+      expect(ctx).toMatchObject({
+        event: { eventName: '__schedule_fire', payload: { commitSha: 'abc123def' } },
+        cronCommitSha: 'abc123def',
+        registrationDefaultBranch: 'trunk',
+        routingKey: 'github:42',
+        repoIdentifier: 'owner/repo',
+      });
+      expect(overrides).toMatchObject({
+        runId: result.newRunId,
+        triggerEvent: 'rerun',
+        rerunLineage: { parentRunId: 'original-run-123' },
+        subjectTriggerEvent: 'schedule',
+      });
+      expect(lockFile.workflows.map((w: { name: string }) => w.name)).toEqual(['ci']);
+      expect(dispatched).not.toHaveBeenCalled();
+    });
+
+    it('re-runs a schedule fired by hand the same way', async () => {
+      deps.db = makeMockDb({ ...TERMINAL_RUN, trigger_event: 'manual_schedule' }) as any;
+
+      await handleRerun('original-run-123', null, null, deps, 'req-manual');
+
+      expect(internalCall().ctx.event.eventName).toBe('__schedule_fire');
+    });
+
+    /**
+     * A per-table fake: the shared mock DB serves one row to every select, so it
+     * cannot give the emitting run another organization than the re-run.
+     */
+    function tablesDb(rows: {
+      runs: Record<string, Record<string, unknown>>;
+      event_log?: Record<string, unknown>;
+      kici_events?: Record<string, unknown>;
+    }) {
+      return {
+        selectFrom: (table: string) => {
+          let runId: unknown;
+          const chain: any = {
+            select: () => chain,
+            selectAll: () => chain,
+            where: (col: string, _op: string, value: unknown) => {
+              if (col === 'run_id') runId = value;
+              return chain;
+            },
+            executeTakeFirst: async () =>
+              table === 'execution_runs'
+                ? rows.runs[String(runId)]
+                : (rows as Record<string, unknown>)[table],
+          };
+          return chain;
+        },
+      };
+    }
+
+    it("refuses another organization's stored event that carries this run's delivery id", async () => {
+      const eventId = '0f8fad5b-d9cb-469f-a165-70867728950e';
+      const run = { ...TERMINAL_RUN, trigger_event: 'deploy-done', delivery_id: eventId };
+      deps.db = tablesDb({
+        runs: {
+          'original-run-123': run,
+          'run-of-org-9': { customer_id: 'org-9' },
+        },
+        kici_events: {
+          id: eventId,
+          event_name: 'deploy-done',
+          payload: '{}',
+          source_run_id: 'run-of-org-9',
+          source_routing_key: null,
+        },
+      }) as any;
+
+      // fails-when: the event is read by id alone, so this org re-runs org-9's event
+      await expect(
+        handleRerun('original-run-123', null, null, deps, 'req-foreign'),
+      ).rejects.toThrow(/the event it ran for is no longer stored/);
+      expect(internalDispatched).not.toHaveBeenCalled();
+    });
+
+    it('re-runs a summoned run from its stored payload, inheriting its summoner', async () => {
+      deps.db = makeMockDb({
+        ...TERMINAL_RUN,
+        trigger_event: 'build-docs',
+        delivery_id: 'invoke-5d2f',
+        summoned_by_run_id: 'summoner-run',
+        chain_depth: 1,
+        org_id: 'another-org',
+      }) as any;
+
+      // breaks-if-wrong: a summoned run must still re-run, as it did before
+      await handleRerun('original-run-123', null, null, deps, 'req-summoned');
+
+      const { ctx } = internalCall();
+      expect(ctx.event).toEqual({ id: 'invoke-5d2f', eventName: 'build-docs', payload: PAYLOAD });
+      expect(ctx.summonedByRunId).toBe('summoner-run');
+      expect(ctx.chainDepth).toBe(1);
+    });
+
+    it('refuses a summoned run whose stored payload is gone', async () => {
+      logStorage.read.mockResolvedValue({ data: null, cursor: 0, complete: true });
+      deps.db = makeMockDb({
+        ...TERMINAL_RUN,
+        trigger_event: 'build-docs',
+        delivery_id: 'invoke-5d2f',
+        summoned_by_run_id: 'summoner-run',
+        org_id: 'another-org',
+      }) as any;
+
+      // fails-when: the summoned run re-runs with an empty event payload
+      await expect(
+        handleRerun('original-run-123', null, null, deps, 'req-sum-gone'),
+      ).rejects.toThrow(/the event it ran for is no longer stored/);
+      expect(internalDispatched).not.toHaveBeenCalled();
+    });
+
+    it('refuses an internal-event run whose event is no longer stored', async () => {
+      deps.db = makeMockDb({
+        ...TERMINAL_RUN,
+        trigger_event: 'deploy-done',
+        org_id: 'another-org',
+      }) as any;
+
+      // fails-when: the run is re-dispatched with no event at all
+      await expect(handleRerun('original-run-123', null, null, deps, 'req-gone')).rejects.toThrow(
+        /the event it ran for is no longer stored/,
+      );
+      expect(internalDispatched).not.toHaveBeenCalled();
+    });
+
+    it('re-runs an internal-event run with its stored event', async () => {
+      const eventId = '0f8fad5b-d9cb-469f-a165-70867728950e';
+      deps.db = makeMockDb({
+        ...TERMINAL_RUN,
+        trigger_event: 'deploy-done',
+        org_id: 'another-org',
+        chain_depth: 2,
+        delivery_id: eventId,
+        id: eventId,
+        // Emitted by a run of this organization (the mock serves this same row).
+        source_run_id: 'original-run-123',
+        event_name: 'deploy-done',
+        payload: JSON.stringify({ env: 'prod' }),
+      }) as any;
+
+      // breaks-if-wrong: a run whose event is still stored must re-run
+      await handleRerun('original-run-123', null, null, deps, 'req-event');
+
+      // The stored event id, so the re-run inherits the trust of the run that emitted it.
+      expect(internalCall().ctx.event).toEqual({
+        id: eventId,
+        eventName: 'deploy-done',
+        payload: { env: 'prod' },
+      });
+      // The re-run counts toward the invoke-gate bound its first run did.
+      expect(internalCall().ctx.chainDepth).toBe(2);
+    });
   });
 
   it('fails with error if lock file not found at original SHA', async () => {
@@ -547,10 +811,11 @@ describe('handleRerun', () => {
       expect(ctx.info.event).toBe('push');
       expect(ctx.event.sourceRepo).toBe(SOURCE_REPO);
       expect(ctx.securityDecision).toEqual({ action: 'pass' });
-      expect(logStorage.append).toHaveBeenCalledWith(
-        `executions/${result.newRunId}/webhook-payload.json`,
-        JSON.stringify(PAYLOAD),
-      );
+      // The pipeline stores the payload under the new run, once.
+      // fails-when: the re-run also appends it, leaving two concatenated copies
+      // no reader can parse, so a re-run of the re-run loses its payload
+      expect(ctx.payload).toEqual(PAYLOAD);
+      expect(logStorage.append).not.toHaveBeenCalled();
       expect(eventRouter.emit).toHaveBeenCalledWith(
         expect.objectContaining({ eventName: 'workflow.rerun' }),
       );
@@ -757,8 +1022,8 @@ describe('handleRerun', () => {
         's1',
         expect.anything(),
       );
-      expect(dispatched).not.toHaveBeenCalled();
-      expect(dispatcher.dispatch).toHaveBeenCalled();
+      expect(dispatched.mock.calls[0][0]).toMatchObject({ workflowRepoIdentifier: SOURCE_REPO });
+      expect(dispatched.mock.calls[0][0].global).toBeUndefined();
     });
 
     it('allows a rerun when the workflow lives in the repository the run acted on', async () => {
@@ -771,8 +1036,7 @@ describe('handleRerun', () => {
 
       await handleRerun('original-run-123', null, null, deps, 'req-test');
 
-      expect(dispatched).not.toHaveBeenCalled();
-      expect(dispatcher.dispatch).toHaveBeenCalled();
+      expect(dispatched.mock.calls[0][0].global).toBeUndefined();
     });
   });
 
@@ -797,27 +1061,6 @@ describe('handleRerun', () => {
     );
   });
 
-  it('passes parentRunId and triggeredBy to executionTracker.onExecutionStarted', async () => {
-    const result = await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
-
-    expect(executionTracker.onExecutionStarted).toHaveBeenCalled();
-    const call = executionTracker.onExecutionStarted.mock.calls[0];
-    // The last two positional args (0-indexed): parentRunId 14, triggeredBy 15.
-    expect(call[14]).toBe('original-run-123'); // parentRunId
-    expect(call[15]).toBe('user@test.com'); // triggeredBy
-
-    expect(result.newRunId).toBeDefined();
-  });
-
-  it('passes different triggeredBy values correctly', async () => {
-    await handleRerun('original-run-123', 'admin@company.com', null, deps, 'req-test');
-
-    expect(executionTracker.onExecutionStarted).toHaveBeenCalled();
-    const call = executionTracker.onExecutionStarted.mock.calls[0];
-    expect(call[14]).toBe('original-run-123'); // parentRunId
-    expect(call[15]).toBe('admin@company.com'); // triggeredBy
-  });
-
   it('emits workflow.rerun system event via EventRouter', async () => {
     await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
 
@@ -832,68 +1075,12 @@ describe('handleRerun', () => {
     );
   });
 
-  it('dispatches jobs using the existing Dispatcher infrastructure', async () => {
-    const result = await handleRerun('original-run-123', null, null, deps, 'req-test');
+  it('leaves storing the payload to the pipeline, so the new run keeps one parseable copy', async () => {
+    await handleRerun('original-run-123', null, null, deps, 'req-test');
 
-    expect(dispatcher.dispatch).toHaveBeenCalledTimes(1);
-
-    const arg = dispatcher.dispatch.mock.calls[0][0];
-    expect(arg.runId).toBe(result.newRunId);
-    expect(arg.workflowName).toBe('ci');
-    expect(arg.jobName).toBe('test');
-    expect(arg.repoUrl).toBe('https://github.com/owner/repo.git');
-    expect(arg.sha).toBe('abc123def');
-    expect(arg.ref).toBe('main');
-  });
-
-  it('stores payload for the new run', async () => {
-    const result = await handleRerun('original-run-123', null, null, deps, 'req-test');
-
-    // Should store payload for the new run too
-    expect(logStorage.append).toHaveBeenCalledWith(
-      `executions/${result.newRunId}/webhook-payload.json`,
-      JSON.stringify(PAYLOAD),
-    );
-  });
-
-  it('routes via the cluster coordinator when one is available (cross-peer rerun)', async () => {
-    // One job dispatched locally, one rerouted. Guards a rerun proxied to a
-    // peer that cannot satisfy the labels: without coordinator routing the job
-    // sits in dispatch_queue forever.
-    const coordinator = {
-      routeJobs: vi.fn().mockResolvedValue({
-        localJobs: [{ jobName: 'test', jobId: 'local-job-1' }],
-        reroutedJobs: [{ jobName: 'other', peerId: 'host-1-eu' }],
-        failedJobs: [],
-      }),
-    };
-    deps.coordinator = coordinator as any;
-
-    await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
-
-    expect(coordinator.routeJobs).toHaveBeenCalledOnce();
-    const [runCtx, jobs] = coordinator.routeJobs.mock.calls[0];
-    expect(runCtx.routingKey).toBe('github:42');
-    expect(runCtx.event).toBe('rerun');
-    expect(runCtx.sha).toBe('abc123def');
-    expect(runCtx.ref).toBe('main');
-    expect(runCtx.installationId).toBe(42);
-    expect(jobs).toHaveLength(1);
-    expect(jobs[0].jobName).toBe('test');
-    expect(jobs[0].ref).toBe('main');
-    expect(jobs[0].sha).toBe('abc123def');
-    // Inner labels are double-wrapped as required by RunCoordinator
-    expect(jobs[0].runsOnLabels).toEqual([['default']]);
-
-    // The coordinator owns dispatch.
-    expect(dispatcher.dispatch).not.toHaveBeenCalled();
-
-    expect(executionTracker.addJobsToRun).toHaveBeenCalledOnce();
-    const addArgs = executionTracker.addJobsToRun.mock.calls[0];
-    expect(typeof addArgs[0]).toBe('string');
-    expect(addArgs[1]).toEqual([
-      { jobId: 'local-job-1', jobName: 'test', runsOnLabels: ['default'], workflowName: 'ci' },
-    ]);
+    // fails-when: the re-run appends the payload as well as the pipeline
+    expect(dispatchedCtx().payload).toEqual(PAYLOAD);
+    expect(logStorage.append).not.toHaveBeenCalled();
   });
 
   // ── `run.rerun.request` orchestrator-side trust model (security invariant) ──
@@ -926,9 +1113,7 @@ describe('handleRerun', () => {
         ),
       ).rejects.toThrow(/archived to cold storage|chunk could not be replayed/);
 
-      expect(dispatcher.dispatch).not.toHaveBeenCalled();
-      expect(executionTracker.onExecutionStarted).not.toHaveBeenCalled();
-      expect(executionTracker.addJobsToRun).not.toHaveBeenCalled();
+      expect(dispatched).not.toHaveBeenCalled();
       expect(eventRouter.emit).not.toHaveBeenCalled();
 
       // The cold store is consulted with the Platform-supplied routingKeyHint as
@@ -965,11 +1150,7 @@ describe('handleRerun', () => {
       expect(callArgs).toContain(realKey);
       expect(callArgs).not.toContain(attackerHint);
 
-      // The mock buildCloneUrl echoes the repo identifier, so repoUrl proves the
-      // dispatch reached the legitimate provider bundle.
-      expect(dispatcher.dispatch).toHaveBeenCalledTimes(1);
-      const dispatchedJob = dispatcher.dispatch.mock.calls[0][0];
-      expect(dispatchedJob.repoUrl).toBe('https://github.com/owner/repo.git');
+      expect(dispatchedCtx().info.routingKey).toBe(realKey);
     });
   });
 
@@ -1370,82 +1551,23 @@ describe('handleRerun', () => {
       expect(second.newRunId).toBe(first.newRunId);
     });
   });
-  describe('a re-run inherits the original run pull-request head context', () => {
-    /**
-     * A re-run's `trigger_event` is `'rerun'`, with no head of its own, so the
-     * columns are copied from the run being re-run. NULL would render every fork
-     * claim `'unresolved'` (fail-closed, but wrong both ways): a re-run of an ordinary push would fail the
-     * documented `is_fork = 'false'` policy, and a fork PR re-run would leave
-     * unanswered a question the original run answered.
-     */
-    const EVENT_CONTEXT_ARG_INDEX = 26;
-
-    it('copies a fork pull request head onto the re-run row', async () => {
-      deps.db = makeMockDb({
-        ...TERMINAL_RUN,
-        trigger_event: 'pull_request:opened',
-        head_ref: 'patch-1',
-        head_repository: 'attacker/app',
-        is_fork: true,
-      }) as any;
-
-      await handleRerun('original-run-123', null, null, deps, 'req-fork-rerun');
-
-      const call = executionTracker.onExecutionStarted.mock.calls[0];
-      expect(call[EVENT_CONTEXT_ARG_INDEX]).toEqual({
-        headRef: 'patch-1',
-        headRepository: 'attacker/app',
-        isFork: true,
-        subjectTriggerEvent: 'pull_request:opened',
-      });
-      // Positive control: the arg index really is the event context and not some
-      // other positional slot that happens to be an object.
-      expect(call[12]).toBe('rerun');
-    });
-
-    it('carries a push re-run through as a resolved non-fork', async () => {
-      deps.db = makeMockDb({
-        ...TERMINAL_RUN,
-        trigger_event: 'push',
-        head_ref: null,
-        head_repository: null,
-        is_fork: false,
-      }) as any;
-
-      await handleRerun('original-run-123', null, null, deps, 'req-push-rerun');
-
-      const call = executionTracker.onExecutionStarted.mock.calls[0];
-      // `false`, NOT null: an `is_fork = 'false'` trust policy must still accept
-      // a re-run of a trusted push.
-      expect(call[EVENT_CONTEXT_ARG_INDEX]).toEqual({
-        headRef: null,
-        headRepository: null,
-        isFork: false,
-        subjectTriggerEvent: 'push',
-      });
-    });
-
+  describe('a re-run presents the subject event of the run it repeats', () => {
     /**
      * The OIDC subject derives from `subjectTriggerEvent`. The new row's
      * `trigger_event` is `'rerun'`, not pull-request family, so without it the
      * re-run would present a trusted base-branch push's branch-shaped identity.
+     * The head context itself comes from the re-normalized event.
      */
     it('reads the original run own inherited event first, so a re-run of a re-run keeps the shape', async () => {
       deps.db = makeMockDb({
         ...TERMINAL_RUN,
         trigger_event: 'rerun',
         subject_trigger_event: 'pull_request:opened',
-        head_ref: 'patch-1',
-        head_repository: 'attacker/app',
-        is_fork: true,
       }) as any;
 
       await handleRerun('original-run-123', null, null, deps, 'req-rerun-of-rerun');
 
-      const call = executionTracker.onExecutionStarted.mock.calls[0];
-      // Not `'rerun'`: the `??` chain reads the inherited column before the
-      // trigger event, so the shape survives more than one hop.
-      expect(call[EVENT_CONTEXT_ARG_INDEX].subjectTriggerEvent).toBe('pull_request:opened');
+      expect(dispatchedCtx().subjectTriggerEvent).toBe('pull_request:opened');
     });
 
     it('inherits nothing when the original run recorded no event at all', async () => {
@@ -1457,9 +1579,8 @@ describe('handleRerun', () => {
 
       await handleRerun('original-run-123', null, null, deps, 'req-rerun-no-event');
 
-      const call = executionTracker.onExecutionStarted.mock.calls[0];
-      // NULL means "use `trigger_event`", so it stays NULL, never a guess.
-      expect(call[EVENT_CONTEXT_ARG_INDEX].subjectTriggerEvent).toBeNull();
+      // No subject event means "use `trigger_event`", never a guess.
+      expect('subjectTriggerEvent' in dispatchedCtx()).toBe(false);
     });
   });
 });

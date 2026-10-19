@@ -5,6 +5,7 @@
  */
 import pc from 'picocolors';
 import {
+  ExecutionJobStatus,
   JobKind,
   RunDetailFallbackReason,
   RunDetailSource,
@@ -32,7 +33,11 @@ export function ranOnAnAgent(job: DashboardJobDetail): boolean {
   return job.startedAt !== null && (job.jobKind ?? JobKind.enum.standard) === JobKind.enum.standard;
 }
 
-/** The notes for a run's detail: none when every finished job has its steps. */
+/**
+ * The notes for a run's detail: none when every finished job has its steps. A
+ * skipped job ran no step, so it has none to miss: its rules returned `false`
+ * on the agent before the first step started.
+ */
 export function stepDetailNotes(read: RunDetailRead): string[] {
   if (read.source === RunDetailSource.enum['platform-db']) {
     const reason = read.fallbackReason
@@ -45,7 +50,10 @@ export function stepDetailNotes(read: RunDetailRead): string[] {
   return read.detail.jobs
     .filter(
       (job) =>
-        ranOnAnAgent(job) && TERMINAL_JOB_STATES.has(job.status) && (job.steps ?? []).length === 0,
+        ranOnAnAgent(job) &&
+        TERMINAL_JOB_STATES.has(job.status) &&
+        job.status !== ExecutionJobStatus.enum.skipped &&
+        (job.steps ?? []).length === 0,
     )
     .map(
       (job) =>

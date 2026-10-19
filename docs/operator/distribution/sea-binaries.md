@@ -206,4 +206,9 @@ tar xzf kici-admin-{version}-linux-x64.tar.gz
 # Light package (requires Node cached)
 tar xzf kici-admin-{version}-linux-x64-light.tar.gz
 ./kici-admin-{version}-linux-x64-light/kici-admin --help
+
+# Agent package: print the version and the required environment variables
+tar xzf kici-agent-{version}-linux-x64.tar.gz
+./kici-agent-{version}-linux-x64/kici-agent --version
+./kici-agent-{version}-linux-x64/kici-agent --help
 ```

@@ -253,6 +253,78 @@ describe('buildRunDetailJobs', () => {
     expect(jobs[0].summonedRunId).toBe('summoned-run-42');
     expect(jobs[0].variantLabel).toBe('octocat/repo:deploy');
   });
+
+  it('classifies each step: typed and untyped init, image build, regular step', () => {
+    const row = (step_index: number, step_name: string, step_type: string) => ({
+      step_index,
+      step_name,
+      status: 'success',
+      started_at: null,
+      completed_at: null,
+      duration_ms: null,
+      exit_code: 0,
+      error_message: null,
+      step_type,
+      secrets_accessed: null,
+      check_outcome: null,
+      drift_summary: null,
+      concurrency_kind: null,
+      group_id: null,
+    });
+    const jobs = buildRunDetailJobs(
+      [
+        {
+          job_id: 'j1',
+          job_name: 'build',
+          status: 'success',
+          matrix_values: null,
+          base_job_name: null,
+          variant_kind: null,
+          variant_label: null,
+          job_kind: null,
+          summoned_run_id: null,
+          started_at: null,
+          completed_at: null,
+          duration_ms: null,
+          agent_id: null,
+          error_message: null,
+          runs_on_labels: null,
+          routing_reason: null,
+          contexts: null,
+          skipped_contexts: null,
+          env_warning: null,
+          outputs: null,
+          init_failure: null,
+        },
+      ],
+      {
+        stepsByJob: new Map([
+          [
+            'j1',
+            [
+              row(1_000_000, 'init:0', 'init:0'),
+              // The pre-0.21.0 recorder stored an init step untyped.
+              row(1_000_001, 'init:1', 'step'),
+              row(0, 'image', 'container:build'),
+              row(0, 'build', 'step'),
+            ],
+          ],
+        ]),
+        secretKeysByJob: new Map(),
+        needsByJob: new Map(),
+      },
+    );
+    const steps = jobs[0].steps;
+    // fails-when: mapRunDetailStep emits no classification
+    expect(steps[0]).toMatchObject({ phase: 'init', initIndex: 0, stepType: 'init:0' });
+    expect(steps[1]).toMatchObject({ phase: 'init', initIndex: 1, stepIndex: 1_000_001 });
+    // breaks-if-wrong: stepType and stepIndex keep their values
+    expect(steps[1]).not.toHaveProperty('stepType');
+    expect(steps[2]).toMatchObject({ phase: 'setup', stepType: 'container:build' });
+    expect(steps[2]).not.toHaveProperty('initIndex');
+    expect(steps[3]).toMatchObject({ phase: 'steps' });
+    expect(steps[3]).not.toHaveProperty('initIndex');
+  });
 });
 
 describe('visibleRoutingReason', () => {

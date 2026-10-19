@@ -84,13 +84,17 @@ are enveloped. Shape (abridged):
           "durationMs": 12000,
           "stepType": "step",
           "checkOutcome": null,
-          "secretsAccessed": ["DEPLOY_TOKEN"]
+          "secretsAccessed": ["DEPLOY_TOKEN"],
+          "phase": "steps"
         }
       ]
     }
   ]
 }
 ```
+
+Each step carries `phase` (`setup`, `init` or `steps`). An `init` command also carries
+`initIndex`, its position in the job's `init` list. Its `stepIndex` is a large internal number.
 
 `baseSha` is best-effort from the run's provider context; it is `null` when the base commit
 is not available. `triggeredBy` is the identity that triggered a re-run, and `null` for

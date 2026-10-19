@@ -37,4 +37,4 @@ scalers:
       - 'host.docker.internal:host-gateway'
     labelSets:
       - labels: [linux, container]
-        image: quay.io/kici-dev/kici-agent:0.23.0@sha256:b05f985282535fbe5536443bdcd8d7163d2890f4004c9a238544bf149847061e
+        image: quay.io/kici-dev/kici-agent:0.24.0@sha256:e10a5006a16c06446a9d0c2846c23edbdb9c44a3fbfb621189331cb9f83331b5

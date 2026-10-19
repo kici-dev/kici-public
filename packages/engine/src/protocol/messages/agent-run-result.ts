@@ -17,6 +17,7 @@ import {
   ExecutionJobStatus,
   ExecutionStepStatus,
   InitFailureCategory,
+  StepPhase,
 } from './execution-status.js';
 import { TrustTierSchema } from '../../context/types.js';
 import { CheckStepOutcome } from '../../check-mode.js';
@@ -63,6 +64,10 @@ export const agentStepResultSchema = z.object({
   checkOutcome: CheckStepOutcome.nullable(),
   /** Secret context key names accessed by this step — names only, never values. */
   secretsAccessed: z.array(z.string()),
+  /** The phase of the job the step ran in. Absent from an older orchestrator. */
+  phase: StepPhase.optional(),
+  /** An init step's position in the job's init list; absent on any other step and from an older orchestrator. */
+  initIndex: z.number().int().nonnegative().optional(),
 });
 export type AgentStepResult = z.infer<typeof agentStepResultSchema>;
 

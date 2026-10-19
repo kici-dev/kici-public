@@ -62,6 +62,31 @@ function fixtureDetail(overrides: Partial<CanonicalRunDetail> = {}): CanonicalRu
 }
 
 describe('mapToAgentRunResult', () => {
+  it('gives each step its phase and an init step its initIndex', () => {
+    const base = fixtureDetail().jobs[0].steps[0];
+    const detail = fixtureDetail({
+      jobs: [
+        {
+          ...fixtureDetail().jobs[0],
+          steps: [
+            { ...base, stepIndex: 1_000_000, stepName: 'init:0', stepType: 'init:0' },
+            // The pre-0.21.0 recorder stored an init step untyped.
+            { ...base, stepIndex: 1_000_001, stepName: 'init:1' },
+            { ...base, stepIndex: 0, stepName: 'compile' },
+          ],
+        },
+      ] as unknown as CanonicalRunDetail['jobs'],
+    });
+    const steps = mapToAgentRunResult(detail).jobs[0].steps;
+    // fails-when: mapStep emits no classification
+    expect(steps[0]).toMatchObject({ phase: 'init', initIndex: 0 });
+    expect(steps[1]).toMatchObject({ phase: 'init', initIndex: 1, stepIndex: 1_000_001 });
+    // breaks-if-wrong: the step name stays fenced as untrusted
+    expect(steps[1].stepName).toEqual({ untrusted: true, value: 'init:1' });
+    expect(steps[2]).toMatchObject({ phase: 'steps' });
+    expect(steps[2]).not.toHaveProperty('initIndex');
+  });
+
   it('produces a schema-valid result', () => {
     const out = mapToAgentRunResult(fixtureDetail());
     expect(agentRunResultSchema.safeParse(out).success).toBe(true);

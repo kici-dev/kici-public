@@ -200,7 +200,7 @@ function printJobFailure(job: DashboardJobDetail): void {
     : step.exitCode != null
       ? ` exited with code ${step.exitCode}`
       : ' failed';
-  console.log(`    ${pc.red('error')}: step ${step.stepName}${why}`);
+  console.log(`    ${pc.red('error')}: step ${stepDisplayName(step)}${why}`);
 }
 
 function printHolds(result: HoldsResult): void {

@@ -128,6 +128,45 @@ describe('DashboardClient typed methods', () => {
     });
   });
 
+  it("getRunDetailWithSource keeps each step's phase and initIndex", async () => {
+    const step = {
+      status: 'success',
+      startedAt: null,
+      completedAt: null,
+      durationMs: null,
+      exitCode: 0,
+      errorMessage: null,
+    };
+    const body = {
+      jobs: [
+        {
+          jobId: 'j1',
+          jobName: 'build',
+          status: 'success',
+          matrixValues: null,
+          startedAt: null,
+          completedAt: null,
+          durationMs: null,
+          agentId: null,
+          errorMessage: null,
+          steps: [
+            { ...step, stepIndex: 1_000_000, stepName: 'init:0', phase: 'init', initIndex: 0 },
+            { ...step, stepIndex: 0, stepName: 'build', phase: 'steps' },
+          ],
+        },
+      ],
+    };
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify(body), { status: 200 }),
+    );
+    const read = await DashboardClient.fromConfig(baseConfig).getRunDetailWithSource('r1');
+    // fails-when: the engine schema lacks the fields and Zod strips them before --json prints
+    expect(read.detail.jobs[0].steps).toMatchObject([
+      { stepIndex: 1_000_000, stepName: 'init:0', phase: 'init', initIndex: 0 },
+      { stepIndex: 0, stepName: 'build', phase: 'steps' },
+    ]);
+  });
+
   it('getRunDetailWithSource reads an unknown header value as not reported', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(JSON.stringify({ jobs: [] }), {

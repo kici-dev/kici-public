@@ -407,12 +407,20 @@ its position in the job's `init` list. `kici runs logs` uses the same order and
 names in its headings. An `init` command that an older orchestrator recorded with
 no step type is listed and named the same way.
 
+In `--json`, each step in `detail.jobs[].steps` carries `phase`: `setup` (the
+job's image build), `init` (an `init` command) or `steps`. An `init` command also
+carries `initIndex`, its position in the job's `init` list. `stepIndex` is the
+stored index. For an `init` command it is a large internal number, so read `phase`
+and `initIndex` instead. The steps are in the order they ran, the same as in the
+text output. This is also true for a run that an older orchestrator recorded.
+
 For a run that spans several workflows, the header shows `workflows=` with every
 workflow name, and each job is named `<workflow> / <job>`. In `--json`, each
 job in `detail.jobs` carries `workflowName`.
 
 A failed job prints an `error:` line: the job's own error message, or else the
-step that failed and its exit code (`error: step test exited with code 3`).
+step that failed and its exit code (`error: step test exited with code 3`). A
+failed `init` command is named `init[<n>]` in this line too.
 
 For a run started with `kici run remote`, the Platform reads the jobs and steps
 from the orchestrator cluster that ran the run. When the Platform cannot get them
@@ -480,6 +488,18 @@ kici runs logs abc123 --follow
 
 Re-trigger a completed run. Prints the new run id. The server enforces a short
 cooldown between reruns of the same run.
+
+The rerun builds the same commit as the original run and goes through the same
+steps: jobs wait for their `needs`, contexts and their approval gates apply,
+and jobs can use artifacts and the cache. It runs the workflow's declared jobs;
+jobs a generator produced are not run again. A rerun of a pull request from a
+fork goes through the organization trust policy again, so it can be held for
+approval as the first run was. When the policy now ignores it, the rerun is
+refused.
+A run cannot be rerun when the event it ran for is no longer stored: a webhook
+delivery past the audit retention window, or an internal event that has
+expired. A run started by a scaler event cannot be rerun either. Start a new run
+instead.
 
 ```bash
 kici runs rerun <run-id> [options]

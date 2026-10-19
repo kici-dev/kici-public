@@ -1,10 +1,12 @@
 /**
- * Re-run handler: loads a completed run and its stored webhook payload,
- * re-fetches the lock file at the original SHA, and dispatches a new run
- * linked by parent_run_id.
+ * Re-run handler: loads a completed run, validates it, and routes it to the
+ * re-run of its kind — a failed global evaluation round is re-evaluated, a
+ * cross-repository global run re-runs from the repository defining its workflow
+ * (`rerun-global.ts`), and every other run re-runs through the pipeline its
+ * original run went through (`rerun-repo.ts`). Each new run links to the
+ * original by parent_run_id.
  *
- * Deliberately not processWebhook: it skips dedup, normalization, trigger
- * matching and the changed-files fetch (lock file -> job expansion -> dispatch).
+ * Deliberately not processWebhook: a re-run skips dedup and trigger matching.
  */
 
 import { createLogger, toErrorMessage, type ColdStore } from '@kici-dev/shared';
@@ -26,21 +28,7 @@ import type { BuildCoordinator } from '../cache/index.js';
 import type { DepCache } from '../cache/index.js';
 import type { PendingBuildTracker } from '../cache/index.js';
 import { claimRequestId } from './request-idempotency.js';
-import type { RunContext } from '../cluster/coordinator.js';
-import {
-  routeOrDispatchJobs,
-  registerDispatchedJobs,
-  type DispatchedJobEntry,
-  type RejectedJobEntry,
-} from './route-or-dispatch-jobs.js';
-import {
-  ExecutionRunStatus,
-  isLockStaticJob,
-  TERMINAL_RUN_STATES,
-  matrixEnvelopeFields,
-} from '@kici-dev/engine';
-import type { LockFile as FullLockFile, LockWorkflow, MaterializedJob } from '@kici-dev/engine';
-import { webhookPayloadPath } from './webhook-payload-store.js';
+import { ExecutionRunStatus, TERMINAL_RUN_STATES } from '@kici-dev/engine';
 import {
   dispatchGlobalWorkflowsForOtherRepos,
   evaluateSecurityPolicy,
@@ -60,6 +48,7 @@ import {
   type RerunProviderBinding,
 } from './rerun-inputs.js';
 import { isCrossRepoGlobalRun, rerunCrossRepoGlobalRun } from './rerun-global.js';
+import { rerunRepositoryRun } from './rerun-repo.js';
 import { registrationsAtHeldCommit } from './held-round-registrations.js';
 import type { WebhookInfo } from '../webhook/handler.js';
 import type { ProviderType, SimulatedEvent } from '@kici-dev/engine';
@@ -118,16 +107,6 @@ export interface RerunDeps {
 /** Original run row from execution_runs (selectAll). */
 export type OriginalRunRow = Selectable<ExecutionRunTable>;
 
-/** Lock-file workflow + provider bundle resolved at the original SHA. */
-interface ResolvedRerunWorkflow {
-  workflow: LockWorkflow;
-  fullLockFile: FullLockFile;
-  providerContext: Record<string, unknown>;
-  providerBundle: NonNullable<ReturnType<ProviderRegistry['getByRoutingKey']>>;
-  /** Validated routing key (non-null — `resolveRerunWorkflow` throws on missing). */
-  routingKey: string;
-}
-
 export async function handleRerun(
   originalRunId: string,
   triggeredBy: string | null,
@@ -168,85 +147,13 @@ export async function handleRerun(
     });
   }
 
-  // Cron/schedule runs have no payload.
-  const payload = await loadWebhookPayload(originalRunId, deps);
-
-  const resolved = await resolveRerunWorkflow(originalRun, deps);
-
-  // Claim BEFORE the first write. The validation above is read-only and throws
-  // identically on every failover hop, so no claim masks it; the atomic claim
-  // guards only create+dispatch, and a re-send returns the sibling's run id.
-  const { newRunId, claimed } = await claimRequestId(deps.db, requestId);
-  if (!claimed) {
-    logger.info('Rerun requestId already claimed by a sibling; returning existing run', {
-      originalRunId,
-      requestId,
-      newRunId,
-    });
-    return { newRunId };
-  }
-
-  const rootRunId = originalRun.original_run_id ?? originalRunId;
-  const commitMessage = extractCommitMessage(payload);
-
-  logger.info('Re-running workflow', {
-    originalRunId,
-    newRunId,
-    rootRunId,
-    workflowName: originalRun.workflow_name,
-    sha: originalRun.sha,
-    triggeredBy,
-  });
-
-  // The new run needs its own payload for the payload viewer and a re-run of the re-run.
-  if (payload) {
-    const newPayloadPath = webhookPayloadPath(newRunId);
-    await deps.logStorage.append(newPayloadPath, JSON.stringify(payload));
-  }
-
-  // Record BEFORE dispatch: a peer reroute's onExecutionStarted (lacking
-  // parentRunId and other rerun metadata) then hits ON CONFLICT DO NOTHING and
-  // keeps this row. Jobs are added after local dispatch.
-  await recordRerunExecutionStart({
-    deps,
-    newRunId,
+  return rerunRepositoryRun({
     originalRun,
-    originalRunId,
-    rootRunId,
-    workflow: resolved.workflow,
-    providerContext: resolved.providerContext,
     triggeredBy,
     triggeredByAgentLabel,
-    commitMessage,
-  });
-
-  const { dispatchedJobs, rejectedJobs } = await dispatchRerunJobs({
     deps,
-    newRunId,
-    originalRun,
-    resolved,
-    payload,
+    requestId,
   });
-
-  await registerDispatchedJobs({
-    newRunId,
-    workflowName: originalRun.workflow_name,
-    dispatchedJobs,
-    rejectedJobs,
-    executionTracker: deps.executionTracker,
-  });
-
-  await emitRerunEventAndCheckRun({
-    deps,
-    originalRun,
-    originalRunId,
-    newRunId,
-    workflow: resolved.workflow,
-    providerContext: resolved.providerContext,
-    triggeredBy,
-  });
-
-  return { newRunId };
 }
 
 /**
@@ -822,274 +729,6 @@ async function postRoundSucceededCheck(opts: {
       repoIdentifier: originalRun.repo_identifier,
       workflowRepo,
       error: err instanceof Error ? err.message : String(err),
-    });
-  }
-}
-
-/**
- * Re-fetch the lock file at the original SHA and find the original workflow.
- * Throws on missing routing_key, unregistered provider, missing lock-file
- * fetcher, missing lock file, or a workflow absent from it.
- */
-async function resolveRerunWorkflow(
-  originalRun: OriginalRunRow,
-  deps: RerunDeps,
-): Promise<ResolvedRerunWorkflow> {
-  const { providerBundle, providerContext, routingKey } = resolveRerunProviderBinding(
-    originalRun,
-    deps,
-  );
-
-  if (!providerBundle.lockFileFetcher) {
-    throw new Error(`Provider ${originalRun.provider} does not support lock file fetching`);
-  }
-
-  const lockFile = await providerBundle.lockFileFetcher.fetchLockFile(
-    originalRun.repo_identifier,
-    originalRun.sha,
-    providerContext,
-  );
-
-  if (!lockFile) {
-    throw new Error('Lock file not found at original SHA (branch may have been force-pushed)');
-  }
-
-  const fullLockFile = lockFile as unknown as FullLockFile;
-
-  const workflow = fullLockFile.workflows.find(
-    (w: LockWorkflow) => w.name === originalRun.workflow_name,
-  );
-  if (!workflow) {
-    throw new Error(
-      `Workflow '${originalRun.workflow_name}' not found in lock file at SHA ${originalRun.sha}`,
-    );
-  }
-
-  return {
-    workflow,
-    fullLockFile,
-    providerContext,
-    providerBundle,
-    routingKey,
-  };
-}
-
-/**
- * First line of head_commit.message, else pull_request.title; undefined for
- * cron/schedule runs (no payload).
- */
-function extractCommitMessage(payload: Record<string, unknown> | null): string | undefined {
-  if (!payload) return undefined;
-  const headCommit = (payload as { head_commit?: { message?: string } }).head_commit;
-  const prTitle = (payload as { pull_request?: { title?: string } }).pull_request?.title;
-  return headCommit?.message?.split('\n')[0] ?? prTitle ?? undefined;
-}
-
-/**
- * Insert the new execution_runs row up-front so a peer reroute's
- * onExecutionStarted (without rerun metadata) hits ON CONFLICT DO NOTHING.
- */
-async function recordRerunExecutionStart(opts: {
-  deps: RerunDeps;
-  newRunId: string;
-  originalRun: OriginalRunRow;
-  originalRunId: string;
-  rootRunId: string;
-  workflow: LockWorkflow;
-  providerContext: Record<string, unknown>;
-  triggeredBy: string | null;
-  triggeredByAgentLabel: string | null;
-  commitMessage: string | undefined;
-}): Promise<void> {
-  const {
-    deps,
-    newRunId,
-    originalRun,
-    originalRunId,
-    rootRunId,
-    workflow,
-    providerContext,
-    triggeredBy,
-    triggeredByAgentLabel,
-    commitMessage,
-  } = opts;
-
-  await deps.executionTracker.onExecutionStarted(
-    newRunId,
-    workflow.name,
-    originalRun.provider,
-    originalRun.repo_identifier,
-    originalRun.ref,
-    originalRun.sha,
-    `rerun:${newRunId}`,
-    providerContext,
-    null, // No trigger decision for re-runs
-    [], // jobs added after dispatch via addJobsToRun
-    originalRun.routing_key ?? undefined,
-    undefined, // contexts
-    'rerun', // triggerEvent — marks as user-initiated re-run
-    commitMessage, // commitMessage from original webhook payload
-    originalRunId, // parentRunId
-    triggeredBy, // triggeredBy
-    rootRunId, // originalRunId — root ancestor for lineage chain
-    workflow.concurrency
-      ? {
-          cancelInProgress: workflow.concurrency.cancelInProgress,
-          max: workflow.concurrency.max,
-        }
-      : undefined,
-    workflow.timeout, // workflowTimeoutMs
-    undefined, // checkMode
-    undefined, // localWorkingTree
-    undefined, // triggerActorUsername
-    undefined, // triggerActorUserId
-    triggeredByAgentLabel, // triggeredByAgentLabel
-    undefined, // prNumber
-    undefined, // workflowRepo
-    // A re-run rebuilds the SAME commit from the SAME source, so it inherits the
-    // original's pull-request head context (`rerun` carries no head).
-    //
-    // NULLs would render every fork claim `'unresolved'`, wrong both ways: the
-    // worked trust policy in `docs/user/oidc.md` pins `is_fork = 'false'`, so an
-    // ordinary push re-run would be refused, and a fork PR re-run would report
-    // the fork question unanswered.
-    //
-    // `subjectTriggerEvent` likewise: the OIDC subject derives from the event and
-    // `'rerun'` has no pull-request dimension, so a fork PR re-run would present
-    // a trusted base-branch push identity. Reading the original's inherited
-    // column FIRST keeps a re-run of a re-run on the pull-request shape.
-    {
-      headRef: originalRun.head_ref,
-      headRepository: originalRun.head_repository,
-      isFork: originalRun.is_fork,
-      subjectTriggerEvent: originalRun.subject_trigger_event ?? originalRun.trigger_event,
-    },
-  );
-}
-
-/**
- * Dispatch via the cluster coordinator (local first, then peers whose scalers
- * satisfy the labels) or, standalone or on coordinator timeout, the local
- * dispatcher. Returns the dispatched job IDs plus synthetic-rejected IDs to
- * mark failed.
- */
-async function dispatchRerunJobs(opts: {
-  deps: RerunDeps;
-  newRunId: string;
-  originalRun: OriginalRunRow;
-  resolved: ResolvedRerunWorkflow;
-  payload: Record<string, unknown> | null;
-}): Promise<{ dispatchedJobs: DispatchedJobEntry[]; rejectedJobs: RejectedJobEntry[] }> {
-  const { deps, newRunId, originalRun, resolved, payload } = opts;
-  const { workflow, fullLockFile, providerContext, providerBundle, routingKey } = resolved;
-
-  const staticJobs = workflow.jobs.filter(isLockStaticJob);
-  const repoUrl = providerBundle.repoUrlBuilder?.buildCloneUrl(originalRun.repo_identifier) ?? '';
-
-  const buildRerunJobConfig = (mat: MaterializedJob) => {
-    const job = mat.lockJob;
-    return {
-      source: workflow.source ?? fullLockFile.source,
-      workflowName: workflow.name,
-      ...matrixEnvelopeFields(mat),
-      steps: job.steps,
-      needs: job.needs,
-      rules: job.rules,
-      // Values are secret NAMES. The credential relay authorizes against the
-      // same map on the job row; omitting it leaves the agent an empty map, where
-      // `credential: 'x'` throws and `default` silently falls back to the source
-      // credential.
-      ...(job.gitCredentials && { gitCredentials: job.gitCredentials }),
-      ...(workflow.contentHash && { contentHash: workflow.contentHash }),
-      ...(workflow.resolvedHashFiles?.length && {
-        resolvedHashFiles: workflow.resolvedHashFiles,
-      }),
-    };
-  };
-
-  const installationId =
-    typeof (providerContext as { installationId?: unknown }).installationId === 'number'
-      ? ((providerContext as { installationId: number }).installationId as number)
-      : undefined;
-
-  const runContext: RunContext = {
-    runId: newRunId,
-    deliveryId: `rerun:${newRunId}`,
-    routingKey,
-    event: 'rerun',
-    action: null,
-    provider: originalRun.provider,
-    payload: (payload as Record<string, unknown> | undefined) ?? {},
-    repoIdentifier: originalRun.repo_identifier,
-    sha: originalRun.sha,
-    ref: originalRun.ref,
-    workflowName: workflow.name,
-    ...(installationId !== undefined && { installationId }),
-  };
-
-  return routeOrDispatchJobs({
-    newRunId,
-    staticJobs,
-    workflowName: workflow.name,
-    repoUrl,
-    ref: originalRun.ref,
-    sha: originalRun.sha,
-    deliveryId: `rerun:${newRunId}`,
-    provider: originalRun.provider,
-    providerContext: providerContext as Record<string, unknown>,
-    routingKey,
-    runContext,
-    buildJobConfig: buildRerunJobConfig,
-    logger,
-    label: 'Re-run',
-    coordinator: deps.coordinator,
-    dispatcher: deps.dispatcher,
-  });
-}
-
-/** Emit the workflow.rerun system event and set a pending check run for the new run. */
-async function emitRerunEventAndCheckRun(opts: {
-  deps: RerunDeps;
-  originalRun: OriginalRunRow;
-  originalRunId: string;
-  newRunId: string;
-  workflow: LockWorkflow;
-  providerContext: Record<string, unknown>;
-  triggeredBy: string | null;
-}): Promise<void> {
-  const { deps, originalRun, originalRunId, newRunId, workflow, providerContext, triggeredBy } =
-    opts;
-
-  if (deps.eventRouter) {
-    await deps.eventRouter.emit({
-      eventName: 'workflow.rerun',
-      payload: {
-        parentRunId: originalRunId,
-        newRunId,
-        workflowName: workflow.name,
-        repo: originalRun.repo_identifier,
-        sha: originalRun.sha,
-        triggeredBy,
-      },
-      sourceRepo: originalRun.repo_identifier,
-      sourceRoutingKey: originalRun.routing_key ?? undefined,
-    });
-  }
-
-  if (deps.checkRunReporter) {
-    const [owner, repo] = originalRun.repo_identifier.split('/');
-    const staticJobs = workflow.jobs.filter(isLockStaticJob);
-    const jobNames = staticJobs.map((j) => j.name);
-
-    deps.checkRunReporter.setPending({
-      provider: originalRun.provider,
-      owner,
-      repo,
-      sha: originalRun.sha,
-      workflowName: workflow.name,
-      jobNames,
-      installationId: (providerContext as { installationId?: number }).installationId,
-      routingKey: originalRun.routing_key ?? undefined,
     });
   }
 }

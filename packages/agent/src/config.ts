@@ -12,6 +12,7 @@ import {
   parseHostPropertyAssignments,
   validateNoReservedLabels,
 } from '@kici-dev/engine';
+import { docsUrl } from '@kici-dev/core';
 import { ContainerBuildCli } from './execution/image-build/build-engine.js';
 import { parseHostInstallRegistries } from './execution/host-install-origins.js';
 
@@ -333,6 +334,17 @@ export const envDef = defineEnv({
     orphanCleanup: 'KICI_AGENT_ORPHAN_CLEANUP',
     drainOnResetFailure: 'KICI_AGENT_DRAIN_ON_RESET_FAILURE',
   },
+  // Shown by `kici-agent --help` and in the generated configuration reference.
+  descriptions: {
+    orchestratorUrl: 'WebSocket URL of the orchestrator, for example ws://orchestrator:4000/ws.',
+    agentToken: 'Agent token (kat_…) that the orchestrator issued for this agent.',
+    scalerClaimCode: 'Single-use claim code that a scaler gives to an agent it starts.',
+    labels: 'Comma-separated labels that jobs use to select this agent.',
+    roles: `Comma-separated roles: ${[...KNOWN_ROLES, 'all'].join(', ')}. Unset means all.`,
+    agentId: 'Agent ID. Default: the host name and a random suffix.',
+    port: 'Port of the health and metrics endpoints.',
+  },
+  validationHint: `Run the agent with --help to list its environment variables, or see ${docsUrl('operator/agent/configuration')}.`,
 });
 
 /**

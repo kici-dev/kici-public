@@ -281,6 +281,45 @@ describe('dispatchInternalEventViaPipeline', () => {
     expect(built.event.targetBranch).toBe('main');
   });
 
+  it("dispatches a person-started fire under the caller's claimed run id and attribution", async () => {
+    const { deps } = makeDeps();
+    const lineage = { parentRunId: 'run-1', originalRunId: 'run-0' };
+
+    const result = await dispatchInternalEventViaPipeline(
+      makeDecision(),
+      makeLockFile(),
+      makeInternalCtx({
+        event: { id: 'sch-2', eventName: '__schedule_fire', payload: { commitSha: 'deadbeef' } },
+        cronCommitSha: 'deadbeef',
+      }),
+      deps,
+      {
+        runId: 'claimed-run',
+        triggerEvent: 'rerun',
+        triggeredBy: 'user@test.com',
+        triggeredByAgentLabel: 'bot',
+        rerunLineage: lineage,
+        subjectTriggerEvent: 'schedule',
+        dispatchInputs: { mode: 'quick' },
+      },
+    );
+
+    const built = core.seen[0]!;
+    // fails-when: the pipeline mints its own run id, so a failover re-send of
+    // the same request starts a second run
+    expect(built.runId).toBe('claimed-run');
+    expect(result?.runId).toBe('claimed-run');
+    expect(built.triggerEventOverride).toBe('rerun');
+    expect(built.triggeredBy).toBe('user@test.com');
+    expect(built.triggeredByAgentLabel).toBe('bot');
+    expect(built.rerunLineage).toEqual(lineage);
+    expect(built.subjectTriggerEvent).toBe('schedule');
+    expect(built.dispatchInputs).toEqual({ mode: 'quick' });
+    // breaks-if-wrong: a fire by hand is still a schedule fire, trusted and typed so
+    expect(built.event.type).toBe('schedule');
+    expect(built.trustResolution?.tier).toBe('trusted');
+  });
+
   describe('branch provenance', () => {
     it('a schedule fire presents the registration default branch, not the commit sha', async () => {
       const { deps } = makeDeps();

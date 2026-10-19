@@ -9,7 +9,7 @@
  */
 import { setupStepsFirst } from './step-display-order.js';
 import type { Kysely } from 'kysely';
-import { ExecutionJobStatus, type InitFailure } from '@kici-dev/engine';
+import { ExecutionJobStatus, stepClassification, type InitFailure } from '@kici-dev/engine';
 import type { Database } from '../db/types.js';
 import { groupNeedsByJobName } from '../dashboard/needs-edges.js';
 import { safeJsonParse } from '../helpers/json.js';
@@ -50,6 +50,11 @@ export function mapRunDetailStep(step: RunDetailStepRow) {
     ...(step.drift_summary != null && { driftSummary: step.drift_summary }),
     ...(step.concurrency_kind != null && { concurrencyKind: step.concurrency_kind }),
     ...(step.group_id != null && { groupId: step.group_id }),
+    ...stepClassification({
+      stepIndex: step.step_index,
+      stepType: step.step_type,
+      stepName: step.step_name,
+    }),
   };
 }
 

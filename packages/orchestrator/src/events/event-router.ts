@@ -35,7 +35,7 @@ import {
 const logger = createLogger({ prefix: 'event-router' });
 
 /** Wrap a registration's single lock entry in a lock file the matcher can read. */
-function registrationLockFile(reg: RegisteredWorkflow): LockFile {
+export function registrationLockFile(reg: RegisteredWorkflow): LockFile {
   return {
     schemaVersion: SCHEMA_VERSION,
     minReaderVersion: SCHEMA_VERSION,

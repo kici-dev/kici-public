@@ -154,7 +154,7 @@ After loading the module, the sandbox extracts the target workflow by export nam
 
 Rules are evaluated sequentially with fail-fast behavior. Each rule's `check` function is called with a `RuleContext` providing the event payload, changed files, environment variables, and a zx `$` shell. Rules can be synchronous or asynchronous.
 
-If a rule check returns `false`, the job is **skipped** (not failed): it reports `skipped` with every step skipped, and its error names the rule (`rule '<label>' returned false`). To an orchestrator that does not advertise `acceptsSkippedJobStatus` on `register.ack`, the agent reports `success` instead. If a rule check throws, the job **fails** with the error, because a rule that could not decide must not read as "do not run". In both cases the remaining rules are not evaluated. Rule evaluation results (label, passed, duration, error) are included in the `job.status` message data.
+If a rule check returns `false`, the job is **skipped** (not failed): it reports `skipped` with every step skipped, and its error names the rule (`rule '<label>' returned false`). No step starts, so no `step.status` is sent; the orchestrator records the step rows from the `stepResults` of that terminal `job.status`, as it does for any job that streamed no step. To an orchestrator that does not advertise `acceptsSkippedJobStatus` on `register.ack`, the agent reports `success` instead. If a rule check throws, the job **fails** with the error, because a rule that could not decide must not read as "do not run". In both cases the remaining rules are not evaluated. Rule evaluation results (label, passed, duration, error) are included in the `job.status` message data.
 
 > See `packages/agent/src/execution/rule-evaluator.ts` for the implementation.
 

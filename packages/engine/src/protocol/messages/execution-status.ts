@@ -303,6 +303,26 @@ export function stepPhase(step: StepRef): StepPhase {
   return StepPhase.enum.steps;
 }
 
+/** How a reader tells a step's phase apart; `initIndex` is present on an init step only. */
+export interface StepClassification {
+  phase: StepPhase;
+  initIndex?: number;
+}
+
+/** The {@link StepPhase} of a stored step, plus its init position when it is an init step. */
+export function stepClassification(step: StepRef): StepClassification {
+  const initIndex = stepInitIndex(step);
+  return { phase: stepPhase(step), ...(initIndex !== undefined && { initIndex }) };
+}
+
+/** A copy of `step` with its classification recomputed; any incoming `phase`/`initIndex` is dropped. */
+export function withStepClassification<
+  T extends StepRef & { phase?: unknown; initIndex?: unknown },
+>(step: T): Omit<T, 'phase' | 'initIndex'> & StepClassification {
+  const { phase: _phase, initIndex: _initIndex, ...rest } = step;
+  return { ...rest, ...stepClassification(step) };
+}
+
 /**
  * Display comparator: by {@link StepPhase} in run order, then by step index. Index
  * alone lists the setup and init pseudo-steps last, although they run first.

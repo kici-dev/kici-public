@@ -15,4 +15,13 @@ describe('service entry points', () => {
   it.each(['./server.ts'])('%s imports the env-file loader before any other module', (file) => {
     expect(firstImport(file)).toBe(LOADER);
   });
+
+  // fails-when: the call is removed or placed after initTelemetry — `--help` would then
+  // start telemetry (or, further down, load config) before printing.
+  it('server.ts handles CLI arguments before telemetry starts', () => {
+    const source = readFileSync(new URL('./server.ts', import.meta.url), 'utf-8');
+    const cliCall = source.indexOf('handleAgentCliArgs(process.argv.slice(2))');
+    expect(cliCall).toBeGreaterThanOrEqual(0);
+    expect(cliCall).toBeLessThan(source.indexOf('initTelemetry({'));
+  });
 });

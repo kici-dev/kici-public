@@ -196,6 +196,42 @@ describe('runsShowCommand', () => {
     expect(log.mock.calls.some((c) => String(c[0]).includes('"run"'))).toBe(true);
   });
 
+  it('prints the phase and initIndex of each step with --json', async () => {
+    const step = {
+      status: ExecutionStepStatus.enum.success,
+      startedAt: null,
+      completedAt: null,
+      durationMs: 5,
+      exitCode: 0,
+      errorMessage: null,
+    };
+    stubClient({
+      jobs: [
+        {
+          jobId: 'j1',
+          jobName: 'build',
+          status: ExecutionJobStatus.enum.success,
+          durationMs: 10,
+          errorMessage: null,
+          steps: [
+            { ...step, stepIndex: 1_000_000, stepName: 'init:0', phase: 'init', initIndex: 0 },
+            { ...step, stepIndex: 0, stepName: 'compile', phase: 'steps' },
+          ],
+        },
+      ],
+    });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await runsShowCommand(RUN, { json: true });
+    const printed = JSON.parse(String(log.mock.calls[0][0]));
+    // breaks-if-wrong: --json prints the detail as read, with no field dropped
+    expect(printed.detail.jobs[0].steps[0]).toMatchObject({
+      stepIndex: 1_000_000,
+      stepName: 'init:0',
+      phase: 'init',
+      initIndex: 0,
+    });
+  });
+
   it('falls back to local history on a Platform 404', async () => {
     vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
       getRun: async () => {
@@ -337,6 +373,16 @@ describe('runsShowCommand', () => {
             ],
           },
           {
+            jobId: 'j3',
+            jobName: 'init-fails',
+            status: ExecutionJobStatus.enum.failed,
+            durationMs: 10,
+            errorMessage: null,
+            steps: [
+              { ...step('init:0', ExecutionStepStatus.enum.failed, 4), stepIndex: 1_000_000 },
+            ],
+          },
+          {
             jobId: 'j2',
             jobName: 'build',
             status: ExecutionJobStatus.enum.success,
@@ -353,8 +399,11 @@ describe('runsShowCommand', () => {
     const printed = printedPlain(log);
     // fails-when: a step failure with no job error message prints no error line
     expect(printed).toContain('step fail-with-output exited with code 3');
+    // fails-when: the error line names a failed init step by its stored name
+    expect(printed).toContain('error: step init[0] exited with code 4');
+    expect(printed).not.toContain('step init:0');
     // breaks-if-wrong: a passing job gets no error line
-    expect(printed.match(/error/g)).toHaveLength(1);
+    expect(printed.match(/error/g)).toHaveLength(2);
   });
 
   it("prints a failed step's own error message, without its leading blank line", async () => {

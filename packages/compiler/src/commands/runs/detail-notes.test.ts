@@ -57,7 +57,7 @@ describe('stepDetailNotes', () => {
     ]);
   });
 
-  it('prints nothing for a job that is still running, never started, or runs no steps on an agent', () => {
+  it('prints nothing for a job that is still running, never started, was skipped, or runs no steps on an agent', () => {
     // breaks-if-wrong: a healthy run with a just-started job, a queued job or a
     // gate job must print no note
     const notes = stepDetailNotes({
@@ -66,6 +66,12 @@ describe('stepDetailNotes', () => {
           job({ status: ExecutionJobStatus.enum.running }),
           job({ startedAt: null }),
           job({ jobKind: JobKind.enum.gate }),
+          // fails-when: a job its rule skipped is reported as one that ran and
+          // reported no steps
+          job({
+            status: ExecutionJobStatus.enum.skipped,
+            errorMessage: "rule 'push to main' returned false",
+          }),
           job({
             steps: [
               {

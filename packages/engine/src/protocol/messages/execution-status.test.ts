@@ -9,8 +9,10 @@ import {
   initStepType,
   parseInitStepRef,
   stepInitIndex,
+  stepClassification,
   stepPhase,
   stepTypeOf,
+  withStepClassification,
   CacheOutcome,
   CacheRunEventType,
   CacheStepType,
@@ -1267,6 +1269,51 @@ describe('init step types', () => {
     expect(steps.sort(compareStepsByPhase).map((s) => s.stepIndex)).toEqual([
       2_000_000, 1_000_000, 1_000_001, 0, 1,
     ]);
+  });
+});
+
+describe('stepClassification', () => {
+  it('gives a typed init step its phase and position', () => {
+    expect(
+      stepClassification({ stepIndex: 1_000_000, stepName: 'init:0', stepType: 'init:0' }),
+    ).toEqual({ phase: 'init', initIndex: 0 });
+  });
+
+  it('classifies an init step an older orchestrator recorded without a type', () => {
+    // fails-when: the classifier reads stepType alone
+    expect(
+      stepClassification({ stepIndex: 1_000_000, stepName: 'init:0', stepType: 'step' }),
+    ).toEqual({ phase: 'init', initIndex: 0 });
+    expect(stepClassification({ stepIndex: 1_000_000, stepName: 'init:0' })).toEqual({
+      phase: 'init',
+      initIndex: 0,
+    });
+  });
+
+  it('gives a regular step no initIndex key', () => {
+    // breaks-if-wrong: a regular step must not gain an initIndex key
+    const result = stepClassification({ stepIndex: 0, stepName: 'build' });
+    expect(result).toEqual({ phase: 'steps' });
+    expect(result).not.toHaveProperty('initIndex');
+    expect(stepClassification({ stepIndex: 1_000_004, stepName: 'cache:restore' })).toEqual({
+      phase: 'steps',
+    });
+    expect(
+      stepClassification({ stepIndex: 0, stepName: 'image', stepType: 'container:build' }),
+    ).toEqual({ phase: 'setup' });
+  });
+
+  it('recomputes the classification and drops a stale one', () => {
+    // fails-when: a stale initIndex survives the recompute
+    const step = withStepClassification({
+      stepIndex: 0,
+      stepName: 'build',
+      status: 'success',
+      phase: 'init',
+      initIndex: 3,
+    });
+    expect(step).toEqual({ stepIndex: 0, stepName: 'build', status: 'success', phase: 'steps' });
+    expect(step).not.toHaveProperty('initIndex');
   });
 });
 

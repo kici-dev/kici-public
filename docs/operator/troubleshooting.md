@@ -101,7 +101,7 @@ The Platform could not read the run's jobs and steps from the orchestrator that 
 | the orchestrator response was not valid              | `invalid_response`         | The orchestrator and the Platform do not agree on the response. Upgrade the orchestrator.                                                                                                                       |
 | the orchestrator reported no jobs                    | `no_jobs`                  | The orchestrator has no jobs recorded for the run.                                                                                                                                                              |
 
-`no step detail for job <name>` means the job ran on an agent but the orchestrator reports no steps for it. For example, the job failed in its setup, before its first step. Read the setup log with `kici runs logs <run-id> --job <name>`.
+`no step detail for job <name>` means the job ran on an agent but the orchestrator reports no steps for it. For example, the job failed in its setup, before its first step. A skipped job never gets this note: it ran no step. Read the setup log with `kici runs logs <run-id> --job <name>`.
 
 ## No jobs dispatched (no matching agent)
 

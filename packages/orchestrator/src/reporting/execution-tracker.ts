@@ -704,6 +704,40 @@ function errorText(value: unknown): string {
   return String(value);
 }
 
+/** One entry of a terminal `job.status`'s `data.stepResults`, as the agent reports it. */
+interface ReportedStepResult {
+  /** The entry's position in `stepResults`, which the agent builds in step order. */
+  stepIndex: number;
+  name: string;
+  status: ExecutionStepStatus;
+  durationMs: number;
+  error?: string;
+}
+
+/**
+ * The well-formed terminal entries of `data.stepResults`. An
+ * entry with no name or a non-terminal status is dropped: a step row is never
+ * written from a value the agent did not report.
+ */
+function reportedStepResults(data: Record<string, unknown> | undefined): ReportedStepResult[] {
+  const raw = data?.stepResults;
+  if (!Array.isArray(raw)) return [];
+  const results: ReportedStepResult[] = [];
+  for (const [stepIndex, entry] of (raw as Array<Record<string, unknown> | null>).entries()) {
+    const status = ExecutionStepStatus.safeParse(entry?.status);
+    if (typeof entry?.name !== 'string' || !status.success) continue;
+    if (!TERMINAL_JOB_STATES.has(status.data)) continue;
+    results.push({
+      stepIndex,
+      name: entry.name,
+      status: status.data,
+      durationMs: typeof entry.durationMs === 'number' ? entry.durationMs : 0,
+      ...(typeof entry.error === 'string' && { error: entry.error }),
+    });
+  }
+  return results;
+}
+
 export class ExecutionTracker {
   private readonly db: Kysely<Database>;
   private readonly observerRegistry?: ObserverRegistry;
@@ -1582,6 +1616,10 @@ export class ExecutionTracker {
     await this.reopenRecoveredRun(run, runId);
     const jobLogBytesTotal = persisted.jobLogBytesTotal;
 
+    if (TERMINAL_JOB_STATES.has(state)) {
+      await this.recordReportedStepsWhenNoneStreamed(runId, jobId, timestamp, data);
+    }
+
     if (job) {
       job.status = state;
       if (isFirstRunning) {
@@ -2259,6 +2297,45 @@ export class ExecutionTracker {
       job.contexts,
       job.workflowName,
     );
+  }
+
+  /**
+   * Record the step results a terminal `job.status` reports for a job that
+   * streamed no `step.status`, so the step rows say what the job's check
+   * summary already shows. A job whose rules returned `false` is the case: the
+   * agent ends it before any step starts and reports every step skipped in
+   * `data.stepResults`, so without this the job reads as one that ran with no
+   * steps. A job that streamed even one step keeps its streamed rows untouched.
+   */
+  private async recordReportedStepsWhenNoneStreamed(
+    runId: string,
+    jobId: string,
+    timestamp: number,
+    data: Record<string, unknown> | undefined,
+  ): Promise<void> {
+    const reported = reportedStepResults(data);
+    if (reported.length === 0) return;
+    try {
+      const streamed = await this.db
+        .selectFrom('execution_steps')
+        .select('step_index')
+        .where('run_id', '=', runId)
+        .where('job_id', '=', jobId)
+        .executeTakeFirst();
+      if (streamed) return;
+      for (const step of reported) {
+        await this.onStepStatus(runId, jobId, step.stepIndex, step.name, step.status, timestamp, {
+          durationMs: step.durationMs,
+          ...(step.error !== undefined && { error: step.error }),
+        });
+      }
+    } catch (err) {
+      logger.error('Failed to record the step results a job reported', {
+        runId,
+        jobId,
+        error: toErrorMessage(err),
+      });
+    }
   }
 
   /**
@@ -3917,11 +3994,38 @@ export class ExecutionTracker {
       values.group_id = String(data.groupId);
     }
 
-    await this.db
+    // Frames are applied concurrently, so a step's `running` frame can land after
+    // its terminal one. A terminal row is never reverted: reverted, the job's
+    // completion would then reconcile the "orphaned" running step to the job's
+    // own status, and a skipped step would read success.
+    // fails-when: a late running frame rewrites a skipped step to running
+    // breaks-if-wrong: a running frame for a new or still-running step must still apply
+    const isRunning = state === ExecutionStepStatus.enum.running;
+    const written = await this.db
       .insertInto('execution_steps')
       .values(values as any)
-      .onConflict((oc) => oc.columns(['run_id', 'job_id', 'step_index']).doUpdateSet(values as any))
-      .execute();
+      .onConflict((oc) => {
+        const conflict = oc.columns(['run_id', 'job_id', 'step_index']);
+        return isRunning
+          ? conflict
+              .doUpdateSet(values as any)
+              .where('execution_steps.status', 'not in', [...TERMINAL_JOB_STATES])
+          : conflict.doUpdateSet(values as any);
+      })
+      .executeTakeFirst();
+    if (isRunning && Number(written?.numInsertedOrUpdatedRows ?? 0) === 0) {
+      // The step already finished: keep its terminal status, record when it
+      // started if no frame has, and send nothing on.
+      await this.db
+        .updateTable('execution_steps')
+        .set({ started_at: now })
+        .where('run_id', '=', runId)
+        .where('job_id', '=', jobId)
+        .where('step_index', '=', stepIndex)
+        .where('started_at', 'is', null)
+        .execute();
+      return;
+    }
 
     const run = this.runs.get(runId);
     this.onStepStatusForward?.(

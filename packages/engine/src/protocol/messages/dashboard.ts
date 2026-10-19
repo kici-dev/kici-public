@@ -15,6 +15,7 @@ import {
   StepConcurrencyKind,
   stateReplayRunSchema,
   JobKind,
+  StepPhase,
 } from './execution-status.js';
 import { SourceSubtype } from './source-registration.js';
 import { SourceOrigin } from '../source-origin.js';
@@ -139,6 +140,10 @@ const dashboardStepDetailSchema = z.object({
   concurrencyKind: StepConcurrencyKind.nullable().optional(),
   /** Parallel-group correlation id shared by a group's children (e.g. `g0`). */
   groupId: z.string().nullable().optional(),
+  /** The phase of the job the step ran in. Absent from an older orchestrator. */
+  phase: StepPhase.optional(),
+  /** An init step's position in the job's init list; absent on any other step and from an older orchestrator. */
+  initIndex: z.number().int().nonnegative().optional(),
 });
 
 /** Job detail within a run detail response. */

@@ -23,8 +23,7 @@ import {
   isRunId,
   parseRunIdRef,
   runIdPrefixRange,
-  stepInitIndex,
-  stepPhase,
+  stepClassification,
 } from '@kici-dev/engine';
 import type { ExpressionBuilder, Kysely } from 'kysely';
 import type { Database } from '../db/types.js';
@@ -444,17 +443,8 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
         .execute();
       stepsByJob = new Map();
       for (const step of steps) {
-        let jobSteps = stepsByJob.get(step.job_id);
-        if (!jobSteps) {
-          jobSteps = [];
-          stepsByJob.set(step.job_id, jobSteps);
-        }
-        const ref = {
-          stepIndex: step.step_index,
-          stepType: step.step_type,
-          stepName: step.step_name,
-        };
-        const initIndex = stepInitIndex(ref);
+        const jobSteps = stepsByJob.get(step.job_id) ?? [];
+        stepsByJob.set(step.job_id, jobSteps);
         jobSteps.push({
           stepIndex: step.step_index,
           stepName: step.step_name,
@@ -466,8 +456,11 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
           errorMessage: step.error_message,
           stepType: step.step_type,
           // Readers tell init steps apart without parsing `stepType`; `stepIndex` stays raw.
-          phase: stepPhase(ref),
-          ...(initIndex !== undefined && { initIndex }),
+          ...stepClassification({
+            stepIndex: step.step_index,
+            stepType: step.step_type,
+            stepName: step.step_name,
+          }),
         });
       }
     }

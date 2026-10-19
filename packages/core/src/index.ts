@@ -1,4 +1,9 @@
 export { toErrorMessage, serializeError } from './error.js';
+export {
+  ConfigValidationError,
+  isConfigValidationError,
+  type ConfigIssue,
+} from './config-validation-error.js';
 export { initZx } from './zx.js';
 export {
   createLogger,

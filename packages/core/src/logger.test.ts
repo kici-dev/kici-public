@@ -10,7 +10,9 @@ import {
   buildLogFilename,
   flushLogFiles,
   installStreamErrorHandlers,
+  guardStartup,
 } from './logger.js';
+import { ConfigValidationError } from './config-validation-error.js';
 import { requestContext } from './request-context.js';
 import { makeTempDir } from './tmp.js';
 
@@ -635,5 +637,77 @@ describe('flushLogFiles', () => {
     const started = Date.now();
     await flushLogFiles();
     expect(Date.now() - started).toBeLessThan(100);
+  });
+});
+
+describe('guardStartup', () => {
+  const configError = () =>
+    new ConfigValidationError([
+      { envVar: 'KICI_ORCHESTRATOR_URL', field: 'orchestratorUrl', message: 'not set (required)' },
+    ]);
+
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    exitSpy = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+  });
+  afterEach(() => {
+    exitSpy.mockRestore();
+  });
+
+  // fails-when: the JSON record keeps `stack` for an operator input error, or loses its
+  // fixed message (a log reader finds the record by `message`).
+  it('JSON: config error has issues and no stack', async () => {
+    const { logger, getLastLine } = createCaptureLogger();
+    await guardStartup(logger, async () => {
+      throw configError();
+    });
+    const record = getLastLine();
+    expect(record?.message).toBe('Fatal startup error');
+    expect(record?.error).toContain('KICI_ORCHESTRATOR_URL: not set (required)');
+    expect((record?.issues as { envVar: string }[])[0].envVar).toBe('KICI_ORCHESTRATOR_URL');
+    expect(record?.stack).toBeUndefined();
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  // breaks-if-wrong: a crash that is not a config error must still log its stack.
+  it('JSON: other error keeps stack', async () => {
+    const { logger, getLastLine } = createCaptureLogger();
+    await guardStartup(logger, async () => {
+      throw new Error('boom');
+    });
+    const record = getLastLine();
+    expect(record?.message).toBe('Fatal startup error');
+    expect(record?.stack).toContain('boom');
+    expect(record?.issues).toBeUndefined();
+  });
+
+  // fails-when: the plain line is only `Fatal startup error`, the reason in metadata the
+  // plain format never prints.
+  it('plain: config error prints the reason without a stack', async () => {
+    const { logger, getLines } = createPlainCaptureLogger();
+    await guardStartup(logger, async () => {
+      throw configError();
+    });
+    const output = stripAnsi(getLines().join('\n'));
+    expect(output).toContain('Fatal startup error: Configuration validation failed:');
+    expect(output).toContain('KICI_ORCHESTRATOR_URL: not set (required)');
+    expect(output).not.toMatch(/\n\s+at /);
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('plain: other error prints stack', async () => {
+    const { logger, getLines } = createPlainCaptureLogger();
+    await guardStartup(logger, async () => {
+      throw new Error('boom');
+    });
+    const output = stripAnsi(getLines().join('\n'));
+    expect(output).toContain('Fatal startup error: Error: boom');
+    expect(output).toMatch(/\n\s+at /);
+  });
+
+  it('does not exit when the startup function resolves', async () => {
+    const { logger } = createCaptureLogger();
+    await guardStartup(logger, async () => {});
+    expect(exitSpy).not.toHaveBeenCalled();
   });
 });

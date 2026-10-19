@@ -3,6 +3,7 @@ import pc from 'picocolors';
 import DailyRotateFile from 'winston-daily-rotate-file';
 import { getRequestContext, type RequestContext } from './request-context.js';
 import { toErrorMessage } from './error.js';
+import { isConfigValidationError } from './config-validation-error.js';
 
 let _serviceName: string | undefined;
 
@@ -214,6 +215,13 @@ function pickJsonDefault(): boolean {
   return !process.stdout.isTTY;
 }
 
+/**
+ * Loggers `createLogger` built with the plain (non-JSON) format. `guardStartup`
+ * reads it to put the failure reason into the message line, the only field the
+ * plain format prints.
+ */
+const plainLoggers = new WeakSet<winston.Logger>();
+
 export function createLogger(options: LoggerOptions = {}): winston.Logger {
   const { json = pickJsonDefault(), level = 'info', prefix } = options;
 
@@ -315,6 +323,7 @@ export function createLogger(options: LoggerOptions = {}): winston.Logger {
     }
   }
 
+  if (!json) plainLoggers.add(loggerInstance);
   return loggerInstance;
 }
 
@@ -333,10 +342,18 @@ export async function guardStartup(log: winston.Logger, fn: () => Promise<void>)
   try {
     await fn();
   } catch (error) {
-    log.error('Fatal startup error', {
-      error: toErrorMessage(error),
-      stack: error instanceof Error ? error.stack : undefined,
-    });
+    // A configuration error is operator input, not a crash: it prints its
+    // per-variable lines and no stack.
+    const configError = isConfigValidationError(error);
+    const stack = !configError && error instanceof Error ? error.stack : undefined;
+    if (plainLoggers.has(log)) {
+      log.error(`Fatal startup error: ${stack ?? toErrorMessage(error)}`);
+    } else {
+      log.error('Fatal startup error', {
+        error: toErrorMessage(error),
+        ...(configError ? { issues: error.issues } : { stack }),
+      });
+    }
     process.exit(1);
   }
 }

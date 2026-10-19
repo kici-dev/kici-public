@@ -36,6 +36,20 @@ Each agent:
 
 ## Running the agent
 
+### Installed binary
+
+`kici-admin` installs the `kici-agent` binary. Check the version and the required environment variables, then start the agent:
+
+```bash
+kici-agent --version
+kici-agent --help
+
+export KICI_ORCHESTRATOR_URL=ws://your-orchestrator:4000/ws
+export KICI_LABELS=linux,docker
+
+kici-agent
+```
+
 ### Direct execution
 
 ```bash

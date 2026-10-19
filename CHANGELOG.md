@@ -2,6 +2,15 @@
 
 Release notes for the public KiCI packages.
 
+## v0.24.0 — 2026-10-19
+
+### Fixes
+
+- A re-run now goes through the same dispatch steps as the run it repeats. Its jobs can upload and download artifacts and use the user cache: before, an artifact upload from a re-run failed with `the run for this job could not be resolved on the orchestrator`. A re-run also keeps `needs` order (before, every job of a re-run started at once), applies contexts with their secrets and approval gates, runs `container` jobs in their container, and resolves the same trust tier from the same event as the original run. A re-run of an untrusted fork pull request reads the lock file from the base branch, as the original run did, and goes through the organization trust policy again: a fork pull request the policy holds is held again. This also applies to a re-run of an organization-wide workflow. A run that an internal event started can be re-run only while that event is still stored. A re-run of a re-run of an organization-wide workflow no longer fails to read its payload. A schedule fired by hand from the dashboard had the same faults and now runs as a scheduled fire does.
+- A job whose rule returns false now records each of its steps as skipped, as its check summary shows. `kici runs show` no longer says such a job ran on an agent with no steps. A step whose rule returns false no longer shows success when its start and its skip reach the orchestrator out of order.
+- `kici runs show --json` now gives each step a `phase`: `setup`, `init` or `steps`. An `init` command also gets `initIndex`, its position in the job's `init` list, so a script no longer needs the stored step index to find it. The steps are in the order they ran, also for a run that an older orchestrator recorded. The MCP `get_run` tool and `kici-admin runs structured --json` give each step the same fields. `kici runs show` also names a failed `init` command `init[n]` in its error line.
+- kici-agent --version prints the installed version and kici-agent --help lists the required environment variables; before, both started the agent. Any other argument stops the agent with exit status 2. A configuration error names the environment variable to set, without a stack trace, and the orchestrator's startup error does the same. In a terminal, a startup failure prints its reason.
+
 ## v0.23.0 — 2026-10-18
 
 ### Fixes

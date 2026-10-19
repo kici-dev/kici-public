@@ -78,8 +78,8 @@ That's the entire setup. The agent can now call the tools below.
 
 - `list_runs` — recent runs in your organization.
 - `get_run` — the structured, provenance-tagged result of a run: the typed job
-  graph, per-step statuses and exit codes, durations, and a derived failure
-  category.
+  graph, per-step statuses, phases and exit codes, durations, and a derived
+  failure category.
 - `get_step_logs` — the log lines for a specific step.
 - `list_workflows` — your registered workflows, optionally filtered by
   `triggerType`, `repo`, or `stale` (only those not triggered within a duration

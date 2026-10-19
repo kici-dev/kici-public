@@ -18,6 +18,7 @@
  */
 
 import { z } from 'zod';
+import { ConfigValidationError, type ConfigIssue } from '@kici-dev/core';
 
 /** Recursive env-var map. Leaf is the env var name (or array of aliases). */
 export type EnvMapValue = string | string[] | EnvMap;
@@ -57,6 +58,8 @@ export interface DefineEnvOptions<TShape extends z.ZodRawShape> {
   envMap: EnvMap;
   /** Optional per-field description override (keyed by dotted path). */
   descriptions?: Record<string, string>;
+  /** Last line of a validation error, e.g. where to find the variable list. */
+  validationHint?: string;
 }
 
 export interface DefineEnvResult<T> {
@@ -72,6 +75,12 @@ export interface DefineEnvResult<T> {
   listKnownEnvVars(): string[];
   /** Subset of `listKnownEnvVars()` starting with `KICI_`. */
   listKnownKiciVars(): string[];
+  /**
+   * Build the error `parse()` throws from Zod issues, for a caller that runs
+   * its own `safeParse` over an object shaped like this env map. `raw` is the
+   * object that was parsed; an issue on an undefined raw value reads "not set".
+   */
+  toValidationError(issues: readonly z.core.$ZodIssue[], raw: unknown): ConfigValidationError;
 }
 
 /** Read an env value following the alias precedence (first non-undefined wins). */
@@ -89,6 +98,37 @@ function readEnv(envMap: EnvMapValue, env: NodeJS.ProcessEnv): unknown {
     result[k] = readEnv(v, env);
   }
   return result;
+}
+
+/**
+ * The env var behind a config path: the leaf's name (first alias for an alias
+ * list), the leaf's name for a path deeper than a leaf, undefined when unmapped.
+ */
+function envVarForPath(envMap: EnvMap, path: readonly PropertyKey[]): string | undefined {
+  let node: EnvMapValue = envMap;
+  for (const key of path) {
+    if (typeof node === 'string' || Array.isArray(node)) break;
+    if (typeof key !== 'string') return undefined;
+    const next: EnvMapValue | undefined = node[key];
+    if (next === undefined) return undefined;
+    node = next;
+  }
+  if (typeof node === 'string') return node;
+  if (Array.isArray(node)) return node[0];
+  return undefined;
+}
+
+/**
+ * The raw value behind `path`: the value at it, or the env string a deeper path
+ * (an element of a parsed list) came from; undefined when a step is missing.
+ */
+function rawAt(raw: unknown, path: readonly PropertyKey[]): unknown {
+  let value: unknown = raw;
+  for (const key of path) {
+    if (value === null || typeof value !== 'object') return value;
+    value = (value as Record<PropertyKey, unknown>)[key];
+  }
+  return value;
 }
 
 /** Walk an EnvMap and yield every leaf env var name. */
@@ -309,13 +349,25 @@ export function defineEnv<TShape extends z.ZodRawShape>(
     const parserSchema: z.ZodType = parserOverride ?? opts.parser ?? opts.schema;
     const raw = readEnv(opts.envMap, env) as Record<string, unknown>;
     const result = parserSchema.safeParse(raw);
-    if (!result.success) {
-      const errors = result.error.issues
-        .map((err) => `  - ${err.path.join('.')}: ${err.message}`)
-        .join('\n');
-      throw new Error(`Configuration validation failed:\n${errors}`);
-    }
+    if (!result.success) throw toValidationError(result.error.issues, raw);
     return result.data as z.infer<z.ZodObject<TShape>>;
+  }
+
+  function toValidationError(
+    issues: readonly z.core.$ZodIssue[],
+    raw: unknown,
+  ): ConfigValidationError {
+    const mapped: ConfigIssue[] = issues.map((issue) => ({
+      envVar: envVarForPath(opts.envMap, issue.path),
+      field: issue.path.map(String).join('.'),
+      // Only a type failure on an absent value is "not set": an empty string
+      // fails its own check, and a refinement keeps its custom message.
+      message:
+        issue.code === 'invalid_type' && rawAt(raw, issue.path) === undefined
+          ? 'not set (required)'
+          : issue.message,
+    }));
+    return new ConfigValidationError(mapped, opts.validationHint);
   }
 
   function describe(): EnvFieldSpec[] {
@@ -332,7 +384,7 @@ export function defineEnv<TShape extends z.ZodRawShape>(
     return listKnownEnvVars().filter((n) => n.startsWith('KICI_'));
   }
 
-  return { parse, describe, listKnownEnvVars, listKnownKiciVars };
+  return { parse, describe, listKnownEnvVars, listKnownKiciVars, toValidationError };
 }
 
 /** Levenshtein distance; O(n*m) is fine for short env var names. */

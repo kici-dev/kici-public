@@ -23,20 +23,21 @@ import {
 } from './global-dispatch.js';
 import type { GlobalDispatchIdentity } from './global-dispatch-identity.js';
 import { resolveTrustForPR } from './process-webhook.js';
+import type { TrustPolicyOutcome } from '../security/trust-policy-gate.js';
 import type { ProcessingDeps } from './processor.js';
-import { claimRequestId } from './request-idempotency.js';
 import type { OriginalRunRow, RerunDeps } from './rerun.js';
 import {
+  claimRerunRequest,
+  emitWorkflowRerun,
   loadDeliveryEventName,
+  rerunSecurityDecision,
   loadWebhookPayload,
   normalizeRoundEvent,
-  RELEASED_DECISION,
   resolveRerunProviderBinding,
   withChangedFiles,
   type RerunProviderBinding,
   type RerunRefusal,
 } from './rerun-inputs.js';
-import { webhookPayloadPath } from './webhook-payload-store.js';
 import { isOrganizationWideEntry, loadWorkflowLockEntryAtSha } from './workflow-lock-at-sha.js';
 
 const logger = createLogger({ prefix: 'rerun' });
@@ -69,6 +70,8 @@ interface GlobalRerunPlan {
   event: SimulatedEvent;
   eventWithFiles: SimulatedEvent;
   trustResolution: TrustResolution | undefined;
+  /** The organization trust policy's verdict on the event, as the delivery reached it. */
+  securityDecision: TrustPolicyOutcome;
   registration: RegisteredWorkflow;
   workflow: LockWorkflow;
   /** Dependency-cache key of the lock file `workflow` was read from, at the recorded commit. */
@@ -102,15 +105,8 @@ export async function rerunCrossRepoGlobalRun(opts: {
   // of a relay failover re-send, so a refusal is never masked by the claim.
   const plan = await planCrossRepoGlobalRerun(originalRun, deps);
 
-  const { newRunId, claimed } = await claimRequestId(deps.db, requestId);
-  if (!claimed) {
-    logger.info('Rerun requestId already claimed by a sibling; returning existing run', {
-      originalRunId: originalRun.run_id,
-      requestId,
-      newRunId,
-    });
-    return { newRunId };
-  }
+  const { newRunId, claimed } = await claimRerunRequest(deps, requestId, originalRun.run_id);
+  if (!claimed) return { newRunId };
   const rootRunId = originalRun.original_run_id ?? originalRun.run_id;
   logger.info('Re-running an organization-wide workflow', {
     originalRunId: originalRun.run_id,
@@ -123,9 +119,10 @@ export async function rerunCrossRepoGlobalRun(opts: {
     sha: originalRun.sha,
     triggeredBy,
   });
-  await deps.logStorage.append(webhookPayloadPath(newRunId), JSON.stringify(plan.payload));
   const subjectEvent = originalRun.subject_trigger_event ?? originalRun.trigger_event ?? null;
 
+  // The pipeline stores the payload under the new run: storing it here as well
+  // appends a second copy, which no reader can parse.
   await dispatchMatchedWorkflow({
     info: globalRerunInfo(originalRun, plan, `rerun:${newRunId}`),
     deps: plan.processingDeps,
@@ -154,10 +151,10 @@ export async function rerunCrossRepoGlobalRun(opts: {
     lockFileSource: undefined,
     localWorkingTree: false,
     crossSource: false,
-    // Authorization to re-run is the decision an approval makes, so like a
-    // per-repository re-run this passes no trust-policy gate. Context rules and
-    // `approval` gates still hold the run.
-    securityDecision: RELEASED_DECISION,
+    // Re-running is not approving: the trust policy holds or rejects a fork pull
+    // request again, as on the delivery. Context rules and `approval` gates
+    // still hold the run.
+    securityDecision: plan.securityDecision,
     triggerEventOverride: 'rerun',
     triggeredBy,
     triggeredByAgentLabel,
@@ -168,21 +165,12 @@ export async function rerunCrossRepoGlobalRun(opts: {
     global: plan.global,
   });
 
-  if (deps.eventRouter) {
-    await deps.eventRouter.emit({
-      eventName: 'workflow.rerun',
-      payload: {
-        parentRunId: originalRun.run_id,
-        newRunId,
-        workflowName: plan.workflow.name,
-        repo: originalRun.repo_identifier,
-        sha: originalRun.sha,
-        triggeredBy,
-      },
-      sourceRepo: originalRun.repo_identifier,
-      sourceRoutingKey: originalRun.routing_key ?? undefined,
-    });
-  }
+  await emitWorkflowRerun(deps, {
+    originalRun,
+    newRunId,
+    workflowName: plan.workflow.name,
+    triggeredBy,
+  });
   return { newRunId };
 }
 
@@ -274,7 +262,17 @@ async function planCrossRepoGlobalRerun(
     repoIdentifier: originalRun.repo_identifier,
   });
   const trust = await resolveTrustForPR({ info, bundle: binding.providerBundle, event, payload });
+  const securityDecision = await rerunSecurityDecision({
+    processingDeps,
+    bundle: binding.providerBundle,
+    delivery,
+    originalRun,
+    trustResolution: trust.trustResolution,
+    event,
+    refusal,
+  });
   return {
+    securityDecision,
     processingDeps,
     payload,
     binding,
@@ -304,7 +302,7 @@ async function planCrossRepoGlobalRerun(
  * delivery id is synthetic and has no event log entry, so the event name is
  * read from the root of the chain.
  */
-async function loadRerunChainRoot(
+export async function loadRerunChainRoot(
   originalRun: OriginalRunRow,
   deps: Pick<RerunDeps, 'db'>,
 ): Promise<OriginalRunRow> {

@@ -45,6 +45,7 @@ import { issueReboot } from './execution/reboot.js';
 import { decideIdleShutdown, idleShutdownDelayMs } from './idle-shutdown.js';
 import { agentToolRequirements } from './required-tools.js';
 import { pidOneWarning } from './pid-one.js';
+import { handleAgentCliArgs } from './cli-args.js';
 
 // Build-time constants injected by Rolldown (scripts/build-service.mjs). The SDK
 // drift diagnostic compares the baked sdkBundleHash against the orchestrator's /health.
@@ -66,6 +67,9 @@ const SHARED_BUNDLE_HASH =
 const ENGINE_VERSION = typeof KICI_ENGINE_VERSION !== 'undefined' ? KICI_ENGINE_VERSION : 'unknown';
 const ENGINE_BUNDLE_HASH =
   typeof KICI_ENGINE_BUNDLE_HASH !== 'undefined' ? KICI_ENGINE_BUNDLE_HASH : 'unknown';
+
+// --help / --version / an unknown argument exit here, before telemetry or config.
+handleAgentCliArgs(process.argv.slice(2));
 
 // OTel must initialize before any module that creates meters at load time. ESM
 // static imports are hoisted, so those modules (./metrics/prometheus.js, and

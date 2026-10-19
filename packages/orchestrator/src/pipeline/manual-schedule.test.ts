@@ -1,10 +1,6 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import {
-  buildManualJobConfig,
-  handleManualSchedule,
-  mergeScheduleInputs,
-} from './manual-schedule.js';
-import type { LockScheduleTrigger, LockWorkflow, MaterializedJob } from '@kici-dev/engine';
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
+import { handleManualSchedule, mergeScheduleInputs } from './manual-schedule.js';
+import type { LockScheduleTrigger } from '@kici-dev/engine';
 import { staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 // An in-memory idempotency claim exercises the wiring (a `claimed: false` re-send
@@ -33,20 +29,49 @@ vi.mock('./request-idempotency.js', () => ({
   pruneRequestIdempotency: vi.fn(async () => 0),
 }));
 
+// The internal-event pipeline has its own suite; stubbed so tests observe the
+// event, context and overrides a fire by hand dispatches with.
+const internalPipeline = vi.hoisted(() => ({
+  spy: null as null | Mock<(...args: unknown[]) => Promise<unknown>>,
+}));
+
+vi.mock('./internal-event-pipeline.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./internal-event-pipeline.js')>();
+  return {
+    ...actual,
+    dispatchInternalEventViaPipeline: (...args: unknown[]) => internalPipeline.spy!(...args),
+  };
+});
+
 function makeRegistration(overrides: Record<string, unknown> = {}) {
   return {
     id: 'reg-abc',
     repoIdentifier: 'owner/repo',
     routingKey: 'github:42',
+    customerId: 'org-7',
     workflowName: 'heartbeat',
     commitSha: 'abc123def',
+    defaultBranch: 'main',
     providerContext: { installationId: 42 },
     disabled: false,
     lockEntry: {
       name: 'heartbeat',
-      source: '.kici/workflows/heartbeat.ts',
+      source: { file: '.kici/workflows/heartbeat.ts', export: '#default' },
       contentHash: 'content-hash-1',
-      triggers: [{ _type: 'schedule', cron: '0 * * * *' }],
+      triggers: [
+        {
+          _type: 'schedule',
+          cronExpression: '0 * * * *',
+          timezone: 'UTC',
+          inputs: { mode: { type: 'enum', values: ['full', 'quick'], default: 'full' } },
+        },
+        {
+          _type: 'schedule',
+          cronExpression: '0 9 * * 1',
+          timezone: 'UTC',
+          inputs: { region: { type: 'string', default: 'eu' } },
+        },
+      ],
       jobs: [
         staticJob({
           name: 'beat',
@@ -60,50 +85,39 @@ function makeRegistration(overrides: Record<string, unknown> = {}) {
 }
 
 function makeDeps(registration: ReturnType<typeof makeRegistration> | null) {
-  const dispatcher = {
-    dispatch: vi.fn().mockResolvedValue({ status: 'dispatched', agentId: 'a1', jobId: 'j1' }),
-  };
-  const executionTracker = {
-    onExecutionStarted: vi.fn().mockResolvedValue(undefined),
-    onJobStatus: vi.fn().mockResolvedValue(undefined),
-    addJobsToRun: vi.fn().mockResolvedValue(undefined),
-  };
-  const providerBundle = {
-    repoUrlBuilder: {
-      buildCloneUrl: vi.fn().mockImplementation((id: string) => `https://github.com/${id}.git`),
-    },
-  };
-  const providerRegistry = {
-    getByRoutingKey: vi.fn().mockReturnValue(providerBundle),
-  };
-  const registrationIndex = {
-    getById: vi.fn().mockReturnValue(registration),
-  };
+  const providerBundle = { normalizer: { provider: 'github' } };
   const eventRouter = { emit: vi.fn().mockResolvedValue(undefined) };
-
+  const processingDeps = { orchestratorMode: 'platform' };
   return {
     deps: {
-      dispatcher,
-      executionTracker,
-      providerRegistry,
-      registrationIndex,
+      providerRegistry: { getByRoutingKey: vi.fn().mockReturnValue(providerBundle) },
+      registrationIndex: { getById: vi.fn().mockReturnValue(registration) },
       eventRouter,
+      processingDeps: () => processingDeps,
     } as never,
-    dispatcher,
-    executionTracker,
+    eventRouter,
+    providerBundle,
+    processingDeps,
   };
 }
 
 describe('handleManualSchedule', () => {
   let harness: ReturnType<typeof makeDeps>;
+  let dispatched: Mock<(...args: unknown[]) => Promise<unknown>>;
 
   beforeEach(() => {
     idempotency.reset();
     harness = makeDeps(makeRegistration());
+    dispatched = vi.fn<(...args: unknown[]) => Promise<unknown>>().mockResolvedValue({});
+    internalPipeline.spy = dispatched;
   });
 
-  it('dispatches with ref="" so the agent clones the default branch (not --branch HEAD)', async () => {
-    const result = await handleManualSchedule(
+  afterEach(() => {
+    internalPipeline.spy = null;
+  });
+
+  it('fires the schedule through the internal-event pipeline a cron fire takes', async () => {
+    const { newRunId } = await handleManualSchedule(
       'reg-abc',
       'user@test.com',
       null,
@@ -111,137 +125,63 @@ describe('handleManualSchedule', () => {
       'req-test',
     );
 
-    expect(result.newRunId).toBeDefined();
-    expect(harness.dispatcher.dispatch).toHaveBeenCalledOnce();
+    // fails-when: the fire hand-builds its own job config, which drops needs
+    // ordering, contexts, containers and the cache identity every artifact
+    // request is resolved against
+    expect(dispatched).toHaveBeenCalledOnce();
+    const [decision, lockFile, ctx, deps, overrides] = dispatched.mock.calls[0] as any[];
+    expect(decision).toMatchObject({ workflowName: 'heartbeat', matched: true });
+    expect(lockFile.workflows.map((w: { name: string }) => w.name)).toEqual(['heartbeat']);
+    expect(ctx).toMatchObject({
+      event: {
+        id: `manual_schedule:${newRunId}`,
+        eventName: '__schedule_fire',
+        payload: { commitSha: 'abc123def' },
+      },
+      routingKey: 'github:42',
+      repoIdentifier: 'owner/repo',
+      providerContext: { installationId: 42 },
+      cronCommitSha: 'abc123def',
+      registrationDefaultBranch: 'main',
+    });
+    expect(ctx.bundle).toBe(harness.providerBundle);
+    expect(deps).toBe(harness.processingDeps);
+    expect(overrides).toEqual({
+      runId: newRunId,
+      triggerEvent: 'manual_schedule',
+      triggeredBy: 'user@test.com',
+      triggeredByAgentLabel: null,
+      // A fire names no schedule, so the defaults of every schedule() trigger merge.
+      dispatchInputs: { mode: 'full', region: 'eu' },
+    });
+    expect(harness.eventRouter.emit).toHaveBeenCalledWith(
+      expect.objectContaining({ eventName: 'workflow.manual_schedule' }),
+    );
+  });
 
-    const input = harness.dispatcher.dispatch.mock.calls[0][0];
-    expect(input.ref).toBe('');
-    expect(input.sha).toBe('abc123def');
-    expect(input.repoUrl).toBe('https://github.com/owner/repo.git');
+  it('passes no dispatch inputs when no schedule declares any', async () => {
+    const entry = makeRegistration().lockEntry;
+    harness = makeDeps(
+      makeRegistration({
+        lockEntry: {
+          ...entry,
+          triggers: entry.triggers.map(({ inputs: _inputs, ...t }) => t),
+        },
+      }),
+    );
+
+    await handleManualSchedule('reg-abc', null, null, harness.deps, 'req-test');
+
+    expect('dispatchInputs' in (dispatched.mock.calls[0][4] as object)).toBe(false);
   });
 
   it('is idempotent on requestId: a failover re-send returns the same run without a second dispatch', async () => {
     const requestId = 'req-schedule-dedupe';
-    const first = await handleManualSchedule(
-      'reg-abc',
-      'user@test.com',
-      null,
-      harness.deps,
-      requestId,
-    );
-    const second = await handleManualSchedule(
-      'reg-abc',
-      'user@test.com',
-      null,
-      harness.deps,
-      requestId,
-    );
+    const first = await handleManualSchedule('reg-abc', 'u', null, harness.deps, requestId);
+    const second = await handleManualSchedule('reg-abc', 'u', null, harness.deps, requestId);
 
     expect(second.newRunId).toBe(first.newRunId);
-    // Only the first hop created + dispatched the run; the re-send short-circuits.
-    expect(harness.dispatcher.dispatch).toHaveBeenCalledOnce();
-    expect(harness.executionTracker.onExecutionStarted).toHaveBeenCalledOnce();
-  });
-
-  it('records execution with ref="" in executionTracker (matches automatic cron path)', async () => {
-    await handleManualSchedule('reg-abc', 'user@test.com', null, harness.deps, 'req-test');
-
-    expect(harness.executionTracker.onExecutionStarted).toHaveBeenCalledOnce();
-    const args = harness.executionTracker.onExecutionStarted.mock.calls[0];
-    expect(args[4]).toBe('');
-    expect(args[5]).toBe('abc123def');
-  });
-
-  it('expands a matrix job into N dispatches each carrying matrixValues', async () => {
-    harness = makeDeps(
-      makeRegistration({
-        lockEntry: {
-          name: 'heartbeat',
-          source: '.kici/workflows/heartbeat.ts',
-          contentHash: 'content-hash-1',
-          triggers: [{ _type: 'schedule', cron: '0 * * * *' }],
-          jobs: [
-            staticJob({
-              name: 'beat',
-              runsOn: [{ kind: 'exact', value: 'default' }],
-              steps: [{ name: 'ping', run: 'echo ok' }],
-              matrix: { _type: 'static', values: ['a', 'b'] },
-            }),
-          ],
-        },
-      }),
-    );
-
-    await handleManualSchedule('reg-abc', 'user@test.com', null, harness.deps, 'req-test');
-
-    expect(harness.dispatcher.dispatch).toHaveBeenCalledTimes(2);
-    const calls = harness.dispatcher.dispatch.mock.calls.map((c: any[]) => c[0]);
-    const byName = Object.fromEntries(calls.map((c: any) => [c.jobName, c]));
-    expect(Object.keys(byName).sort()).toEqual(['beat (a)', 'beat (b)']);
-    expect(byName['beat (a)'].jobConfig.matrixValues).toEqual({ value: 'a' });
-    expect(byName['beat (a)'].jobConfig.baseJobName).toBe('beat');
-    expect(byName['beat (a)'].jobConfig.matrix).toBeUndefined();
-  });
-
-  it('degrades gracefully when one matrix job can no longer expand (FanoutError)', async () => {
-    harness = makeDeps(
-      makeRegistration({
-        lockEntry: {
-          name: 'heartbeat',
-          source: '.kici/workflows/heartbeat.ts',
-          contentHash: 'content-hash-1',
-          triggers: [{ _type: 'schedule', cron: '0 * * * *' }],
-          jobs: [
-            staticJob({
-              name: 'bad',
-              runsOn: [{ kind: 'exact', value: 'default' }],
-              steps: [{ name: 'ping', run: 'echo ok' }],
-              // Static matrix with no `values` → materializeFanout throws FanoutError.
-              matrix: { _type: 'static' },
-            }),
-            staticJob({
-              name: 'good',
-              runsOn: [{ kind: 'exact', value: 'default' }],
-              steps: [{ name: 'ping', run: 'echo ok' }],
-            }),
-          ],
-        },
-      }),
-    );
-
-    const result = await handleManualSchedule(
-      'reg-abc',
-      'user@test.com',
-      null,
-      harness.deps,
-      'req-test',
-    );
-
-    // One rejected job does not fail the whole manual trigger: the good job dispatches.
-    expect(result.newRunId).toBeDefined();
-    expect(harness.dispatcher.dispatch).toHaveBeenCalledOnce();
-    expect(harness.dispatcher.dispatch.mock.calls[0][0].jobName).toBe('good');
-    // Both registered: 'good', plus the synthetic rejected entry for 'bad'.
-    expect(harness.executionTracker.addJobsToRun).toHaveBeenCalledOnce();
-    const registered = harness.executionTracker.addJobsToRun.mock.calls[0][1];
-    expect(registered.some((j: { jobName: string }) => j.jobName === 'good')).toBe(true);
-    expect(registered.some((j: { jobName: string }) => j.jobName === 'bad')).toBe(true);
-    // The synthetic-rejected 'bad' job is marked failed.
-    expect(harness.executionTracker.onJobStatus).toHaveBeenCalled();
-  });
-
-  it('throws if registration is missing', async () => {
-    const h = makeDeps(null);
-    await expect(
-      handleManualSchedule('reg-missing', null, null, h.deps, 'req-test'),
-    ).rejects.toThrow('Registration not found');
-  });
-
-  it('throws if registration is disabled', async () => {
-    const h = makeDeps(makeRegistration({ disabled: true }));
-    await expect(handleManualSchedule('reg-abc', null, null, h.deps, 'req-test')).rejects.toThrow(
-      'Workflow is disabled',
-    );
+    expect(dispatched).toHaveBeenCalledOnce();
   });
 
   it('throws if registration has no commit SHA', async () => {
@@ -249,52 +189,6 @@ describe('handleManualSchedule', () => {
     await expect(handleManualSchedule('reg-abc', null, null, h.deps, 'req-test')).rejects.toThrow(
       'Registration has no commit SHA',
     );
-  });
-
-  it('throws if workflow has no schedule trigger', async () => {
-    const h = makeDeps(
-      makeRegistration({
-        lockEntry: {
-          name: 'heartbeat',
-          source: '.kici/workflows/heartbeat.ts',
-          triggers: [{ _type: 'push', branches: ['main'] }],
-          jobs: [],
-        },
-      }),
-    );
-    await expect(handleManualSchedule('reg-abc', null, null, h.deps, 'req-test')).rejects.toThrow(
-      'Workflow has no schedule trigger',
-    );
-  });
-
-  it('routes via the cluster coordinator when one is available (cross-peer manual trigger)', async () => {
-    const h = makeDeps(makeRegistration());
-    const coordinator = {
-      routeJobs: vi.fn().mockResolvedValue({
-        localJobs: [],
-        reroutedJobs: [{ jobName: 'beat', peerId: 'host-1-eu' }],
-        failedJobs: [],
-      }),
-    };
-    (h.deps as any).coordinator = coordinator;
-
-    await handleManualSchedule('reg-abc', 'user@test.com', null, h.deps, 'req-test');
-
-    expect(coordinator.routeJobs).toHaveBeenCalledOnce();
-    const [runCtx, jobs] = coordinator.routeJobs.mock.calls[0];
-    expect(runCtx.routingKey).toBe('github:42');
-    expect(runCtx.event).toBe('manual_schedule');
-    expect(runCtx.ref).toBe('');
-    expect(runCtx.sha).toBe('abc123def');
-    expect(runCtx.installationId).toBe(42);
-    expect(jobs).toHaveLength(1);
-    expect(jobs[0].jobName).toBe('beat');
-    expect(jobs[0].ref).toBe('');
-    // Inner labels are double-wrapped as required by RunCoordinator
-    expect(jobs[0].runsOnLabels).toEqual([['default']]);
-
-    // Standalone dispatch was NOT called — coordinator owns dispatch
-    expect(h.dispatcher.dispatch).not.toHaveBeenCalled();
   });
 
   // ── `run.manual_schedule.request` orch-side trust model (security invariant) ──
@@ -305,27 +199,21 @@ describe('handleManualSchedule', () => {
   // carries only `requestId`, `actor` and `registrationId` — no routing data,
   // lock-file content or commit SHA. The orchestrator resolves the registration
   // in its OWN local `registrationIndex` (single-tenant), and every downstream
-  // value (repoUrl, sha, providerContext, routing key) comes from that record, so
-  // a `registrationId` not in this orchestrator's registry drives no side effect.
-  //
-  // The enforcement branches of `validateScheduleRequest` are covered as feature
-  // tests above. The tests below pin side-effect-freeness: a rejected request
-  // MUST NOT call `dispatcher.dispatch`, `executionTracker.onExecutionStarted` or
-  // `eventRouter.emit`. The audit-attribution caveat (`triggeredBy` is
-  // Platform-supplied) matches the rerun request's and is by design under the
-  // 3-tier auth model — outside customer-data isolation.
+  // value (sha, providerContext, routing key) comes from that record, so a
+  // `registrationId` not in this orchestrator's registry drives no side effect.
+  // A rejected request MUST NOT dispatch or emit.
   describe('tenant-isolation invariants under a rogue Platform', () => {
+    function expectNoSideEffect(h: ReturnType<typeof makeDeps>): void {
+      expect(dispatched).not.toHaveBeenCalled();
+      expect(h.eventRouter.emit).not.toHaveBeenCalled();
+    }
+
     it('forged registrationId (not in local index) is side-effect-free', async () => {
       const h = makeDeps(null);
       await expect(
         handleManualSchedule('forged-reg-id', null, null, h.deps, 'req-test'),
       ).rejects.toThrow('Registration not found');
-      expect(h.dispatcher.dispatch).not.toHaveBeenCalled();
-      expect(h.executionTracker.onExecutionStarted).not.toHaveBeenCalled();
-      expect(h.executionTracker.addJobsToRun).not.toHaveBeenCalled();
-      expect(
-        (h.deps as { eventRouter: { emit: ReturnType<typeof vi.fn> } }).eventRouter.emit,
-      ).not.toHaveBeenCalled();
+      expectNoSideEffect(h);
     });
 
     it('disabled registration is side-effect-free', async () => {
@@ -333,129 +221,26 @@ describe('handleManualSchedule', () => {
       await expect(handleManualSchedule('reg-abc', null, null, h.deps, 'req-test')).rejects.toThrow(
         'Workflow is disabled',
       );
-      expect(h.dispatcher.dispatch).not.toHaveBeenCalled();
-      expect(h.executionTracker.onExecutionStarted).not.toHaveBeenCalled();
-      expect(h.executionTracker.addJobsToRun).not.toHaveBeenCalled();
-      expect(
-        (h.deps as { eventRouter: { emit: ReturnType<typeof vi.fn> } }).eventRouter.emit,
-      ).not.toHaveBeenCalled();
+      expectNoSideEffect(h);
     });
 
     it('non-schedule-triggered registration cannot be manually triggered (side-effect-free)', async () => {
       // The schedule-only restriction stops the Platform from using
       // `run.manual_schedule.request` to dispatch any registration on this
-      // orchestrator (e.g. push- or pull_request-triggered workflows). Without
-      // it, the rerun surface would gain an alternate dispatch path with a
-      // strictly looser trust model.
+      // orchestrator (e.g. push- or pull_request-triggered workflows).
       const h = makeDeps(
         makeRegistration({
           lockEntry: {
-            name: 'ci',
-            source: '.kici/workflows/ci.ts',
+            ...makeRegistration().lockEntry,
             triggers: [{ _type: 'push', branches: ['main'] }],
-            jobs: [],
           },
         }),
       );
       await expect(handleManualSchedule('reg-abc', null, null, h.deps, 'req-test')).rejects.toThrow(
         'Workflow has no schedule trigger',
       );
-      expect(h.dispatcher.dispatch).not.toHaveBeenCalled();
-      expect(h.executionTracker.onExecutionStarted).not.toHaveBeenCalled();
-      expect(h.executionTracker.addJobsToRun).not.toHaveBeenCalled();
-      expect(
-        (h.deps as { eventRouter: { emit: ReturnType<typeof vi.fn> } }).eventRouter.emit,
-      ).not.toHaveBeenCalled();
+      expectNoSideEffect(h);
     });
-  });
-});
-
-function fakeScheduleWorkflow(inputs?: Record<string, unknown>): LockWorkflow {
-  return {
-    name: 'sched-wf',
-    source: 'test/repo',
-    triggers: [
-      {
-        _type: 'schedule',
-        cronExpression: '0 0 * * *',
-        timezone: 'UTC',
-        ...(inputs && { inputs }),
-      },
-    ],
-    jobs: [],
-  } as unknown as LockWorkflow;
-}
-
-function fakeMat(): MaterializedJob {
-  return {
-    expandedName: 'j',
-    baseName: 'j',
-    lockJob: { _type: 'static', name: 'j', steps: [], needs: [], rules: [] },
-  } as unknown as MaterializedJob;
-}
-
-describe('buildManualJobConfig dispatchInputs', () => {
-  it('stamps defaults-only schedule inputs onto the job config', () => {
-    const wf = fakeScheduleWorkflow({
-      mode: { type: 'enum', values: ['full', 'quick'], default: 'full' },
-    });
-    const cfg = buildManualJobConfig(wf, fakeMat());
-    expect(cfg.dispatchInputs).toEqual({ mode: 'full' });
-  });
-
-  it('omits dispatchInputs when the schedule declares no inputs', () => {
-    const cfg = buildManualJobConfig(fakeScheduleWorkflow(), fakeMat());
-    expect('dispatchInputs' in cfg).toBe(false);
-  });
-
-  it('merges defaults across ALL schedule triggers on a manual fire', () => {
-    const wf = {
-      name: 'multi-sched-wf',
-      source: 'test/repo',
-      triggers: [
-        {
-          _type: 'schedule',
-          cronExpression: '0 9 * * 1',
-          timezone: 'UTC',
-          inputs: { mode: { type: 'enum', values: ['full', 'quick'], default: 'full' } },
-        },
-        {
-          _type: 'schedule',
-          cronExpression: '0 18 * * 5',
-          timezone: 'UTC',
-          inputs: { region: { type: 'string', default: 'eu' } },
-        },
-      ],
-      jobs: [],
-    } as unknown as LockWorkflow;
-    const cfg = buildManualJobConfig(wf, fakeMat());
-    expect(cfg.dispatchInputs).toEqual({ mode: 'full', region: 'eu' });
-  });
-});
-
-describe('buildManualJobConfig gitCredentials', () => {
-  it("carries the lock job's declared map through to the agent", () => {
-    const declared = { default: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' } };
-    const mat = {
-      expandedName: 'j',
-      baseName: 'j',
-      lockJob: {
-        _type: 'static',
-        name: 'j',
-        steps: [],
-        needs: [],
-        rules: [],
-        gitCredentials: declared,
-      },
-    } as unknown as MaterializedJob;
-    // `routeOrDispatchJobs` persists the same map on the job row; without it in
-    // the job config the agent's map is empty, so `credential: 'x'` throws and
-    // `default` silently falls back to the source credential.
-    expect(buildManualJobConfig(fakeScheduleWorkflow(), mat).gitCredentials).toEqual(declared);
-  });
-
-  it('omits the key when the job declares none', () => {
-    expect('gitCredentials' in buildManualJobConfig(fakeScheduleWorkflow(), fakeMat())).toBe(false);
   });
 });
 

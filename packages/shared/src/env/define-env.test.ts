@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { z } from 'zod';
 import { defineEnv, validateUnknownKiciVars } from './define-env.js';
+import { isConfigValidationError } from '@kici-dev/core';
 
 describe('defineEnv', () => {
   it('parses a flat schema from env vars', () => {
@@ -449,5 +450,118 @@ describe('validateUnknownKiciVars', () => {
         },
       ),
     ).not.toThrow();
+  });
+});
+
+describe('validation errors name env vars', () => {
+  const envDef = defineEnv({
+    service: 't',
+    schema: z.object({ url: z.string().url(), n: z.coerce.number() }),
+    envMap: { url: 'KICI_URL', n: 'KICI_N' },
+    validationHint: 'See the docs.',
+  });
+
+  function errorOf(fn: () => unknown): Error {
+    try {
+      fn();
+    } catch (err) {
+      return err as Error;
+    }
+    throw new Error('expected a throw');
+  }
+
+  // fails-when: the renderer prints the Zod path (`url: Invalid input…`).
+  it('names the env var and says not set for a missing required var', () => {
+    expect(() => envDef.parse({ KICI_N: '1' })).toThrow('  - KICI_URL: not set (required)');
+  });
+
+  // fails-when: the "not set" rule tests falsiness instead of undefined.
+  it('empty value is not reported as not set', () => {
+    const err = errorOf(() => envDef.parse({ KICI_URL: '', KICI_N: '1' }));
+    expect(err.message).toMatch(/KICI_URL: Invalid URL/);
+    expect(err.message).not.toContain('not set');
+  });
+
+  it('keeps the zod message for a wrong type', () => {
+    expect(() => envDef.parse({ KICI_URL: 'https://x', KICI_N: 'x' })).toThrow(
+      /KICI_N: Invalid input: expected number/,
+    );
+  });
+
+  it('keeps a custom issue message on an unset field', () => {
+    const schema = z.object({ role: z.string(), coordinatorUrl: z.string().optional() });
+    const refined = schema.superRefine((cfg, ctx) => {
+      if (cfg.role === 'worker' && !cfg.coordinatorUrl) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['coordinatorUrl'],
+          message: 'coordinatorUrl required for workers',
+        });
+      }
+    });
+    const def = defineEnv({
+      service: 't',
+      schema,
+      parser: refined,
+      envMap: { role: 'KICI_ROLE', coordinatorUrl: 'KICI_COORD' },
+    });
+    expect(() => def.parse({ KICI_ROLE: 'worker' })).toThrow(
+      '  - KICI_COORD: coordinatorUrl required for workers',
+    );
+  });
+
+  it('resolves a nested envMap path', () => {
+    const def = defineEnv({
+      service: 't',
+      schema: z.object({ cluster: z.object({ id: z.string() }) }),
+      envMap: { cluster: { id: 'KICI_CLUSTER_ID' } },
+    });
+    const err = errorOf(() => def.parse({}));
+    expect(err.message.split('\n')[1]).toBe('  - KICI_CLUSTER_ID: not set (required)');
+  });
+
+  it('names the leaf var for an issue inside a parsed list', () => {
+    const def = defineEnv({
+      service: 't',
+      schema: z.object({
+        ports: z
+          .string()
+          .transform((v) => v.split(','))
+          .pipe(z.array(z.string().min(2))),
+      }),
+      envMap: { ports: 'KICI_PORTS' },
+    });
+    const err = errorOf(() => def.parse({ KICI_PORTS: 'ab,c' }));
+    expect(err.message).toMatch(/^ {2}- KICI_PORTS: /m);
+    expect(err.message).not.toContain('not set');
+  });
+
+  it('appends the validationHint and throws a ConfigValidationError', () => {
+    const err = errorOf(() => envDef.parse({ KICI_N: '1' }));
+    expect(isConfigValidationError(err)).toBe(true);
+    expect(err.message.endsWith('\nSee the docs.')).toBe(true);
+    if (!isConfigValidationError(err)) throw err;
+    expect(err.issues[0]).toEqual({
+      envVar: 'KICI_URL',
+      field: 'url',
+      message: 'not set (required)',
+    });
+  });
+
+  it('never prints the internal field name for a mapped field', () => {
+    const err = errorOf(() => envDef.parse({ KICI_N: 'x' }));
+    expect(err.message).not.toMatch(/\burl:/);
+    expect(err.message).not.toMatch(/\bn:/);
+  });
+
+  it('toValidationError renders issues from a caller-run safeParse', () => {
+    const schema = z.object({ url: z.string() });
+    const def = defineEnv({ service: 't', schema, envMap: { url: 'KICI_URL' } });
+    const raw = { url: undefined };
+    const result = schema.safeParse(raw);
+    if (result.success) throw new Error('expected failure');
+    expect(def.toValidationError(result.error.issues, raw).message).toBe(
+      'Configuration validation failed:\n  - KICI_URL: not set (required)',
+    );
   });
 });

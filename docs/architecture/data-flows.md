@@ -665,7 +665,7 @@ Dashboard                    Platform                         Orchestrator
     |                          |                              |-- Load original run from DB
     |                          |                              |-- Read webhook payload from storage
     |                          |                              |-- Re-fetch lock file at original SHA
-    |                          |                              |-- Dispatch new jobs via Dispatcher
+    |                          |                              |-- Dispatch through the shared pipeline
     |                          |                              |-- Record execution with parent_run_id + original_run_id
     |                          |                              |-- execution.status (WS, via callback)
     |                          |                              |   { parentRunId, originalRunId, triggeredBy }
@@ -681,10 +681,12 @@ Dashboard                    Platform                         Orchestrator
 Key design points:
 
 - **Cooldown enforcement:** The Platform enforces a 5-second cooldown per original run via the `last_rerun_at` column. Rapid re-run attempts receive 429 Too Many Requests.
-- **Payload reuse:** The orchestrator reads the original webhook payload from filesystem/object storage and stores a copy for the new run (enabling re-run of re-runs).
+- **Payload reuse:** The orchestrator reads the original webhook payload from filesystem/object storage, and the dispatch pipeline stores it for the new run (enabling re-run of re-runs).
 - **Lock file at original SHA:** The lock file is re-fetched at the original commit SHA, ensuring the re-run uses the same workflow definition.
 - **Lineage tracking:** The new run has `parent_run_id` pointing to the immediate parent run, `original_run_id` pointing to the root ancestor run (for chain traversal), and `triggered_by` recording the user identity.
-- **No trigger matching:** Re-runs skip deduplication, normalization, and trigger matching. They go directly from lock file parse to job dispatch.
+- **No trigger matching:** Re-runs skip deduplication and trigger matching. The run's workflow is dispatched directly, limited to its declared static jobs, and its filter is not evaluated again.
+- **Same pipeline as the original run:** What started the chain's first run decides how it re-runs. A schedule fire, by cron or by hand, fires again at the recorded commit. A webhook delivery re-runs from its stored payload through the dispatch pipeline the delivery used, with the event, trust tier and lock file the delivery resolved; an untrusted fork pull request reads its base branch's lock file, as the original did. An internal event is read back from the event store, only when it belongs to the run's organization, so the re-run inherits the trust of the run that emitted it. A run an invoke gate summoned re-runs from its stored payload and inherits the trust of the run that summoned it. A run whose event is no longer stored is refused. So a re-run keeps `needs` ordering, contexts and their secrets, approval gates, containers, and the cache identity its artifact and user-cache requests resolve against.
+- **Trust policy:** Re-running is not approving. A re-run of a webhook delivery goes through the organization trust policy again, so a fork pull request the policy holds is held again, and one it ignores is not run.
 
 ### Cancel flow
 

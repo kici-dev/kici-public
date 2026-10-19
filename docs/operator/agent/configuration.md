@@ -7,6 +7,28 @@ description: Environment variables, labels, container executor setup
 
 All agent configuration is provided via environment variables.
 
+## Command-line options
+
+The agent reads its configuration only from environment variables. It accepts these options:
+
+| Option            | Effect                                                                                       |
+| ----------------- | -------------------------------------------------------------------------------------------- |
+| `-V`, `--version` | Prints the installed agent version and exits.                                                |
+| `-h`, `--help`    | Lists the required and frequently used environment variables, links to this page, and exits. |
+
+```bash
+kici-agent --version
+kici-agent --help
+```
+
+The agent stops with exit status 2 on any other argument. When a variable is missing or not valid, the agent stops with exit status 1. The error shows one line for each variable, with the name of the environment variable to set:
+
+```
+Configuration validation failed:
+  - KICI_ORCHESTRATOR_URL: not set (required)
+Run the agent with --help to list its environment variables, or see https://docs.kici.dev/operator/agent/configuration/.
+```
+
 ## Environment variables
 
 These environment variables are specific to the agent. Variables shared across
@@ -15,53 +37,53 @@ and the rotated-file logger live in the [environment variable reference](../env-
 
 <!-- BEGIN GENERATED: agent-env (do not edit; run the doc generator) -->
 
-| Env var                                    | Required | Default    | Type                                    | Aliases | Description |
-| ------------------------------------------ | -------- | ---------- | --------------------------------------- | ------- | ----------- |
-| `KICI_AGENT_BETWEEN_JOBS_RESET_COMMAND`    | no       |            | string                                  |         |             |
-| `KICI_AGENT_BETWEEN_JOBS_RESET_RUN_ON`     | no       | "always"   | enum:always\|on-failure                 |         |             |
-| `KICI_AGENT_BETWEEN_JOBS_RESET_TIMEOUT_MS` | no       | 60000      | number                                  |         |             |
-| `KICI_AGENT_COMMAND`                       | no       |            | string                                  |         |             |
-| `KICI_AGENT_DRAIN_ON_RESET_FAILURE`        | no       | "false"    | string                                  |         |             |
-| `KICI_AGENT_ID`                            | no       |            | string                                  |         |             |
-| `KICI_AGENT_IS_ORCHESTRATOR_HOST`          | no       |            | string                                  |         |             |
-| `KICI_AGENT_ORPHAN_CLEANUP`                | no       | "true"     | string                                  |         |             |
-| `KICI_AGENT_PAYLOAD_DIR`                   | no       |            | string                                  |         |             |
-| `KICI_AGENT_TOKEN`                         | no       |            | string                                  |         |             |
-| `KICI_ALLOW_INSTALL_SCRIPTS`               | no       | "false"    | string                                  |         |             |
-| `KICI_BACKPRESSURE_MODE`                   | no       | "pause"    | enum:pause\|drop                        |         |             |
-| `KICI_CONTAINER_BUILD_CLI`                 | no       |            | enum:docker\|podman                     |         |             |
-| `KICI_DEFAULT_STEP_TIMEOUT_MS`             | no       | 1800000    | number                                  |         |             |
-| `KICI_DOCKER_KEEP_FAILED`                  | no       | "false"    | string                                  |         |             |
-| `KICI_EXECUTION_MODE`                      | no       |            | enum:container\|bare-metal\|firecracker |         |             |
-| `KICI_GITHUB_TOKEN`                        | no       |            | string                                  |         |             |
-| `KICI_HOST_INSTALL_REGISTRIES`             | no       |            | string                                  |         |             |
-| `KICI_IN_PLACE`                            | no       | "false"    | string                                  |         |             |
-| `KICI_JOB_IMAGE_AGENT`                     | no       |            | string                                  |         |             |
-| `KICI_LABELS`                              | no       |            | string                                  |         |             |
-| `KICI_MAX_LOG_SIZE_BYTES`                  | no       | 10485760   | number                                  |         |             |
-| `KICI_ORCHESTRATOR_URL`                    | yes      |            | string                                  |         |             |
-| `KICI_PORT`                                | no       | 8080       | number                                  |         |             |
-| `KICI_PROPERTIES`                          | no       |            | string                                  |         |             |
-| `KICI_ROLES`                               | no       |            | string                                  |         |             |
-| `KICI_RUNNER_DEBUG_STDIO`                  | no       | "false"    | string                                  |         |             |
-| `KICI_RUNNER_USER`                         | no       |            | string                                  |         |             |
-| `KICI_RUNTIME_IMAGE`                       | no       |            | string                                  |         |             |
-| `KICI_RUNTIME_NODE_SOURCE`                 | no       |            | string                                  |         |             |
-| `KICI_SANDBOX`                             | no       | "false"    | string                                  |         |             |
-| `KICI_SANDBOX_HARDENED`                    | no       | "true"     | string                                  |         |             |
-| `KICI_SANDBOX_MEMORY_BYTES`                | no       | 2147483648 | number                                  |         |             |
-| `KICI_SANDBOX_NANO_CPUS`                   | no       | 2000000000 | number                                  |         |             |
-| `KICI_SANDBOX_NETWORK`                     | no       | "isolated" | enum:isolated\|host                     |         |             |
-| `KICI_SANDBOX_NETWORK_ISOLATION`           | no       | "true"     | string                                  |         |             |
-| `KICI_SANDBOX_PIDS_LIMIT`                  | no       | 512        | number                                  |         |             |
-| `KICI_SANDBOX_READONLY_ROOTFS`             | no       | "false"    | string                                  |         |             |
-| `KICI_SANDBOX_USER`                        | no       |            | string                                  |         |             |
-| `KICI_SCALER_CLAIM_CODE`                   | no       |            | string                                  |         |             |
-| `KICI_SCALER_IDLE_TIMEOUT`                 | no       | 5000       | number                                  |         |             |
-| `KICI_SCALER_MANAGED`                      | no       |            | string                                  |         |             |
-| `KICI_SCALER_PENDING_DISPATCH_TIMEOUT`     | no       | 60000      | number                                  |         |             |
-| `KICI_SCALER_SINGLE_JOB`                   | no       |            | string                                  |         |             |
-| `KICI_TRUSTED_ENV`                         | no       | "false"    | string                                  |         |             |
+| Env var                                    | Required | Default    | Type                                    | Aliases | Description                                                               |
+| ------------------------------------------ | -------- | ---------- | --------------------------------------- | ------- | ------------------------------------------------------------------------- |
+| `KICI_AGENT_BETWEEN_JOBS_RESET_COMMAND`    | no       |            | string                                  |         |                                                                           |
+| `KICI_AGENT_BETWEEN_JOBS_RESET_RUN_ON`     | no       | "always"   | enum:always\|on-failure                 |         |                                                                           |
+| `KICI_AGENT_BETWEEN_JOBS_RESET_TIMEOUT_MS` | no       | 60000      | number                                  |         |                                                                           |
+| `KICI_AGENT_COMMAND`                       | no       |            | string                                  |         |                                                                           |
+| `KICI_AGENT_DRAIN_ON_RESET_FAILURE`        | no       | "false"    | string                                  |         |                                                                           |
+| `KICI_AGENT_ID`                            | no       |            | string                                  |         | Agent ID. Default: the host name and a random suffix.                     |
+| `KICI_AGENT_IS_ORCHESTRATOR_HOST`          | no       |            | string                                  |         |                                                                           |
+| `KICI_AGENT_ORPHAN_CLEANUP`                | no       | "true"     | string                                  |         |                                                                           |
+| `KICI_AGENT_PAYLOAD_DIR`                   | no       |            | string                                  |         |                                                                           |
+| `KICI_AGENT_TOKEN`                         | no       |            | string                                  |         | Agent token (kat_…) that the orchestrator issued for this agent.          |
+| `KICI_ALLOW_INSTALL_SCRIPTS`               | no       | "false"    | string                                  |         |                                                                           |
+| `KICI_BACKPRESSURE_MODE`                   | no       | "pause"    | enum:pause\|drop                        |         |                                                                           |
+| `KICI_CONTAINER_BUILD_CLI`                 | no       |            | enum:docker\|podman                     |         |                                                                           |
+| `KICI_DEFAULT_STEP_TIMEOUT_MS`             | no       | 1800000    | number                                  |         |                                                                           |
+| `KICI_DOCKER_KEEP_FAILED`                  | no       | "false"    | string                                  |         |                                                                           |
+| `KICI_EXECUTION_MODE`                      | no       |            | enum:container\|bare-metal\|firecracker |         |                                                                           |
+| `KICI_GITHUB_TOKEN`                        | no       |            | string                                  |         |                                                                           |
+| `KICI_HOST_INSTALL_REGISTRIES`             | no       |            | string                                  |         |                                                                           |
+| `KICI_IN_PLACE`                            | no       | "false"    | string                                  |         |                                                                           |
+| `KICI_JOB_IMAGE_AGENT`                     | no       |            | string                                  |         |                                                                           |
+| `KICI_LABELS`                              | no       |            | string                                  |         | Comma-separated labels that jobs use to select this agent.                |
+| `KICI_MAX_LOG_SIZE_BYTES`                  | no       | 10485760   | number                                  |         |                                                                           |
+| `KICI_ORCHESTRATOR_URL`                    | yes      |            | string                                  |         | WebSocket URL of the orchestrator, for example ws://orchestrator:4000/ws. |
+| `KICI_PORT`                                | no       | 8080       | number                                  |         | Port of the health and metrics endpoints.                                 |
+| `KICI_PROPERTIES`                          | no       |            | string                                  |         |                                                                           |
+| `KICI_ROLES`                               | no       |            | string                                  |         | Comma-separated roles: builder, init-runner, all. Unset means all.        |
+| `KICI_RUNNER_DEBUG_STDIO`                  | no       | "false"    | string                                  |         |                                                                           |
+| `KICI_RUNNER_USER`                         | no       |            | string                                  |         |                                                                           |
+| `KICI_RUNTIME_IMAGE`                       | no       |            | string                                  |         |                                                                           |
+| `KICI_RUNTIME_NODE_SOURCE`                 | no       |            | string                                  |         |                                                                           |
+| `KICI_SANDBOX`                             | no       | "false"    | string                                  |         |                                                                           |
+| `KICI_SANDBOX_HARDENED`                    | no       | "true"     | string                                  |         |                                                                           |
+| `KICI_SANDBOX_MEMORY_BYTES`                | no       | 2147483648 | number                                  |         |                                                                           |
+| `KICI_SANDBOX_NANO_CPUS`                   | no       | 2000000000 | number                                  |         |                                                                           |
+| `KICI_SANDBOX_NETWORK`                     | no       | "isolated" | enum:isolated\|host                     |         |                                                                           |
+| `KICI_SANDBOX_NETWORK_ISOLATION`           | no       | "true"     | string                                  |         |                                                                           |
+| `KICI_SANDBOX_PIDS_LIMIT`                  | no       | 512        | number                                  |         |                                                                           |
+| `KICI_SANDBOX_READONLY_ROOTFS`             | no       | "false"    | string                                  |         |                                                                           |
+| `KICI_SANDBOX_USER`                        | no       |            | string                                  |         |                                                                           |
+| `KICI_SCALER_CLAIM_CODE`                   | no       |            | string                                  |         | Single-use claim code that a scaler gives to an agent it starts.          |
+| `KICI_SCALER_IDLE_TIMEOUT`                 | no       | 5000       | number                                  |         |                                                                           |
+| `KICI_SCALER_MANAGED`                      | no       |            | string                                  |         |                                                                           |
+| `KICI_SCALER_PENDING_DISPATCH_TIMEOUT`     | no       | 60000      | number                                  |         |                                                                           |
+| `KICI_SCALER_SINGLE_JOB`                   | no       |            | string                                  |         |                                                                           |
+| `KICI_TRUSTED_ENV`                         | no       | "false"    | string                                  |         |                                                                           |
 
 <!-- END GENERATED: agent-env -->
 

@@ -1824,3 +1824,52 @@ describe('fleet host entries carry confirmed', () => {
     expect(fleetHostEntrySchema.safeParse(INVENTORY_ENTRY).success).toBe(false);
   });
 });
+
+describe('dashboardRunDetailApiResponseSchema step classification', () => {
+  const step = {
+    stepIndex: 1_000_000,
+    stepName: 'init:0',
+    status: 'success',
+    startedAt: null,
+    completedAt: null,
+    durationMs: null,
+    exitCode: 0,
+    errorMessage: null,
+  };
+  const detail = (s: Record<string, unknown>) => ({
+    jobs: [
+      {
+        jobId: 'job-1',
+        jobName: 'build',
+        status: 'success',
+        matrixValues: null,
+        startedAt: null,
+        completedAt: null,
+        durationMs: null,
+        agentId: null,
+        errorMessage: null,
+        steps: [s],
+      },
+    ],
+  });
+
+  it('keeps phase and initIndex on a step', () => {
+    // fails-when: the schema lacks the fields and Zod strips them
+    const parsed = dashboardRunDetailApiResponseSchema.parse(
+      detail({ ...step, phase: 'init', initIndex: 0 }),
+    );
+    expect(parsed.jobs[0].steps[0]).toMatchObject({ phase: 'init', initIndex: 0 });
+  });
+
+  it('still accepts a step with no classification', () => {
+    // breaks-if-wrong: an older orchestrator's response must validate
+    const parsed = dashboardRunDetailApiResponseSchema.parse(detail(step));
+    expect(parsed.jobs[0].steps[0]).not.toHaveProperty('phase');
+  });
+
+  it('rejects an unknown phase', () => {
+    expect(
+      dashboardRunDetailApiResponseSchema.safeParse(detail({ ...step, phase: 'bogus' })).success,
+    ).toBe(false);
+  });
+});

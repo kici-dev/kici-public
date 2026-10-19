@@ -3,17 +3,26 @@
  * the dashboard. It dispatches directly, not through the fire-and-forget
  * `eventRouter.emit` the automatic cron path uses, so the WS response can
  * return the newRunId synchronously.
+ *
+ * A fire by hand is the run a cron fire would start, so it goes through the
+ * same internal-event pipeline: `needs` ordering, contexts and their secrets,
+ * approval gates, containers, the trusted tier a schedule fire carries, and the
+ * cache identity the orchestrator resolves artifact and user-cache requests
+ * against. Only the run id, the trigger event and who fired it differ.
  */
 
 import { createLogger } from '@kici-dev/shared';
-import { isLockStaticJob, matrixEnvelopeFields, resolveScheduleInputs } from '@kici-dev/engine';
-import type { LockScheduleTrigger, LockWorkflow, MaterializedJob } from '@kici-dev/engine';
+import { resolveScheduleInputs } from '@kici-dev/engine';
+import type { LockScheduleTrigger } from '@kici-dev/engine';
 import type { RerunDeps } from './rerun.js';
 import type { RegistrationIndex } from '../registration/registration-index.js';
 import type { RegisteredWorkflow } from '../registration/registration-index.js';
-import type { RunContext } from '../cluster/coordinator.js';
-import { routeOrDispatchJobs, registerDispatchedJobs } from './route-or-dispatch-jobs.js';
 import { claimRequestId } from './request-idempotency.js';
+import {
+  dispatchInternalEventViaPipeline,
+  InternalSystemEventName,
+} from './internal-event-pipeline.js';
+import { registrationLockFile } from '../events/event-router.js';
 
 const logger = createLogger({ prefix: 'manual-schedule' });
 
@@ -24,8 +33,10 @@ interface ManualScheduleDeps extends RerunDeps {
 interface ValidatedRequest {
   registration: RegisteredWorkflow;
   commitSha: string;
-  provider: string;
 }
+
+/** The `trigger_event` a schedule fired by hand records. */
+export const MANUAL_SCHEDULE_TRIGGER_EVENT = 'manual_schedule';
 
 export async function handleManualSchedule(
   registrationId: string,
@@ -39,7 +50,11 @@ export async function handleManualSchedule(
    */
   requestId: string,
 ): Promise<{ newRunId: string }> {
-  const { registration, commitSha, provider } = validateScheduleRequest(registrationId, deps);
+  const { registration, commitSha } = validateScheduleRequest(registrationId, deps);
+  const processingDeps = deps.processingDeps?.();
+  if (!processingDeps) {
+    throw new Error('This orchestrator is not wired to dispatch a schedule fired by hand');
+  }
   const workflow = registration.lockEntry;
 
   // Claim the `requestId` BEFORE the first write; on a failover re-send a
@@ -63,68 +78,46 @@ export async function handleManualSchedule(
     triggeredBy,
   });
 
-  const staticJobs = workflow.jobs.filter(isLockStaticJob);
-  const repoUrl = resolveRepoUrl(registration, deps);
-
-  await recordExecutionStart({
-    newRunId,
-    workflow,
-    registration,
-    commitSha,
-    provider,
-    triggeredBy,
-    triggeredByAgentLabel,
-    deps,
-  });
-
-  const installationId =
-    typeof (registration.providerContext as { installationId?: unknown }).installationId ===
-    'number'
-      ? ((registration.providerContext as { installationId: number }).installationId as number)
-      : undefined;
-
-  const runContext: RunContext = {
-    runId: newRunId,
-    deliveryId: `manual_schedule:${newRunId}`,
-    routingKey: registration.routingKey,
-    event: 'manual_schedule',
-    action: null,
-    provider,
-    payload: {},
-    repoIdentifier: registration.repoIdentifier,
-    sha: commitSha,
-    ref: '',
-    workflowName: workflow.name,
-    ...(installationId !== undefined && { installationId }),
-  };
-
-  const { dispatchedJobs, rejectedJobs } = await routeOrDispatchJobs({
-    newRunId,
-    staticJobs,
-    workflowName: workflow.name,
-    repoUrl,
-    ref: '',
-    sha: commitSha,
-    deliveryId: `manual_schedule:${newRunId}`,
-    provider,
-    providerContext: registration.providerContext as Record<string, unknown>,
-    routingKey: registration.routingKey,
-    runContext,
-    buildJobConfig: (mat) => buildManualJobConfig(workflow, mat),
-    logger,
-    label: 'Manual schedule',
-    coordinator: deps.coordinator,
-    dispatcher: deps.dispatcher,
-  });
-
-  await registerDispatchedJobs({
-    newRunId,
-    workflowName: workflow.name,
-    dispatchedJobs,
-    rejectedJobs,
-    executionTracker: deps.executionTracker,
-  });
-  await emitScheduleEvent({ newRunId, workflow, registration, triggeredBy, deps });
+  const scheduleTriggers = workflow.triggers.filter(
+    (t): t is LockScheduleTrigger => t._type === 'schedule',
+  );
+  const dispatchInputs = mergeScheduleInputs(scheduleTriggers);
+  await dispatchInternalEventViaPipeline(
+    {
+      workflowName: workflow.name,
+      matched: true,
+      checks: [],
+      summary: 'Schedule fired by hand',
+    },
+    registrationLockFile(registration),
+    {
+      // The fire's own id: a schedule fire is orchestrator-minted, so its trust
+      // is never looked up by event id.
+      event: {
+        id: `${MANUAL_SCHEDULE_TRIGGER_EVENT}:${newRunId}`,
+        eventName: InternalSystemEventName.enum.__schedule_fire,
+        payload: { commitSha },
+      },
+      routingKey: registration.routingKey,
+      repoIdentifier: registration.repoIdentifier,
+      providerContext: registration.providerContext,
+      providerType: registration.routingKey.split(':')[0] as 'github',
+      bundle: deps.providerRegistry.getByRoutingKey(registration.routingKey) ?? undefined,
+      cronCommitSha: commitSha,
+      registrationDefaultBranch: registration.defaultBranch ?? null,
+    },
+    processingDeps,
+    {
+      runId: newRunId,
+      triggerEvent: MANUAL_SCHEDULE_TRIGGER_EVENT,
+      triggeredBy,
+      triggeredByAgentLabel,
+      // A schedule fire carries no operator input: steps and rules see the
+      // declared defaults of every schedule() trigger as ctx.dispatchInputs.
+      ...(dispatchInputs && { dispatchInputs }),
+    },
+  );
+  await emitScheduleEvent({ newRunId, registration, triggeredBy, deps });
 
   return { newRunId };
 }
@@ -154,13 +147,7 @@ function validateScheduleRequest(
   return {
     registration,
     commitSha: registration.commitSha,
-    provider: registration.routingKey.split(':')[0],
   };
-}
-
-function resolveRepoUrl(registration: RegisteredWorkflow, deps: ManualScheduleDeps): string {
-  const providerBundle = deps.providerRegistry.getByRoutingKey(registration.routingKey);
-  return providerBundle?.repoUrlBuilder?.buildCloneUrl(registration.repoIdentifier) ?? '';
 }
 
 /**
@@ -184,106 +171,13 @@ export function mergeScheduleInputs(
   return any ? merged : undefined;
 }
 
-export function buildManualJobConfig(workflow: LockWorkflow, mat: MaterializedJob) {
-  const job = mat.lockJob;
-  // A schedule fire carries no operator input: steps and rules see the declared
-  // defaults of every schedule() trigger as ctx.dispatchInputs.
-  const scheduleTriggers = workflow.triggers.filter(
-    (t): t is LockScheduleTrigger => t._type === 'schedule',
-  );
-  const dispatchInputs = mergeScheduleInputs(scheduleTriggers);
-  return {
-    source: workflow.source,
-    workflowName: workflow.name,
-    ...matrixEnvelopeFields(mat),
-    steps: job.steps,
-    needs: job.needs,
-    rules: job.rules,
-    // Values are secret NAMES. `routeOrDispatchJobs` persists the same map on
-    // the job row for the credential relay; omitting it here leaves the agent
-    // an empty map, where `credential: 'x'` throws and `default` silently falls
-    // back to the source credential.
-    ...(job.gitCredentials && { gitCredentials: job.gitCredentials }),
-    ...(dispatchInputs && { dispatchInputs }),
-    ...(workflow.contentHash && { contentHash: workflow.contentHash }),
-    ...(workflow.resolvedHashFiles?.length && {
-      resolvedHashFiles: workflow.resolvedHashFiles,
-    }),
-  };
-}
-
-/**
- * Runs BEFORE dispatch, so a peer-rerouted onExecutionStarted hits ON CONFLICT
- * DO NOTHING and keeps this row's manual-schedule metadata (triggeredBy,
- * triggerEvent='manual_schedule'). Jobs join via addJobsToRun once dispatched.
- */
-async function recordExecutionStart(args: {
-  newRunId: string;
-  workflow: LockWorkflow;
-  registration: RegisteredWorkflow;
-  commitSha: string;
-  provider: string;
-  triggeredBy: string | null;
-  triggeredByAgentLabel: string | null;
-  deps: ManualScheduleDeps;
-}): Promise<void> {
-  const {
-    newRunId,
-    workflow,
-    registration,
-    commitSha,
-    provider,
-    triggeredBy,
-    triggeredByAgentLabel,
-    deps,
-  } = args;
-  await deps.executionTracker.onExecutionStarted(
-    newRunId,
-    workflow.name,
-    provider,
-    registration.repoIdentifier,
-    '',
-    commitSha,
-    `manual_schedule:${newRunId}`,
-    registration.providerContext,
-    null, // No trigger decision for manual schedules
-    [], // jobs added after dispatch via addJobsToRun
-    registration.routingKey,
-    undefined, // contexts
-    'manual_schedule', // triggerEvent
-    undefined, // commitMessage
-    undefined, // parentRunId
-    triggeredBy, // triggeredBy
-    undefined, // originalRunId
-    workflow.concurrency
-      ? {
-          cancelInProgress: workflow.concurrency.cancelInProgress,
-          max: workflow.concurrency.max,
-        }
-      : undefined,
-    workflow.timeout, // workflowTimeoutMs
-    undefined, // checkMode
-    undefined, // localWorkingTree
-    undefined, // triggerActorUsername
-    undefined, // triggerActorUserId
-    triggeredByAgentLabel, // triggeredByAgentLabel
-    undefined, // prNumber
-    undefined, // workflowRepo
-    // No pull request is in a manual schedule's provenance, so `false` is its
-    // true fork state, as for a push. Left unresolved, the documented
-    // `is_fork = 'false'` trust policy would reject a legitimate scheduled run.
-    { headRef: null, headRepository: null, isFork: false },
-  );
-}
-
 async function emitScheduleEvent(args: {
   newRunId: string;
-  workflow: LockWorkflow;
   registration: RegisteredWorkflow;
   triggeredBy: string | null;
   deps: ManualScheduleDeps;
 }): Promise<void> {
-  const { newRunId, workflow, registration, triggeredBy, deps } = args;
+  const { newRunId, registration, triggeredBy, deps } = args;
   if (!deps.eventRouter) {
     return;
   }
@@ -292,7 +186,7 @@ async function emitScheduleEvent(args: {
     eventName: 'workflow.manual_schedule',
     payload: {
       newRunId,
-      workflowName: workflow.name,
+      workflowName: registration.workflowName,
       repo: registration.repoIdentifier,
       sha: registration.commitSha,
       triggeredBy,

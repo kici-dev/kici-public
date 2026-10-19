@@ -3,6 +3,7 @@ import {
   wrapUntrusted,
   AgentFailureCategory,
   agentRunResultSchema,
+  agentStepResultSchema,
   agentStepLogsSchema,
   agentRunListItemSchema,
   agentWorkflowSummarySchema,
@@ -201,5 +202,36 @@ describe('agentWorkflowSummarySchema', () => {
       },
     };
     expect(agentWorkflowSummarySchema.parse(wf)).toEqual(wf);
+  });
+});
+
+describe('agentStepResultSchema step classification', () => {
+  const step = {
+    stepIndex: 1_000_000,
+    stepName: wrapUntrusted('init:0'),
+    status: 'success',
+    exitCode: 0,
+    durationMs: null,
+    startedAt: null,
+    completedAt: null,
+    errorMessage: null,
+    stepType: 'step',
+    checkOutcome: null,
+    secretsAccessed: [],
+  };
+
+  it('keeps phase and initIndex on a step', () => {
+    // fails-when: the schema lacks the fields and Zod strips them
+    const parsed = agentStepResultSchema.parse({ ...step, phase: 'init', initIndex: 0 });
+    expect(parsed).toMatchObject({ phase: 'init', initIndex: 0 });
+  });
+
+  it('still accepts a step with no classification', () => {
+    // breaks-if-wrong: an older orchestrator's result must validate
+    expect(agentStepResultSchema.parse(step)).not.toHaveProperty('phase');
+  });
+
+  it('rejects an unknown phase', () => {
+    expect(agentStepResultSchema.safeParse({ ...step, phase: 'bogus' }).success).toBe(false);
   });
 });

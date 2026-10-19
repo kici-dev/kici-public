@@ -28,6 +28,7 @@ import { resolveOrgId, type ProcessingDeps } from './processor.js';
 import { dispatchMatchedWorkflow } from './dispatch-matched-workflow.js';
 import type { WorkflowDispatchContext } from './dispatch-matched-workflow.js';
 import type { TrustResolution } from '../security/trust-resolver.js';
+import type { RerunLineage } from '../reporting/execution-tracker.js';
 import type { WebhookInfo } from '../webhook/handler.js';
 import type { ProviderBundle } from '../provider-registry.js';
 
@@ -536,6 +537,25 @@ async function resolveInternalInheritance(
 }
 
 /**
+ * How a run started by a person rather than by the event itself differs from
+ * the event's own run: a schedule fired by hand (`manual-schedule.ts`) and a
+ * re-run of an internally triggered run (`rerun.ts`). Each claims its run id
+ * first, so a relay failover re-send returns the same run.
+ */
+export interface InternalDispatchOverrides {
+  runId: string;
+  /** Recorded as the run's `trigger_event` (`manual_schedule`, `rerun`). */
+  triggerEvent: string;
+  triggeredBy: string | null;
+  triggeredByAgentLabel: string | null;
+  rerunLineage?: RerunLineage;
+  /** The trigger event the run's OIDC subject derives from; see `subjectTriggerEvent`. */
+  subjectTriggerEvent?: string;
+  /** Replaces the inputs derived from the fired schedule, for a fire that names none. */
+  dispatchInputs?: Record<string, unknown>;
+}
+
+/**
  * Dispatch one matched workflow for an internal event through the shared
  * pipeline. Returns `null` when the decision names a workflow the lock file
  * does not carry.
@@ -545,12 +565,13 @@ export async function dispatchInternalEventViaPipeline(
   lockFile: LockFile,
   ctx: InternalEventDispatchContext,
   deps: ProcessingDeps,
+  overrides?: InternalDispatchOverrides,
 ): Promise<{ runId: string; repo: string; workflow: string } | null> {
   const workflow = lockFile.workflows.find((w) => w.name === decision.workflowName);
   if (!workflow) return null;
 
   const { jobConfigType, triggerEvent } = deriveInternalEventIdentity(ctx.event.eventName);
-  const runId = randomUUID();
+  const runId = overrides?.runId ?? randomUUID();
   const payload = ctx.event.payload ?? {};
 
   // The branch presented to a context's branch restrictions: the registration's
@@ -598,7 +619,8 @@ export async function dispatchInternalEventViaPipeline(
 
   const resolvedOrgId = deps.db ? await resolveOrgId(deps.db, ctx.routingKey) : '__default__';
   const dispatchedByFailureLifecycle = isFailureLifecycleDispatch(workflow, decision);
-  const dispatchInputs = resolveInternalDispatchInputs(workflow, payload);
+  const dispatchInputs =
+    overrides?.dispatchInputs ?? resolveInternalDispatchInputs(workflow, payload);
 
   const dispatchCtx: WorkflowDispatchContext = {
     info,
@@ -631,8 +653,12 @@ export async function dispatchInternalEventViaPipeline(
     lockFileSource: undefined,
     localWorkingTree: false,
     crossSource: false,
-    triggeredBy: null,
-    triggeredByAgentLabel: null,
+    triggeredBy: overrides?.triggeredBy ?? null,
+    triggeredByAgentLabel: overrides?.triggeredByAgentLabel ?? null,
+    ...(overrides?.rerunLineage && { rerunLineage: overrides.rerunLineage }),
+    ...(overrides?.subjectTriggerEvent !== undefined && {
+      subjectTriggerEvent: overrides.subjectTriggerEvent,
+    }),
     // No pull-request provenance for the org trust policy to evaluate; the
     // centralized evaluator returns `pass` on a non-PR event, so this is the
     // same verdict, not a bypass (as in `test-pipeline.ts`).
@@ -640,7 +666,7 @@ export async function dispatchInternalEventViaPipeline(
     // Lets the context branch gate tell a branchless run (empty
     // `event.targetBranch`) from a branch mismatch and name the real cause.
     internallyTriggered: true,
-    triggerEventOverride: triggerEvent,
+    triggerEventOverride: overrides?.triggerEvent ?? triggerEvent,
     eventEnvelopeOverride: eventEnvelope,
     ...(dispatchInputs && { dispatchInputs }),
     ...(ctx.chainDepth !== undefined && { chainDepth: ctx.chainDepth }),

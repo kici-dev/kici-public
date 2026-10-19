@@ -10,6 +10,7 @@
 import {
   wrapUntrusted,
   ExecutionJobStatus,
+  stepClassification,
   type AgentRunResult,
   type AgentJobResult,
   type AgentStepResult,
@@ -71,6 +72,8 @@ function mapStep(s: CanonicalStep): AgentStepResult {
     stepType: s.stepType ?? 'step',
     checkOutcome: (s.checkOutcome as AgentStepResult['checkOutcome']) ?? null,
     secretsAccessed,
+    // Classified from the raw step name, before it is fenced.
+    ...stepClassification(s),
   };
 }
 

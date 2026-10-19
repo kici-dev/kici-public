@@ -6,10 +6,17 @@
  * re-run, so the paths cannot disagree about how a run's inputs are read back.
  */
 import type { SimulatedEvent } from '@kici-dev/engine';
+import { createLogger } from '@kici-dev/shared';
+import type { TrustResolution } from '../security/trust-resolver.js';
+import { evaluateSecurityPolicy, isPullRequestEvent } from './process-webhook.js';
+import type { ProcessingDeps } from './processor.js';
+import { claimRequestId } from './request-idempotency.js';
 import type { ProviderRegistry } from '../provider-registry.js';
 import type { TrustPolicyOutcome } from '../security/trust-policy-gate.js';
 import type { WebhookInfo } from '../webhook/handler.js';
 import { webhookPayloadPath } from './webhook-payload-store.js';
+
+const logger = createLogger({ prefix: 'rerun' });
 import { resolveEventChangedFiles, stampChangedFiles, withDefaultBranch } from './changed-files.js';
 import type { OriginalRunRow, RerunDeps } from './rerun.js';
 
@@ -107,19 +114,35 @@ export async function loadDeliveryEventName(
         `cannot be identified. ${refusal.remedy}`,
     );
   }
+  const found = await findDeliveryEventName(originalRun, deps);
+  if (!found) {
+    throw new Error(
+      `${refusal.subject}: no event log entry for delivery ${deliveryId} is available, so the ` +
+        `event it ${refusal.eventVerb} cannot be reconstructed. ${refusal.remedy}`,
+    );
+  }
+  return found;
+}
+
+/**
+ * The delivery's event name and action, or `null` when the run records no
+ * delivery id or the event log holds no row for it: a run the orchestrator
+ * started was never a delivery, and an old row may be past retention.
+ * Addressed as {@link loadDeliveryEventName} addresses it.
+ */
+export async function findDeliveryEventName(
+  originalRun: OriginalRunRow,
+  deps: Pick<RerunDeps, 'db'>,
+): Promise<{ event: string; action: string | null } | null> {
+  const deliveryId = originalRun.delivery_id;
+  if (!deliveryId) return null;
   const row = await deps.db
     .selectFrom('event_log')
     .select(['event', 'action'])
     .where('org_id', '=', originalRun.customer_id)
     .where('delivery_id', '=', deliveryId)
     .executeTakeFirst();
-  if (!row?.event) {
-    throw new Error(
-      `${refusal.subject}: no event log entry for delivery ${deliveryId} is available, so the ` +
-        `event it ${refusal.eventVerb} cannot be reconstructed. ${refusal.remedy}`,
-    );
-  }
-  return { event: row.event, action: row.action ?? null };
+  return row?.event ? { event: row.event, action: row.action ?? null } : null;
 }
 
 /** The verdict an approved security hold stands for. */
@@ -173,4 +196,86 @@ export async function withChangedFiles(opts: {
     event,
   });
   return { ...stampChangedFiles(event, resolved), sourceRepo: repoIdentifier };
+}
+
+/**
+ * The organization trust policy's verdict on a re-run's event, reached as the
+ * delivery reached it: re-running is not approving, so a fork pull request the
+ * policy holds is held again. An event the policy now ignores starts no run, so
+ * the re-run is refused before it claims a run id that would name nothing.
+ */
+export async function rerunSecurityDecision(args: {
+  processingDeps: ProcessingDeps;
+  bundle: NonNullable<ReturnType<ProviderRegistry['getByRoutingKey']>>;
+  delivery: { event: string };
+  originalRun: OriginalRunRow;
+  trustResolution: TrustResolution | undefined;
+  event: SimulatedEvent;
+  refusal: RerunRefusal;
+}): Promise<TrustPolicyOutcome> {
+  const { processingDeps, originalRun, refusal } = args;
+  // fails-when: a re-run of a fork pull request the policy held dispatches without the hold
+  // breaks-if-wrong: a re-run of a push, or of a trusted pull request, must dispatch
+  const decision = await evaluateSecurityPolicy({
+    deps: processingDeps,
+    bundle: args.bundle,
+    isPREvent: isPullRequestEvent(args.delivery.event),
+    resolvedOrgId: originalRun.customer_id,
+    mode: processingDeps.orchestratorMode ?? 'platform',
+    trustResolution: args.trustResolution,
+    isForkPR: args.event.isForkPR ?? false,
+  });
+  // fails-when: the policy ignores the event and the re-run answers with a run id
+  if (decision.action === 'ignore') {
+    throw new Error(
+      `${refusal.subject}: the organization trust policy ignores the event it ${refusal.eventVerb}, so nothing would run.`,
+    );
+  }
+  return decision;
+}
+
+/**
+ * Claim a re-run's Platform-minted request id. A failover re-send finds it
+ * claimed by a sibling and answers with that sibling's run.
+ */
+export async function claimRerunRequest(
+  deps: Pick<RerunDeps, 'db'>,
+  requestId: string,
+  originalRunId: string,
+): Promise<{ newRunId: string; claimed: boolean }> {
+  const claim = await claimRequestId(deps.db, requestId);
+  if (!claim.claimed) {
+    logger.info('Rerun requestId already claimed by a sibling; returning existing run', {
+      originalRunId,
+      requestId,
+      newRunId: claim.newRunId,
+    });
+  }
+  return claim;
+}
+
+/** Emit the `workflow.rerun` system event for a re-run that dispatched. */
+export async function emitWorkflowRerun(
+  deps: Pick<RerunDeps, 'eventRouter'>,
+  args: {
+    originalRun: OriginalRunRow;
+    newRunId: string;
+    workflowName: string;
+    triggeredBy: string | null;
+  },
+): Promise<void> {
+  const { originalRun } = args;
+  await deps.eventRouter?.emit({
+    eventName: 'workflow.rerun',
+    payload: {
+      parentRunId: originalRun.run_id,
+      newRunId: args.newRunId,
+      workflowName: args.workflowName,
+      repo: originalRun.repo_identifier,
+      sha: originalRun.sha,
+      triggeredBy: args.triggeredBy,
+    },
+    sourceRepo: originalRun.repo_identifier,
+    sourceRoutingKey: originalRun.routing_key ?? undefined,
+  });
 }

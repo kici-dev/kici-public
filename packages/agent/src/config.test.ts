@@ -71,7 +71,20 @@ describe('loadConfig', () => {
 
   it('throws with clear error when KICI_ORCHESTRATOR_URL is missing', () => {
     expect(() => loadConfig()).toThrow('Configuration validation failed');
-    expect(() => loadConfig()).toThrow('orchestratorUrl');
+    expect(() => loadConfig()).toThrow('  - KICI_ORCHESTRATOR_URL: not set (required)');
+  });
+
+  it('the missing-URL error ends with the --help hint and never names the field', () => {
+    let message = '';
+    try {
+      loadConfig();
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message.split('\n').at(-1)).toBe(
+      'Run the agent with --help to list its environment variables, or see https://docs.kici.dev/operator/agent/configuration/.',
+    );
+    expect(message).not.toMatch(/orchestratorUrl:/);
   });
 
   describe('container-sandbox hardening config', () => {
@@ -260,7 +273,7 @@ describe('loadConfig', () => {
     process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
     process.env.KICI_SANDBOX_NETWORK = 'maybe';
 
-    expect(() => loadConfig()).toThrow(/sandboxNetwork/);
+    expect(() => loadConfig()).toThrow(/KICI_SANDBOX_NETWORK/);
   });
 
   describe('KICI_HOST_INSTALL_REGISTRIES', () => {
@@ -503,7 +516,7 @@ describe('loadConfig', () => {
     it('rejects KICI_EXECUTION_MODE with unsupported value', () => {
       process.env.KICI_ORCHESTRATOR_URL = 'ws://localhost:4000';
       process.env.KICI_EXECUTION_MODE = 'wasm';
-      expect(() => loadConfig()).toThrow(/executionMode/);
+      expect(() => loadConfig()).toThrow(/KICI_EXECUTION_MODE/);
     });
 
     it('leaves executionMode undefined when env var unset', () => {

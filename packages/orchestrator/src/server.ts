@@ -618,6 +618,9 @@ export async function runServer(
                   pendingBuilds: sub.pendingBuilds ?? null,
                   registrationIndex: sub.registrationIndex,
                   coldStore: sub.coldStore,
+                  // The webhook path's bag: a fire by hand dispatches through the
+                  // same internal-event pipeline a cron fire does.
+                  processingDeps: buildProcessingDeps,
                 },
                 requestId,
               );

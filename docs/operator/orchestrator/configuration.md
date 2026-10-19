@@ -642,12 +642,12 @@ When SIGHUP is sent to a coordinator, both the orchestrator config and the scale
 
 ### Startup validation
 
-On startup, the orchestrator validates the environment against the startup schema in `packages/orchestrator/src/config.ts`. If validation fails, the service prints every error and exits:
+On startup, the orchestrator validates the environment against the startup schema in `packages/orchestrator/src/config.ts`. If validation fails, the service prints every error and exits. Each line names the environment variable to set:
 
 ```
 Configuration validation failed:
-  - platformUrl: KICI_PLATFORM_URL is required when KICI_MODE is platform, hybrid, or observed
-  - platformToken: KICI_PLATFORM_TOKEN is required when KICI_MODE is platform, hybrid, or observed
+  - KICI_PLATFORM_URL is required when KICI_MODE is platform, hybrid, or observed
+  - KICI_PLATFORM_TOKEN is required when KICI_MODE is platform, hybrid, or observed
 ```
 
 The reload path runs a second, separate validation: it merges the environment over the YAML file and validates the result against `appConfigSchema` in `packages/orchestrator/src/config/schema.ts`. A reload that fails validation keeps the current config and logs the errors.
