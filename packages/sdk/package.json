@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/sdk",
-  "version": "0.24.0",
+  "version": "0.25.0",
   "description": "TypeScript SDK for defining KiCI workflows. Import into `.kici/workflows/*.ts` to declare workflows, jobs, steps, triggers, rules, and matrix configurations.",
   "keywords": [
     "ci",
@@ -67,7 +67,7 @@
     "@kici-dev/engine": "workspace:*",
     "micromatch": "^4.0.8",
     "yaml": "^2.9.1",
-    "zod": "^4.6.5",
+    "zod": "^4.6.7",
     "zx": "^8.8.5"
   },
   "devDependencies": {

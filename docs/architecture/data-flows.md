@@ -230,6 +230,8 @@ The source cache and dep cache are independent. Four combinations are possible:
 
 A miss on either cache triggers a build job, and the job carries `buildSourceNeeded` and `buildDepsNeeded` separately. Deps are platform-specific (`deps/{platform}-{arch}/{hash}.tar.gz`), so the build job requires a builder agent with the target platform's `kici:os:` and `kici:arch:` labels. A single build job handles both artifacts when both miss, avoiding duplicate builds. A miss needs its key: a workflow with no `contentHash` builds no source pack, and a lock with no `lockfileHash` builds no dependency tarball.
 
+After the cache probe and before any build job, a single orchestrator checks the lock entry's `compileSchemaVersion`. It compares it with the schema that each agent able to load the source first reports: a connected agent, or a scaler label set whose agents reported one from an unchanged image or binary. When every such agent implements another schema, the run fails with `lock_resolution` and nothing is dispatched. An unknown agent, no agent, or another live cluster instance lets the run proceed, and the agent rejects the lock itself. See [compile schema mismatch](../user/lock-file-and-drift.md#compile-schema-mismatch).
+
 ### Cross-source / no-contentHash workflows
 
 - **A workflow entry without `contentHash`** skips the source cache entirely, and agents compile from source. The compiler writes a `contentHash` for every workflow, and a lock old enough to lack one (schema v1) is below the oldest supported schema version, so the orchestrator rejects it when it fetches the lock. Regenerate it with `kici compile`. The current lock file schema version is 44.
@@ -665,22 +667,24 @@ Dashboard                    Platform                         Orchestrator
     |                          |                              |-- Load original run from DB
     |                          |                              |-- Read webhook payload from storage
     |                          |                              |-- Re-fetch lock file at original SHA
-    |                          |                              |-- Dispatch through the shared pipeline
-    |                          |                              |-- Record execution with parent_run_id + original_run_id
-    |                          |                              |-- execution.status (WS, via callback)
-    |                          |                              |   { parentRunId, originalRunId, triggeredBy }
+    |                          |                              |-- Validate, then claim the request id
     |                          |<- run.rerun.response (WS) ---|
     |                          |   { newRunId }               |
-    |                          |                              |
     |<- 200 { newRunId } ------|                              |
     |                          |-- UPDATE last_rerun_at       |
     |-- Navigate to new run    |                              |
-    |                          |                              |
+    |                          |                              |-- Dispatch through the shared pipeline
+    |                          |                              |   (detached from the request)
+    |                          |                              |-- Record execution with parent_run_id + original_run_id
+    |                          |                              |-- execution.status (WS, via callback)
+    |                          |                              |   { parentRunId, originalRunId, triggeredBy }
 ```
 
 Key design points:
 
-- **Cooldown enforcement:** The Platform enforces a 5-second cooldown per original run via the `last_rerun_at` column. Rapid re-run attempts receive 429 Too Many Requests.
+- **Answered once accepted:** The orchestrator answers `run.rerun.response` once it has validated the re-run and claimed its request id, before the dispatch. A dispatch can wait minutes on a cold source or dependency cache, while the relayed request has ten seconds. A dispatch that fails after the answer fails the new run, and the run's failure reason says why. When the relay times out, the Platform answers 504 with `run_start_unconfirmed`: the run may still start, so clients point at the run list instead of offering a retry. A schedule fired by hand ("Run now") is answered the same way.
+- **Cooldown enforcement:** The Platform enforces a 5-second cooldown per original run via the `last_rerun_at` column, on the HTTP route and on the MCP `rerun_run` tool. Rapid re-run attempts receive 429 Too Many Requests. The cooldown starts when the orchestrator accepts the re-run, and also when the relay times out (504 `run_start_unconfirmed`), because the run may still start. A refusal (400 or 410) or no connected orchestrator (503) starts no cooldown. A request that rejoins a live run-start intent skips the cooldown.
+- **Retry of an unconfirmed start:** Before it relays a re-run or a "Run now", the Platform records a run-start intent (`run_start_intents`): the organization, the action and its target, the principal, and the request id. While the intent is live, a request for the same action by the same principal relays the same request id, so the orchestrator's request-id claim answers it with the run the first request started and sets `alreadyAccepted: true`. The Platform deletes the intent when an orchestrator answer comes back (a run id or a refusal). A timeout, a shutdown or a send failure keeps it. The intent expires 30 minutes after the first send and is never extended, so it ends before the orchestrator prunes its one-hour claim. The `run-start-intent-sweep` job deletes expired intents. Another principal is another intent.
 - **Payload reuse:** The orchestrator reads the original webhook payload from filesystem/object storage, and the dispatch pipeline stores it for the new run (enabling re-run of re-runs).
 - **Lock file at original SHA:** The lock file is re-fetched at the original commit SHA, ensuring the re-run uses the same workflow definition.
 - **Lineage tracking:** The new run has `parent_run_id` pointing to the immediate parent run, `original_run_id` pointing to the root ancestor run (for chain traversal), and `triggered_by` recording the user identity.

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { InfraAlertSeverity, InfraAlertType } from '../../diagnostics/infra-alert.js';
 import {
+  registrationItemSchema,
   DASHBOARD_REQUEST_TYPES,
   DASHBOARD_REQUEST_TYPE_SET,
   DashboardResponseErrorCode,
@@ -940,6 +941,30 @@ describe('run.cancel.response alreadyTerminal flag', () => {
   });
 });
 
+describe.each([
+  { type: 'run.rerun.response' as const },
+  { type: 'run.manual_schedule.response' as const },
+])('$type alreadyAccepted flag', ({ type }) => {
+  const base = { type, requestId: 'req-001', newRunId: 'run-a' };
+
+  it('carries alreadyAccepted when the orchestrator reports it', () => {
+    const parsed = dashboardOrchToPlatformSchema.parse({ ...base, alreadyAccepted: true });
+    expect(parsed.type).toBe(type);
+    expect((parsed as { alreadyAccepted?: boolean }).alreadyAccepted).toBe(true);
+  });
+
+  it('still parses without alreadyAccepted (an orchestrator predating the field)', () => {
+    const parsed = dashboardOrchToPlatformSchema.parse(base);
+    expect((parsed as { alreadyAccepted?: boolean }).alreadyAccepted).toBeUndefined();
+  });
+
+  it('rejects a non-boolean alreadyAccepted', () => {
+    expect(() =>
+      dashboardOrchToPlatformSchema.parse({ ...base, alreadyAccepted: 'yes' }),
+    ).toThrow();
+  });
+});
+
 describe('dashboardEventLogPayloadStreamRequestSchema', () => {
   const valid = {
     type: 'dashboard.event-log.payload.stream',
@@ -1871,5 +1896,37 @@ describe('dashboardRunDetailApiResponseSchema step classification', () => {
     expect(
       dashboardRunDetailApiResponseSchema.safeParse(detail({ ...step, phase: 'bogus' })).success,
     ).toBe(false);
+  });
+});
+
+describe('registrationItemSchema compile schema fields', () => {
+  const item = {
+    id: 'r',
+    repoIdentifier: 'acme/app',
+    workflowName: 'ci',
+    triggerTypes: ['push'],
+    triggers: [],
+    lastTriggeredAt: null,
+    nextFireAt: null,
+    sourceRepos: [],
+    createdAt: '2026-01-01T00:00:00Z',
+    updatedAt: '2026-01-01T00:00:00Z',
+  };
+
+  it('parses an item without the fields (an older orchestrator)', () => {
+    expect(registrationItemSchema.parse(item)).toEqual(item);
+  });
+
+  it('keeps both fields, and a null lock schema', () => {
+    expect(
+      registrationItemSchema.parse({
+        ...item,
+        compileSchemaVersion: 5,
+        agentCompileSchemaVersion: 7,
+      }),
+    ).toMatchObject({ compileSchemaVersion: 5, agentCompileSchemaVersion: 7 });
+    expect(
+      registrationItemSchema.parse({ ...item, compileSchemaVersion: null }).compileSchemaVersion,
+    ).toBeNull();
   });
 });

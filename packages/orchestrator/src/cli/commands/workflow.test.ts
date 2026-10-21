@@ -114,6 +114,33 @@ describe('kici-admin workflow CLI commands', () => {
       expect(stdout).not.toContain('org_id');
     });
 
+    // fails-when: the table drops the lock's schema or does not mark a lock the agents reject
+    it('W-7: the schema column marks a stale lock and a footer warns', async () => {
+      mockGet.mockResolvedValue({
+        registrations: [
+          { ...sampleRegistration, compileSchemaVersion: 5, agentCompileSchemaVersion: 7 },
+          {
+            ...sampleRegistration,
+            id: 'reg-2',
+            compileSchemaVersion: 7,
+            agentCompileSchemaVersion: 7,
+          },
+        ],
+        total: 2,
+      });
+      const { stdout } = await runCommand(['workflow', 'list'], client);
+      expect(stdout).toContain('schema');
+      expect(stdout).toContain('5 (stale)');
+      // breaks-if-wrong: a current lock shows its schema unmarked
+      expect(stdout).not.toContain('7 (stale)');
+      expect(stdout).toMatch(/Warning: 1 registered workflow lock\(s\)/);
+    });
+
+    it('W-8: an older server without the fields shows no schema and no warning', async () => {
+      const { stdout } = await runCommand(['workflow', 'list'], client);
+      expect(stdout).not.toContain('Warning:');
+    });
+
     it('W-6: --trigger-type and --event are combined in the query string', async () => {
       await runCommand(['workflow', 'list', '--trigger-type', 'webhook', '--event', 'foo'], client);
 
@@ -237,6 +264,59 @@ describe('kici-admin workflow CLI commands', () => {
       );
       const parsed = JSON.parse(stdout);
       expect(parsed).toEqual({ workflowCount: 1, registryVersion: 3 });
+    });
+
+    it('RM-5: prints each server warning', async () => {
+      const mockPost = vi.fn().mockResolvedValue({
+        workflowCount: 1,
+        registryVersion: 7,
+        warnings: ['owner/repo workflow ci: its lock declares compile schema 2, but …'],
+      });
+      const { stdout, stderr } = await runCommand(
+        [
+          'workflow',
+          'register-manual',
+          '--lock-file',
+          '/tmp/kici.lock.json',
+          '--repo',
+          'owner/repo',
+          '--routing-key',
+          'github:42',
+          '--org',
+          'orgA',
+        ],
+        { ...client, post: mockPost as any },
+      );
+      expect(stdout + stderr).toContain(
+        'Warning: owner/repo workflow ci: its lock declares compile schema 2',
+      );
+    });
+
+    // fails-when: the direct-DB path, which has no server, prints no warning for a stale lock
+    it('RM-6: direct-DB mode computes the warning itself', async () => {
+      mockReadFileSync.mockReturnValue(
+        JSON.stringify({ workflows: [{ name: 'ci', compileSchemaVersion: 2, jobs: [] }] }),
+      );
+      const { stdout, stderr } = await runCommand(
+        [
+          'workflow',
+          'register-manual',
+          '--lock-file',
+          '/tmp/kici.lock.json',
+          '--repo',
+          'owner/repo',
+          '--routing-key',
+          'github:42',
+          '--org',
+          'orgA',
+          '--database-url',
+          'postgres://x',
+        ],
+        client,
+      );
+      expect(stdout + stderr).toContain(
+        'Warning: owner/repo workflow ci: its lock declares compile schema 2',
+      );
     });
 
     it('RM-4: --provider-context rejects non-object JSON with a clear error', async () => {

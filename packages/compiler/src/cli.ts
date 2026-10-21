@@ -788,7 +788,7 @@ Environment variables:
 
   runsCommand
     .command('rerun')
-    .argument('<run-id>', 'Run ID to rerun')
+    .argument('<run-id>', 'Run ID to rerun, or its first 4 or more characters')
     .description('Re-trigger a run')
     .option('--json', 'Output raw JSON', false)
     .action(async (runId, options) => {
@@ -799,7 +799,7 @@ Environment variables:
 
   runsCommand
     .command('cancel')
-    .argument('[run-id]', 'Run ID to cancel')
+    .argument('[run-id]', 'Run ID to cancel, or its first 4 or more characters')
     .description('Cancel a run, or all in-progress runs on a branch')
     .option('--force', 'Force cancel (kill immediately, skip hooks)', false)
     .option('--branch <name>', 'Cancel all in-progress runs on this branch')

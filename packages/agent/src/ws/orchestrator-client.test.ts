@@ -14,6 +14,7 @@ import {
   type OrchestratorClientOptions,
 } from './orchestrator-client.js';
 import { readAgentVersion } from '../version.js';
+import { COMPILE_SCHEMA_VERSION } from '@kici-dev/core/kici-source-digest';
 
 // ── Hoisted mock state ──────────────────────────────────────────────
 
@@ -209,6 +210,9 @@ describe('OrchestratorClient', () => {
       expect(msg.messageId).toBeDefined();
       // Reports its own package version so the Infrastructure page can show it.
       expect(msg.version).toBe(readAgentVersion());
+      // fails-when: the register frame omits the schema — the orchestrator's dispatch
+      // gate would then never know any candidate's schema and never refuse.
+      expect(msg.compileSchemaVersion).toBe(COMPILE_SCHEMA_VERSION);
       // No agent capability flag is defined at protocol 4.
       expect(msg.capabilities).toEqual({});
       // fails-when: the agent stops self-reporting the label a result-aware round is routed by

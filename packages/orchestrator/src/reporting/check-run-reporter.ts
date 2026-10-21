@@ -608,14 +608,7 @@ export class CheckRunReporter {
     const keysToClean = this.runIdToKeys.get(runId);
     if (keysToClean) {
       for (const key of keysToClean) {
-        const timer = this.progressTimers.get(key);
-        if (timer) {
-          clearTimeout(timer);
-          this.progressTimers.delete(key);
-        }
-        this.stepProgress.delete(key);
-        this.inProgressSent.delete(key);
-        this.terminalSent.delete(key);
+        this.resetKeyLatches(key);
         this.checkRunIds.delete(key);
         this.updateLocks.delete(key);
       }
@@ -635,6 +628,28 @@ export class CheckRunReporter {
   async recoverState(): Promise<void> {
     if (!this.deps.trackingStore) return;
     logger.info('CheckRunReporter recovered (DB-backed state lookups enabled)');
+  }
+
+  /** Drop a key's in-memory progress and terminal latches. */
+  private resetKeyLatches(key: string): void {
+    const timer = this.progressTimers.get(key);
+    if (timer) {
+      clearTimeout(timer);
+      this.progressTimers.delete(key);
+    }
+    this.stepProgress.delete(key);
+    this.inProgressSent.delete(key);
+    this.terminalSent.delete(key);
+  }
+
+  /** Make `runId` the only run whose `cleanupRun` evicts `key`. */
+  private moveKeyToRun(key: string, runId: string | undefined): void {
+    if (!runId) return;
+    for (const [otherRunId, keys] of this.runIdToKeys) {
+      if (otherRunId === runId || !keys.delete(key)) continue;
+      if (keys.size === 0) this.runIdToKeys.delete(otherRunId);
+    }
+    this.trackRunKey(runId, key);
   }
 
   private trackRunKey(runId: string | undefined, key: string): void {
@@ -664,8 +679,17 @@ export class CheckRunReporter {
     };
   }
 
-  /** Write-through to L1 + store after a successful `checks.create()`. */
+  /**
+   * Write-through to L1 + store after a successful `checks.create()`.
+   *
+   * A new check run id for a key means a new run created it (a re-run on the same commit
+   * reuses the names): the latches of the previous check run must not apply to the new one,
+   * and a later `cleanupRun` of the previous run must not clear the new run's state. The
+   * store's row reset (`setCheckRunId`) is the persisted half of the same rule.
+   */
   private async persistCheckRunId(key: string, checkRunId: number, runId?: string): Promise<void> {
+    if (this.checkRunIds.get(key) !== checkRunId) this.resetKeyLatches(key);
+    this.moveKeyToRun(key, runId);
     this.checkRunIds.set(key, checkRunId);
     if (!this.deps.trackingStore) return;
     try {

@@ -139,3 +139,34 @@ describe('matchJsonPathNot', () => {
     expect(matchJsonPathNot(payload, { '$.env': ['prod', 'dev'] })).toBe(true);
   });
 });
+
+// Semantics pinned at the jsonpath-plus 11 line, so a library bump that moves
+// them goes red here instead of silently changing which events a trigger accepts.
+describe('jsonpath-plus semantics', () => {
+  it('an explicit zero slice end selects nothing', () => {
+    const payload = { tags: ['ci', 'deploy'] };
+    // fails-when: `[0:0]` returns the whole array (the jsonpath-plus 10 behaviour).
+    expect(matchJsonPath(payload, { '$.tags[0:0]': 'ci' })).toBe(false);
+    // breaks-if-wrong: a non-empty slice still selects its elements.
+    expect(matchJsonPath(payload, { '$.tags[0:1]': 'ci' })).toBe(true);
+    expect(matchJsonPath(payload, { '$.tags[0:1]': 'deploy' })).toBe(false);
+  });
+
+  it('a bare `@` filter selects every truthy element', () => {
+    const payload = { flags: [0, 'on', ''] };
+    expect(matchJsonPath(payload, { '$.flags[?(@)]': 'on' })).toBe(true);
+    expect(matchJsonPath(payload, { '$.flags[?(@)]': 0 })).toBe(false);
+  });
+
+  it('a nested filter cannot reach a constructor to pollute Object.prototype', () => {
+    const propName = 'kiciJsonpathNestedFilterPollution';
+    const path =
+      '$[?(@.constructor[( ' +
+      `@.assign(@.prototype, @.fromEntries([["${propName}", "pwned"]])) ` +
+      ')])]';
+    // fails-when: jsonpath-plus < 11.0.1, whose nested-filter fast path read
+    // `constructor` unguarded and let the expression write to Object.prototype.
+    expect(() => matchJsonPath({ a: { b: 1 } }, { [path]: 'x' })).toThrow(/constructor/);
+    expect(Object.hasOwn(Object.prototype, propName)).toBe(false);
+  });
+});

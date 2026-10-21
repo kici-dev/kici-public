@@ -45,6 +45,25 @@ describeWithTestDb<Database>(
       expect(rows[0]!.new_run_id).toBe(first.newRunId);
     });
 
+    it.each([2, 5])(
+      'N=%i sequential claims of one id all read the first run id; one wins, one row',
+      async (n) => {
+        const requestId = `req-retry-${n}`;
+        const results = [];
+        for (let i = 0; i < n; i++) results.push(await claimRequestId(db, requestId));
+
+        expect(results.filter((r) => r.claimed)).toHaveLength(1);
+        expect(results[0]!.claimed).toBe(true);
+        for (const r of results) expect(r.newRunId).toBe(results[0]!.newRunId);
+        const rows = await db
+          .selectFrom('request_idempotency')
+          .select('new_run_id')
+          .where('request_id', '=', requestId)
+          .execute();
+        expect(rows).toHaveLength(1);
+      },
+    );
+
     it('distinct requestIds each claim their own run id', async () => {
       const a = await claimRequestId(db, 'req-a');
       const b = await claimRequestId(db, 'req-b');

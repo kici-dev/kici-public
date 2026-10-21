@@ -69,6 +69,7 @@ export interface DirectIngressDepsSource {
   accessLogWriter?: ProcessingDeps['accessLogWriter'];
   hostRosterStore?: ProcessingDeps['hostRosterStore'];
   clusterSettings?: ProcessingDeps['clusterSettings'];
+  compileSchemaView?: ProcessingDeps['compileSchemaView'];
 }
 
 /** The per-process stores this factory owns, exposed so the caller can reuse them. */
@@ -160,6 +161,7 @@ export function createDirectIngressProcessingDeps(
     globalEvalCandidateTimeoutMs: deps.config.globalEvalCandidateTimeoutMs,
     globalEvalWaitTimeoutMs: deps.config.globalEvalWaitTimeoutMs,
     clusterSettings: deps.clusterSettings,
+    compileSchemaView: deps.compileSchemaView,
   });
 
   return { build, stores: { trustDirectoryStore, trustPolicyStore } };

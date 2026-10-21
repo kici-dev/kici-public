@@ -34,7 +34,9 @@
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import { gitCredentialRequestParamsSchema } from '@kici-dev/engine/protocol/messages/git-credential-relay';
 import type { TrustTier } from '@kici-dev/engine';
-import type { GitCredentialBroker } from '../git/credential-broker.js';
+import { type GitCredentialBroker, GitCredentialRefusedError } from '../git/credential-broker.js';
+import { JobSecretRefusalKind, JobSecretRefusedError } from '../secrets/job-secret-gate.js';
+import { AgentApiRefusalError } from './agent-api-registry.js';
 import type { GitCredentialRef } from '@kici-dev/engine';
 import { isUntrustedTier } from '../security/trust-tier.js';
 
@@ -123,19 +125,80 @@ function refMatchesDeclared(
   return refKeys.every((k) => ref[k] === declared[k]);
 }
 
+/** Context that the refusal log line names. */
+interface RefusalLogContext {
+  agentId: string;
+  jobId: string;
+  runId?: string;
+  orgId?: string;
+  repositories: readonly string[];
+}
+
+/**
+ * Log a refusal once, with its full reason, and build the error the job sees.
+ * The job's message can be shorter than the logged reason (a protection
+ * rule's text stays in the log); both are redacted.
+ */
+function refuse(
+  ctx: RefusalLogContext,
+  jobMessage: string,
+  logReason: string = jobMessage,
+): AgentApiRefusalError {
+  logger.warn('Git credential refused', { ...ctx, reason: redact(logReason) });
+  return new AgentApiRefusalError(redact(jobMessage));
+}
+
+const CONTEXT_REFUSAL_KINDS: ReadonlySet<JobSecretRefusalKind> = new Set([
+  JobSecretRefusalKind.enum['missing-context'],
+  JobSecretRefusalKind.enum['context-rejected'],
+  JobSecretRefusalKind.enum['missing-secret'],
+]);
+
+/**
+ * The job-visible message for a broker refusal, or null when the error is not
+ * a refusal (a mint or store failure), which stays internal.
+ *
+ * The context-gate kinds share one message, naming the context and the run's
+ * org: telling a missing context from a rule that rejects the run, or from a
+ * missing key, would let a job probe another context's configuration. The
+ * orchestrator log names which.
+ */
+function brokerRefusalMessage(err: unknown, repos: string, orgId: string): string | null {
+  if (err instanceof GitCredentialRefusedError) {
+    return `Refusing a git credential for ${repos}: ${err.message}`;
+  }
+  if (!(err instanceof JobSecretRefusedError)) return null;
+  if (CONTEXT_REFUSAL_KINDS.has(err.kind)) {
+    return (
+      `Refusing a git credential for ${repos}: context '${err.context}' did not provide it ` +
+      `for this run in org '${orgId}'. The context is missing in that org, its protection ` +
+      `rules do not admit this run, or no secret bound to it carries the key; the ` +
+      `orchestrator log names which.`
+    );
+  }
+  return `Refusing a git credential for ${repos}: ${err.message}`;
+}
+
 export function buildGitCredentialHandler(deps: GitCredentialHandlerDeps) {
   return async (agentId: string, rawParams: Record<string, unknown>): Promise<unknown> => {
     const params = gitCredentialRequestParamsSchema.parse(rawParams);
+    const logCtx: RefusalLogContext = {
+      agentId,
+      jobId: params.jobId,
+      repositories: params.repositories,
+    };
 
     const owned = deps.dispatcher.resolveOwnedJob(agentId, params.jobId);
     if (!owned) {
-      throw new Error(`job ${params.jobId} not owned by agent ${agentId}`);
+      throw refuse(logCtx, `job ${params.jobId} not owned by agent ${agentId}`);
     }
+    logCtx.runId = owned.runId;
 
     const job = await deps.jobContext(owned.runId, params.jobId);
     if (!job) {
-      throw new Error(`Unknown job '${params.jobId}' for a git credential request`);
+      throw refuse(logCtx, `Unknown job '${params.jobId}' for a git credential request`);
     }
+    logCtx.orgId = job.orgId;
 
     // EVERY repository must clear the fence, not just the first, or an in-org name
     // followed by an out-of-org one mints a token covering both.
@@ -146,7 +209,8 @@ export function buildGitCredentialHandler(deps: GitCredentialHandlerDeps) {
         (r) => r !== job.checkoutRepo && !sameOrg(r, job.sourceRepo),
       );
       if (outside.length > 0) {
-        throw new Error(
+        throw refuse(
+          logCtx,
           `Refusing a write credential for ${outside.map((r) => `'${r}'`).join(', ')}: ` +
             `outside the organisation of this job's source repository ` +
             `'${job.sourceRepo}'.`,
@@ -163,13 +227,8 @@ export function buildGitCredentialHandler(deps: GitCredentialHandlerDeps) {
     // above. Only a workflow-supplied ref reaches the declaration and tier checks.
     if (ref) {
       if (isUntrustedTier(job.trustTier)) {
-        logger.warn('Refused a workflow-supplied credential ref for an untrusted ref', {
-          agentId,
-          runId: owned.runId,
-          jobId: params.jobId,
-          trustTier: job.trustTier,
-        });
-        throw new Error(
+        throw refuse(
+          logCtx,
           `Refusing a workflow-supplied git credential for a run whose contributor tier ` +
             `is '${job.trustTier}'. Only a trusted ref may use a declared credential.`,
         );
@@ -177,13 +236,8 @@ export function buildGitCredentialHandler(deps: GitCredentialHandlerDeps) {
 
       const declared = Object.values(job.declaredCredentials);
       if (!declared.some((entry) => refMatchesDeclared(ref, entry))) {
-        logger.warn('Refused an undeclared git credential ref', {
-          agentId,
-          runId: owned.runId,
-          jobId: params.jobId,
-          declaredNames: Object.keys(job.declaredCredentials),
-        });
-        throw new Error(
+        throw refuse(
+          logCtx,
           `credential ref not declared by this job's lock. Declare it in the job's ` +
             `gitCredentials map and name it with 'credential'. Declared: ` +
             `${Object.keys(job.declaredCredentials).join(', ') || '(none)'}`,
@@ -191,6 +245,7 @@ export function buildGitCredentialHandler(deps: GitCredentialHandlerDeps) {
       }
     }
 
+    const repos = params.repositories.map((r) => `'${r}'`).join(', ');
     try {
       return await deps.broker.resolve({
         orgId: job.orgId,
@@ -211,6 +266,8 @@ export function buildGitCredentialHandler(deps: GitCredentialHandlerDeps) {
         },
       });
     } catch (err) {
+      const refusal = brokerRefusalMessage(err, repos, job.orgId);
+      if (refusal !== null) throw refuse(logCtx, refusal, toErrorMessage(err));
       // A broker error can carry forge output; never forward it verbatim.
       logger.warn('Git credential resolution failed', {
         agentId,
@@ -218,9 +275,7 @@ export function buildGitCredentialHandler(deps: GitCredentialHandlerDeps) {
         repositories: params.repositories,
       });
       throw new Error(
-        `Could not resolve a git credential for ` +
-          `${params.repositories.map((r) => `'${r}'`).join(', ')}: ` +
-          `${redact(toErrorMessage(err))}`,
+        `Could not resolve a git credential for ${repos}: ${redact(toErrorMessage(err))}`,
       );
     }
   };

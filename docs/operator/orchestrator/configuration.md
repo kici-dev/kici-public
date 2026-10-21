@@ -328,7 +328,7 @@ variables, with type/default/required metadata generated from the config schema:
 
 ### Direct mappings
 
-These are the names the reload path's overlay maps onto YAML config paths. Most of them are startup variables too, and the generated table above lists those. Seven are not, and setting one of them in the orchestrator's own environment stops the service from starting — the typo check rejects it and names the startup variable to set instead:
+These are the names the reload path's overlay maps onto YAML config paths. Most of them are startup variables too, and the generated table above lists those. The names below are not. Setting one of them in the orchestrator's own environment stops the service from starting — the typo check rejects it and names the startup variable to set instead:
 
 | Overlay-only name                      | Startup name               |
 | -------------------------------------- | -------------------------- |

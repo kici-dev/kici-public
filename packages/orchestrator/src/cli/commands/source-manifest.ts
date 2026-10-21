@@ -27,6 +27,8 @@ import { manifestCreateUrl } from '../../providers/github/manifest-form.js';
 import { startManifestLoopback, type ManifestLoopback } from '../loopback-callback.js';
 import { openBrowserBestEffort } from '../open-browser.js';
 import { webhookNoteReason, webhookNoteHint } from '../webhook-url-notes.js';
+import type { PlatformAttachment } from '../../db/repos/org-ids-repo.js';
+import { resolveNewSourceOrg } from '../../sources/source-org.js';
 
 /** Static marketing-site page the CLI points at in headless paste-code mode. */
 const STATIC_CALLBACK_URL = 'https://kici.dev/gh-manifest-callback';
@@ -48,6 +50,8 @@ export interface ManifestSetupOptions {
    * at this URL; the operator owns delivery. Advanced/self-hosted only.
    */
   webhookUrl?: string;
+  /** Org the source belongs to; the orchestrator defaults it to the attached org. */
+  customerId?: string;
 }
 
 /** Injectable boundary so unit tests can stub GitHub + the browser + stdin. */
@@ -88,6 +92,27 @@ export const realManifestSetupDeps: ManifestSetupDeps = {
   verifyRepoAccess,
   writeRecoveryFile: defaultWriteRecoveryFile,
 };
+
+/**
+ * Refuse an org the orchestrator would refuse, before an App exists on GitHub:
+ * the store route makes the same check, but by then the App is already created.
+ * An orchestrator that does not report its attachment skips the pre-check.
+ */
+async function checkSourceOrg(opts: ManifestSetupOptions, client: AdminApiClient): Promise<void> {
+  const list = await client.get<{
+    platformAttachment?: PlatformAttachment;
+    attachedOrgId?: string | null;
+  }>('/api/v1/admin/sources');
+  if (!list.platformAttachment) return;
+  const org = resolveNewSourceOrg({
+    requested: opts.customerId,
+    attachment: {
+      platformAttachment: list.platformAttachment,
+      attachedOrgId: list.attachedOrgId ?? null,
+    },
+  });
+  if (!org.ok) throw new Error(org.error);
+}
 
 /** Resolve the org-scoped webhook URL via the pre-flight route; abort if null. */
 async function resolveWebhookUrl(client: AdminApiClient): Promise<string> {
@@ -153,6 +178,7 @@ async function storeAndRegister(
       appId: creds.appId,
       privateKey: creds.privateKey,
       webhookSecret: creds.webhookSecret,
+      ...(opts.customerId && { customerId: opts.customerId }),
     });
   } catch (err) {
     const file = deps.writeRecoveryFile(creds.appId, creds.privateKey);
@@ -163,7 +189,8 @@ async function storeAndRegister(
     console.error('  Recover with:');
     console.error(
       `    kici-admin source add github --name "${opts.name}" --app-id ${creds.appId} ` +
-        `--private-key @${file} --webhook-secret ${creds.webhookSecret}`,
+        `--private-key @${file} --webhook-secret ${creds.webhookSecret}` +
+        (opts.customerId ? ` --org ${opts.customerId}` : ''),
     );
     throw err;
   }
@@ -174,6 +201,8 @@ export async function runGithubManifestSetup(
   client: AdminApiClient,
   deps: ManifestSetupDeps = realManifestSetupDeps,
 ): Promise<void> {
+  await checkSourceOrg(opts, client);
+
   // Resolve the webhook URL BEFORE creating anything on GitHub. An explicit
   // --webhook-url means the operator owns delivery and is used verbatim.
   const webhookUrl = opts.webhookUrl

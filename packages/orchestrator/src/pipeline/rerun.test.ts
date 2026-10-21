@@ -1,5 +1,7 @@
+import { claimRequestId, type RunStartAnswer } from './request-idempotency.js';
+import { settleAcceptedDispatches } from './accepted-dispatch.js';
 import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
-import { handleRerun, settlePendingRoundReevaluations, type RerunDeps } from './rerun.js';
+import { handleRerun, type RerunDeps } from './rerun.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
 import { staticJob } from '../__test-helpers__/lock-fixtures.js';
 
@@ -83,6 +85,16 @@ vi.mock('./internal-event-pipeline.js', async (importOriginal) => {
   };
 });
 
+/**
+ * Re-run, then settle the dispatch it detached: the request is answered once the
+ * re-run is accepted, so a test that asserts on the dispatch waits for it.
+ */
+async function rerunSettled(...args: Parameters<typeof handleRerun>): Promise<RunStartAnswer> {
+  const result = await handleRerun(...args);
+  await settleAcceptedDispatches();
+  return result;
+}
+
 // --- Mock helpers ---
 
 function makeMockDb(run?: Record<string, unknown>) {
@@ -114,7 +126,35 @@ function createMockExecutionTracker() {
     addJobsToRun: vi.fn().mockResolvedValue(undefined),
     getExecutionContext: vi.fn().mockReturnValue(null),
     getJobName: vi.fn().mockReturnValue(null),
+    recordAcceptedDispatchFailure: vi.fn().mockResolvedValue(undefined),
   };
+}
+
+const ANSWER_TIMEOUT = Symbol('answer-timeout');
+
+/**
+ * The re-run's answer, or {@link ANSWER_TIMEOUT} when it takes a second: a
+ * handler that awaits a held dispatch fails here instead of hanging.
+ */
+async function answerWithin(
+  answer: Promise<{ newRunId: string }>,
+): Promise<{ newRunId: string } | typeof ANSWER_TIMEOUT> {
+  return Promise.race([
+    answer,
+    new Promise<typeof ANSWER_TIMEOUT>((r) => setTimeout(() => r(ANSWER_TIMEOUT), 1_000)),
+  ]);
+}
+
+/** Make `spy` hang until the returned `release` is called. */
+function holdUntilReleased(spy: Mock): () => void {
+  let release: () => void = () => {};
+  spy.mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        release = () => resolve({});
+      }),
+  );
+  return () => release();
 }
 
 function createMockProviderBundle() {
@@ -313,7 +353,7 @@ describe('handleRerun', () => {
   }
 
   it("re-runs through the shared pipeline with the original run's org, repository, commit and lineage", async () => {
-    const result = await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
+    const result = await rerunSettled('original-run-123', 'user@test.com', null, deps, 'req-test');
 
     expect(logStorage.read).toHaveBeenCalledWith(
       'executions/original-run-123/webhook-payload.json',
@@ -349,10 +389,13 @@ describe('handleRerun', () => {
 
   it('is idempotent on requestId: a failover re-send returns the same run without a second dispatch', async () => {
     const requestId = 'req-dedupe-1';
-    const first = await handleRerun('original-run-123', 'user@test.com', null, deps, requestId);
-    const second = await handleRerun('original-run-123', 'user@test.com', null, deps, requestId);
+    const first = await rerunSettled('original-run-123', 'user@test.com', null, deps, requestId);
+    const second = await rerunSettled('original-run-123', 'user@test.com', null, deps, requestId);
 
     expect(second.newRunId).toBe(first.newRunId);
+    // fails-when: the lost claim answers without the flag
+    expect(second.alreadyAccepted).toBe(true);
+    expect(first).not.toHaveProperty('alreadyAccepted');
     expect(dispatched).toHaveBeenCalledTimes(1);
   });
 
@@ -371,7 +414,7 @@ describe('handleRerun', () => {
       ],
     });
 
-    await handleRerun('original-run-123', null, null, deps, 'req-test');
+    await rerunSettled('original-run-123', null, null, deps, 'req-test');
 
     const ctx = dispatchedCtx();
     expect(ctx.workflow.jobs.map((j: { name: string }) => j.name)).toEqual(['test']);
@@ -410,7 +453,7 @@ describe('handleRerun', () => {
   it("reads an untrusted fork pull request's lock file from its base branch, as the run did", async () => {
     forkPrRun('hold');
 
-    await handleRerun('original-run-123', null, null, deps, 'req-fork');
+    await rerunSettled('original-run-123', null, null, deps, 'req-fork');
 
     // fails-when: the re-run reads the fork's own lock file at its head commit
     expect(providerBundle.lockFileFetcher!.fetchLockFile).toHaveBeenCalledWith(
@@ -440,17 +483,99 @@ describe('handleRerun', () => {
     expect(dispatched).not.toHaveBeenCalled();
     // breaks-if-wrong: the same request id stays unclaimed, so a later re-run can use it
     forkPrRun('allow');
-    await handleRerun('original-run-123', null, null, deps, 'req-ignored');
+    await rerunSettled('original-run-123', null, null, deps, 'req-ignored');
     expect(dispatched).toHaveBeenCalledTimes(1);
   });
 
   it('refuses a webhook run whose delivery is no longer in the event log', async () => {
     deps.db = makeMockDb({ ...TERMINAL_RUN, org_id: 'another-org' }) as any;
 
+    vi.mocked(claimRequestId).mockClear();
+
     await expect(handleRerun('original-run-123', null, null, deps, 'req-test')).rejects.toThrow(
       /Cannot re-run run original-run-123: the event it ran for is no longer stored/,
     );
+    await settleAcceptedDispatches();
     expect(dispatched).not.toHaveBeenCalled();
+    // A refusal answers an error, never a run id: it rejects before the claim.
+    expect(claimRequestId).not.toHaveBeenCalled();
+  });
+
+  describe('answered once accepted', () => {
+    it('answers a repository re-run before its dispatch settles', async () => {
+      const release = holdUntilReleased(dispatched);
+
+      // fails-when: the handler awaits the dispatch before it answers
+      const answer = await answerWithin(
+        handleRerun('original-run-123', 'user@test.com', null, deps, 'req-early'),
+      );
+      expect(answer).toEqual({ newRunId: 'mock-newrun-1' });
+      await vi.waitFor(() => expect(dispatched).toHaveBeenCalledOnce());
+      expect(dispatchedCtx().runId).toBe('mock-newrun-1');
+
+      // workflow.rerun is emitted only once the dispatch went through.
+      expect(eventRouter.emit).not.toHaveBeenCalled();
+      release();
+      await settleAcceptedDispatches();
+      expect(eventRouter.emit).toHaveBeenCalledWith(
+        expect.objectContaining({ eventName: 'workflow.rerun' }),
+      );
+      expect(executionTracker.recordAcceptedDispatchFailure).not.toHaveBeenCalled();
+    });
+
+    it('fails the accepted run when its dispatch throws', async () => {
+      dispatched.mockRejectedValue(new Error('source cache unreachable'));
+
+      const { newRunId } = await rerunSettled(
+        'original-run-123',
+        'user@test.com',
+        'ci-bot',
+        deps,
+        'req-throws',
+      );
+
+      // fails-when: the detached failure is only logged, or recorded on the original run
+      expect(executionTracker.recordAcceptedDispatchFailure).toHaveBeenCalledOnce();
+      expect(executionTracker.recordAcceptedDispatchFailure).toHaveBeenCalledWith(
+        expect.objectContaining({
+          runId: newRunId,
+          failureReason: 'Re-run could not be dispatched: source cache unreachable',
+          workflowName: 'ci',
+          repoIdentifier: 'owner/repo',
+          workflowRepoIdentifier: 'owner/repo',
+          sha: 'abc123def',
+          routingKey: 'github:42',
+          providerContext: { installationId: 42 },
+          deliveryId: `rerun:${newRunId}`,
+          triggerEvent: 'rerun',
+          triggeredBy: 'user@test.com',
+          triggeredByAgentLabel: 'ci-bot',
+          rerunLineage: { parentRunId: 'original-run-123', originalRunId: 'original-run-123' },
+        }),
+      );
+      expect(eventRouter.emit).not.toHaveBeenCalled();
+    });
+
+    it('keeps a dispatched re-run when the workflow.rerun emit fails', async () => {
+      eventRouter.emit.mockRejectedValue(new Error('event store down'));
+
+      await rerunSettled('original-run-123', null, null, deps, 'req-emit-fails');
+
+      // breaks-if-wrong: a failed emit after a good dispatch must not fail the live run
+      expect(dispatched).toHaveBeenCalledOnce();
+      expect(executionTracker.recordAcceptedDispatchFailure).not.toHaveBeenCalled();
+    });
+
+    it('starts no dispatch for a lost claim', async () => {
+      const first = await rerunSettled('original-run-123', null, null, deps, 'req-lost');
+      dispatched.mockClear();
+
+      // A failover re-send finds the claim taken: it answers the winner's run.
+      const second = await rerunSettled('original-run-123', null, null, deps, 'req-lost');
+
+      expect(second.newRunId).toBe(first.newRunId);
+      expect(dispatched).not.toHaveBeenCalled();
+    });
   });
 
   it('fails with error if run is not in terminal state (running -> error)', async () => {
@@ -500,7 +625,7 @@ describe('handleRerun', () => {
 
       // fails-when: the stored payload sends a cron run down the webhook path,
       // which finds no event log row and refuses
-      const result = await handleRerun('original-run-123', null, null, deps, 'req-cron');
+      const result = await rerunSettled('original-run-123', null, null, deps, 'req-cron');
 
       expect(getAllByOrgAndRepo).toHaveBeenCalledWith('org-7', 'owner/repo');
       const { lockFile, ctx, overrides } = internalCall();
@@ -521,10 +646,23 @@ describe('handleRerun', () => {
       expect(dispatched).not.toHaveBeenCalled();
     });
 
+    it('answers a schedule-rooted re-run before its dispatch settles', async () => {
+      deps.db = makeMockDb({ ...TERMINAL_RUN, trigger_event: 'schedule' }) as any;
+      const release = holdUntilReleased(internalDispatched);
+
+      const answer = await answerWithin(
+        handleRerun('original-run-123', null, null, deps, 'req-cron-early'),
+      );
+      expect(answer).toEqual({ newRunId: 'mock-newrun-1' });
+      await vi.waitFor(() => expect(internalDispatched).toHaveBeenCalledOnce());
+      release();
+      await settleAcceptedDispatches();
+    });
+
     it('re-runs a schedule fired by hand the same way', async () => {
       deps.db = makeMockDb({ ...TERMINAL_RUN, trigger_event: 'manual_schedule' }) as any;
 
-      await handleRerun('original-run-123', null, null, deps, 'req-manual');
+      await rerunSettled('original-run-123', null, null, deps, 'req-manual');
 
       expect(internalCall().ctx.event.eventName).toBe('__schedule_fire');
     });
@@ -593,7 +731,7 @@ describe('handleRerun', () => {
       }) as any;
 
       // breaks-if-wrong: a summoned run must still re-run, as it did before
-      await handleRerun('original-run-123', null, null, deps, 'req-summoned');
+      await rerunSettled('original-run-123', null, null, deps, 'req-summoned');
 
       const { ctx } = internalCall();
       expect(ctx.event).toEqual({ id: 'invoke-5d2f', eventName: 'build-docs', payload: PAYLOAD });
@@ -648,7 +786,7 @@ describe('handleRerun', () => {
       }) as any;
 
       // breaks-if-wrong: a run whose event is still stored must re-run
-      await handleRerun('original-run-123', null, null, deps, 'req-event');
+      await rerunSettled('original-run-123', null, null, deps, 'req-event');
 
       // The stored event id, so the re-run inherits the trust of the run that emitted it.
       expect(internalCall().ctx.event).toEqual({
@@ -771,7 +909,7 @@ describe('handleRerun', () => {
 
     it('re-runs a cross-repo global run against its recorded workflow commit', async () => {
       // fails-when: re-run is refused, or loads the lock at the registration's current commit
-      const result = await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-g1');
+      const result = await rerunSettled('original-run-123', 'user@test.com', null, deps, 'req-g1');
 
       expect(workflowBundle.lockFileFetcher.fetchLockFile).toHaveBeenCalledWith(
         WORKFLOW_REPO,
@@ -825,7 +963,7 @@ describe('handleRerun', () => {
       // fails-when: a registration already at the recorded commit is fetched again
       registration.commitSha = 'a1';
 
-      await handleRerun('original-run-123', null, null, deps, 'req-g2');
+      await rerunSettled('original-run-123', null, null, deps, 'req-g2');
 
       expect(workflowBundle.lockFileFetcher.fetchLockFile).not.toHaveBeenCalled();
       const ctx = dispatched.mock.calls[0][0] as any;
@@ -844,7 +982,7 @@ describe('handleRerun', () => {
         workflows: [globalEntry('lint-at-a1')],
       });
 
-      await handleRerun('original-run-123', null, null, deps, 'req-g20');
+      await rerunSettled('original-run-123', null, null, deps, 'req-g20');
 
       const ctx = dispatched.mock.calls[0][0] as any;
       expect(ctx.fullLockFile.lockfileHash).toBe('lock-at-a1');
@@ -856,7 +994,7 @@ describe('handleRerun', () => {
       registration.lockfileHash = 'lock-at-b2';
       registration.siblingsDigest = 'siblings-at-b2';
 
-      await handleRerun('original-run-123', null, null, deps, 'req-g21');
+      await rerunSettled('original-run-123', null, null, deps, 'req-g21');
 
       const ctx = dispatched.mock.calls[0][0] as any;
       expect(ctx.workflow.jobs.map((j: { name: string }) => j.name)).toEqual(['lint-at-a1']);
@@ -870,7 +1008,7 @@ describe('handleRerun', () => {
       registration.lockfileHash = 'lock-at-a1';
       registration.siblingsDigest = null;
 
-      await handleRerun('original-run-123', null, null, deps, 'req-g22');
+      await rerunSettled('original-run-123', null, null, deps, 'req-g22');
 
       expect(workflowBundle.lockFileFetcher.fetchLockFile).not.toHaveBeenCalled();
       const ctx = dispatched.mock.calls[0][0] as any;
@@ -881,7 +1019,7 @@ describe('handleRerun', () => {
     it('keeps the pull-request subject event of a re-run of a PR run', async () => {
       // fails-when: the re-run states no subject event, so its OIDC subject derives from `rerun`
       deps.db = makeMockDb({ ...GLOBAL_RUN, trigger_event: 'pull_request' }) as any;
-      await handleRerun('original-run-123', null, null, deps, 'req-g10');
+      await rerunSettled('original-run-123', null, null, deps, 'req-g10');
       expect((dispatched.mock.calls[0][0] as any).subjectTriggerEvent).toBe('pull_request');
 
       // A re-run of that re-run records `rerun` itself but inherits the subject.
@@ -891,7 +1029,7 @@ describe('handleRerun', () => {
         trigger_event: 'rerun',
         subject_trigger_event: 'pull_request',
       }) as any;
-      await handleRerun('original-run-123', null, null, deps, 'req-g11');
+      await rerunSettled('original-run-123', null, null, deps, 'req-g11');
       expect((dispatched.mock.calls[0][0] as any).subjectTriggerEvent).toBe('pull_request');
     });
 
@@ -902,7 +1040,7 @@ describe('handleRerun', () => {
         original_run_id: 'root-run',
       }) as any;
 
-      await handleRerun('rerun-2', null, null, deps, 'req-g3');
+      await rerunSettled('rerun-2', null, null, deps, 'req-g3');
 
       const ctx = dispatched.mock.calls[0][0] as any;
       expect(ctx.rerunLineage).toEqual({ parentRunId: 'rerun-2', originalRunId: 'root-run' });
@@ -969,7 +1107,7 @@ describe('handleRerun', () => {
       // breaks-if-wrong: a workflow global at the recorded commit re-runs whatever its registration says now
       registration.isGlobal = false;
 
-      await handleRerun('original-run-123', null, null, deps, 'req-g12');
+      await rerunSettled('original-run-123', null, null, deps, 'req-g12');
 
       expect(dispatched).toHaveBeenCalledTimes(1);
     });
@@ -978,7 +1116,7 @@ describe('handleRerun', () => {
       // fails-when: the re-run guesses the registration's branch for a run that recorded none
       deps.db = makeMockDb({ ...GLOBAL_RUN, workflow_branch: null }) as any;
 
-      await handleRerun('original-run-123', null, null, deps, 'req-g13');
+      await rerunSettled('original-run-123', null, null, deps, 'req-g13');
 
       expect((dispatched.mock.calls[0][0] as any).global.workflowBranch).toBeNull();
     });
@@ -1001,11 +1139,42 @@ describe('handleRerun', () => {
       expect(dispatched).not.toHaveBeenCalled();
     });
 
+    it('answers a cross-repository re-run before its dispatch settles', async () => {
+      const release = holdUntilReleased(dispatched);
+
+      const answer = await answerWithin(
+        handleRerun('original-run-123', null, null, deps, 'req-g-early'),
+      );
+      expect(answer).toEqual({ newRunId: 'mock-newrun-1' });
+      await vi.waitFor(() => expect(dispatched).toHaveBeenCalledOnce());
+      expect(eventRouter.emit).not.toHaveBeenCalled();
+      release();
+      await settleAcceptedDispatches();
+      expect(eventRouter.emit).toHaveBeenCalledOnce();
+    });
+
+    it('fails the accepted cross-repository run when its dispatch throws', async () => {
+      dispatched.mockRejectedValue(new Error('workflow repo clone failed'));
+
+      const { newRunId } = await rerunSettled('original-run-123', null, null, deps, 'req-g-throw');
+
+      expect(executionTracker.recordAcceptedDispatchFailure).toHaveBeenCalledWith(
+        expect.objectContaining({
+          runId: newRunId,
+          repoIdentifier: SOURCE_REPO,
+          workflowRepoIdentifier: WORKFLOW_REPO,
+          failureReason: 'Re-run could not be dispatched: workflow repo clone failed',
+        }),
+      );
+    });
+
     it('dispatches once across a failover re-send of the same requestId', async () => {
-      const first = await handleRerun('original-run-123', null, null, deps, 'req-g9');
-      const second = await handleRerun('original-run-123', null, null, deps, 'req-g9');
+      const first = await rerunSettled('original-run-123', null, null, deps, 'req-g9');
+      const second = await rerunSettled('original-run-123', null, null, deps, 'req-g9');
 
       expect(second.newRunId).toBe(first.newRunId);
+      expect(second.alreadyAccepted).toBe(true);
+      expect(first).not.toHaveProperty('alreadyAccepted');
       expect(dispatched).toHaveBeenCalledTimes(1);
     });
 
@@ -1015,7 +1184,7 @@ describe('handleRerun', () => {
       const { workflow_repo_identifier: _dropped, ...unmarked } = GLOBAL_RUN;
       deps.db = makeMockDb({ ...unmarked, workflow_name: 'ci' }) as any;
 
-      await handleRerun('original-run-123', null, null, deps, 'req-test');
+      await rerunSettled('original-run-123', null, null, deps, 'req-test');
 
       expect(providerBundle.lockFileFetcher!.fetchLockFile).toHaveBeenCalledWith(
         SOURCE_REPO,
@@ -1034,7 +1203,7 @@ describe('handleRerun', () => {
         workflow_repo_identifier: TERMINAL_RUN.repo_identifier,
       }) as any;
 
-      await handleRerun('original-run-123', null, null, deps, 'req-test');
+      await rerunSettled('original-run-123', null, null, deps, 'req-test');
 
       expect(dispatched.mock.calls[0][0].global).toBeUndefined();
     });
@@ -1062,7 +1231,7 @@ describe('handleRerun', () => {
   });
 
   it('emits workflow.rerun system event via EventRouter', async () => {
-    await handleRerun('original-run-123', 'user@test.com', null, deps, 'req-test');
+    await rerunSettled('original-run-123', 'user@test.com', null, deps, 'req-test');
 
     expect(eventRouter.emit).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1076,7 +1245,7 @@ describe('handleRerun', () => {
   });
 
   it('leaves storing the payload to the pipeline, so the new run keeps one parseable copy', async () => {
-    await handleRerun('original-run-123', null, null, deps, 'req-test');
+    await rerunSettled('original-run-123', null, null, deps, 'req-test');
 
     // fails-when: the re-run appends the payload as well as the pipeline
     expect(dispatchedCtx().payload).toEqual(PAYLOAD);
@@ -1141,7 +1310,7 @@ describe('handleRerun', () => {
       db = makeMockDb({ ...TERMINAL_RUN, routing_key: realKey });
       deps.db = db as any;
 
-      await handleRerun('original-run-123', null, null, deps, 'req-test', attackerHint);
+      await rerunSettled('original-run-123', null, null, deps, 'req-test', attackerHint);
 
       const getByRoutingKey = (
         deps.providerRegistry as unknown as { getByRoutingKey: ReturnType<typeof vi.fn> }
@@ -1238,9 +1407,9 @@ describe('handleRerun', () => {
     async function rerunRound(
       requestId: string,
       actor: string | null = null,
-    ): Promise<{ newRunId: string }> {
+    ): Promise<RunStartAnswer> {
       const result = await handleRerun('original-run-123', actor, null, deps, requestId);
-      await settlePendingRoundReevaluations();
+      await settleAcceptedDispatches();
       return result;
     }
 
@@ -1274,7 +1443,7 @@ describe('handleRerun', () => {
 
       // And the detached work still completes and posts its check.
       releaseRound();
-      await settlePendingRoundReevaluations();
+      await settleAcceptedDispatches();
       expect(postSucceeded).toHaveBeenCalledTimes(1);
     });
 
@@ -1549,6 +1718,8 @@ describe('handleRerun', () => {
 
       expect(first.newRunId).toBe('original-run-123');
       expect(second.newRunId).toBe(first.newRunId);
+      expect(second.alreadyAccepted).toBe(true);
+      expect(first).not.toHaveProperty('alreadyAccepted');
     });
   });
   describe('a re-run presents the subject event of the run it repeats', () => {
@@ -1565,7 +1736,7 @@ describe('handleRerun', () => {
         subject_trigger_event: 'pull_request:opened',
       }) as any;
 
-      await handleRerun('original-run-123', null, null, deps, 'req-rerun-of-rerun');
+      await rerunSettled('original-run-123', null, null, deps, 'req-rerun-of-rerun');
 
       expect(dispatchedCtx().subjectTriggerEvent).toBe('pull_request:opened');
     });
@@ -1577,7 +1748,7 @@ describe('handleRerun', () => {
         subject_trigger_event: null,
       }) as any;
 
-      await handleRerun('original-run-123', null, null, deps, 'req-rerun-no-event');
+      await rerunSettled('original-run-123', null, null, deps, 'req-rerun-no-event');
 
       // No subject event means "use `trigger_event`", never a guess.
       expect('subjectTriggerEvent' in dispatchedCtx()).toBe(false);

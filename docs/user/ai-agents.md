@@ -111,6 +111,16 @@ That's the entire setup. The agent can now call the tools below.
 - `cancel_runs_by_branch` — cancel all in-progress runs on a branch (bounded —
   up to 100 per call; a `truncated` flag tells the agent to re-invoke).
 
+`trigger_run` and `rerun_run` return the new run id as soon as the orchestrator
+accepts the request. The run then starts. An error that says the run may still
+start means the start was not confirmed in time: check `list_runs` before you
+call the tool again. After that error, when the same user or organization API
+key calls the tool again for the same run or workflow within 30 minutes, the
+result names the run that the first call started and contains
+`alreadyAccepted: true`. No second run starts.
+`rerun_run` refuses a second re-run of the same run for 5 seconds
+(`Cooldown active. Try again in <n>s`).
+
 The tools cover the same developer operations you can drive yourself with the
 `kici` CLI. Operations that are purely local to your machine (scaffolding,
 compiling, running a workflow locally) or that mint credentials are

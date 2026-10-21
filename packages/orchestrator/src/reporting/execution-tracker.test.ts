@@ -2013,6 +2013,77 @@ describe('ExecutionTracker', () => {
       expect(ctx.workflowRepoIdentifier).toBe('acme/org-workflows');
     });
 
+    // fails-when: the row records no workflow commit — a re-run of the failed global run is
+    // then refused ("no recorded workflow commit"), though the operator fixed the cause
+    it('recordInitFailureRun records the workflow commit and branch of a global run', async () => {
+      const t = new ExecutionTracker({ db: mockDb.db });
+      await t.recordInitFailureRun({
+        runId: 'run-init-global-sha',
+        workflowName: 'org-ci',
+        provider: 'github',
+        repoIdentifier: 'owner/source-repo',
+        workflowRepoIdentifier: 'acme/org-workflows',
+        workflowSha: 'wfsha1',
+        workflowBranch: 'main',
+        ref: 'main',
+        sha: 'abc',
+        deliveryId: 'delivery-1',
+        providerContext: {},
+        routingKey: 'rk',
+        initFailure: {
+          scope: 'run',
+          category: InitFailureCategory.enum.lock_resolution,
+          message: 'stale lock',
+        },
+      });
+      const row = mockDb.inserts.find(
+        (i) => i.table === 'execution_runs' && i.values.run_id === 'run-init-global-sha',
+      );
+      expect(row!.values.workflow_sha).toBe('wfsha1');
+      expect(row!.values.workflow_branch).toBe('main');
+    });
+
+    // fails-when: a global run whose coalesced build failed before tracking records no
+    // workflow repository — the row then reads as a per-repository run of the source repo,
+    // and its re-run cannot resolve the workflow at the recorded commit
+    it('onBuildFailedBeforeTracking records the workflow repository and commit of a global run', async () => {
+      const t = new ExecutionTracker({ db: mockDb.db });
+      const failBuild = (runId: string, workflowRepoIdentifier: string) =>
+        t.onBuildFailedBeforeTracking(
+          runId,
+          'org-ci',
+          'github',
+          'owner/source-repo',
+          'main',
+          'abc',
+          'delivery-1',
+          {},
+          'rk',
+          undefined,
+          undefined,
+          'build failed',
+          undefined,
+          { workflowRepo: { identifier: workflowRepoIdentifier, sha: 'wfsha1', branch: 'main' } },
+        );
+      await failBuild('run-build-global', 'acme/org-workflows');
+      const global = mockDb.inserts.find(
+        (i) => i.table === 'execution_runs' && i.values.run_id === 'run-build-global',
+      );
+      expect(global!.values).toMatchObject({
+        workflow_repo_identifier: 'acme/org-workflows',
+        workflow_sha: 'wfsha1',
+        workflow_branch: 'main',
+      });
+
+      // breaks-if-wrong: a per-repository run keeps the null marker
+      await failBuild('run-build-same', 'owner/source-repo');
+      const same = mockDb.inserts.find(
+        (i) => i.table === 'execution_runs' && i.values.run_id === 'run-build-same',
+      );
+      expect(same!.values).not.toHaveProperty('workflow_repo_identifier');
+      expect(same!.values).not.toHaveProperty('workflow_sha');
+    });
+
     it('recordInitFailureRun records nothing when the two repos match', async () => {
       // The marker keeps its one meaning: present iff the two differ. Every
       // per-repository init failure states its own repository, so this is the
@@ -4392,6 +4463,117 @@ describe('ExecutionTracker', () => {
     });
   });
 
+  describe('recordAcceptedDispatchFailure', () => {
+    /** A re-run the dispatch registered: one job, still live. */
+    const liveRerun = {
+      jobs: [{ jobId: 'j1', jobName: 'build' }],
+      triggerDecision: { matched: true },
+      sha: 'deadbeef',
+      repoIdentifier: 'org/repo',
+      workflowName: 'wf',
+    };
+    const failureArgs = (runId: string) => ({
+      runId,
+      workflowName: 'wf',
+      provider: 'github',
+      repoIdentifier: 'org/repo',
+      workflowRepoIdentifier: 'org/repo',
+      ref: 'main',
+      sha: 'deadbeef',
+      deliveryId: `rerun:${runId}`,
+      providerContext: {},
+      routingKey: 'github:1',
+      failureReason: 'Re-run could not be dispatched: source cache unreachable',
+      triggerEvent: 'rerun',
+      triggeredBy: 'user@test.com',
+      triggeredByAgentLabel: 'ci-bot',
+      rerunLineage: { parentRunId: 'run-parent', originalRunId: 'run-root' },
+    });
+
+    it('inserts a failed row when none exists', async () => {
+      await tracker.recordAcceptedDispatchFailure(failureArgs('run-accepted-new'));
+
+      const row = mockDb.inserts.find(
+        (i) => i.table === 'execution_runs' && i.values.run_id === 'run-accepted-new',
+      );
+      expect(row!.values).toMatchObject({
+        status: ExecutionRunStatus.enum.failed,
+        failure_class: RunFailureClass.enum.never_started,
+        failure_reason: 'Re-run could not be dispatched: source cache unreachable',
+        trigger_event: 'rerun',
+        triggered_by: 'user@test.com',
+        triggered_by_agent_label: 'ci-bot',
+        parent_run_id: 'run-parent',
+        original_run_id: 'run-root',
+        delivery_id: 'rerun:run-accepted-new',
+      });
+      // No init phase names a failed dispatch.
+      expect(row!.values).not.toHaveProperty('init_failure');
+    });
+
+    it('overwrites a live row the dispatch registered', async () => {
+      const runId = 'run-accepted-pending';
+      await startRun(tracker, { ...liveRerun, runId, deliveryId: `rerun:${runId}` });
+
+      await tracker.recordAcceptedDispatchFailure(failureArgs(runId));
+
+      const update = mockDb.updates.find(
+        (u) => u.table === 'execution_runs' && u.values.run_id === runId,
+      );
+      expect(update!.values).toMatchObject({
+        status: ExecutionRunStatus.enum.failed,
+        failure_reason: 'Re-run could not be dispatched: source cache unreachable',
+      });
+    });
+
+    it('keeps a terminal row and forwards nothing', async () => {
+      const runId = 'run-accepted-terminal';
+      const forwarded: string[] = [];
+      const t = new ExecutionTracker({
+        db: mockDb.db,
+        onExecutionStatusChange: (_id, status) => forwarded.push(status),
+      });
+      await startRun(t, { ...liveRerun, runId, deliveryId: `rerun:${runId}` });
+      await t.onJobStatus(runId, 'j1', ExecutionJobStatus.enum.success, Date.now());
+      // Positive control: the genuine completion did forward `success`.
+      expect(forwarded.at(-1)).toBe(ExecutionRunStatus.enum.success);
+      forwarded.length = 0;
+      const before = mockDb.updates.filter(
+        (u) => u.table === 'execution_runs' && u.values.run_id === runId,
+      ).length;
+
+      await t.recordAcceptedDispatchFailure(failureArgs(runId));
+
+      // fails-when: the upsert drops its terminal-status guard, so a finished
+      // run is rewritten as failed
+      const after = mockDb.updates.filter(
+        (u) => u.table === 'execution_runs' && u.values.run_id === runId,
+      ).length;
+      expect(after).toBe(before);
+      expect(forwarded).toEqual([]);
+    });
+
+    it('forwards the lineage and who triggered the run', async () => {
+      const onExecutionStatusChange = vi.fn();
+      const t = new ExecutionTracker({ db: mockDb.db, onExecutionStatusChange });
+
+      await t.recordAcceptedDispatchFailure(failureArgs('run-accepted-forward'));
+
+      const call = onExecutionStatusChange.mock.calls.at(-1)!;
+      expect(call[1]).toBe(ExecutionRunStatus.enum.failed);
+      expect(call[2]).toMatchObject({
+        parentRunId: 'run-parent',
+        originalRunId: 'run-root',
+        triggeredBy: 'user@test.com',
+        triggeredByAgentLabel: 'ci-bot',
+        triggerEvent: 'rerun',
+        failureClass: RunFailureClass.enum.never_started,
+      });
+      expect(call[7]).toBe('Re-run could not be dispatched: source cache unreachable');
+      expect(call[9]).toBeUndefined();
+    });
+  });
+
   describe('recordRunHeld', () => {
     const heldArgs = (runId: string) => ({
       runId,
@@ -5341,6 +5523,46 @@ describe('ExecutionTracker', () => {
       // fails-when: the build-failure write is unguarded — the run the sibling
       // completed green is flipped to failed by a stale build wait.
       expect(mockDb.runRows.get('run-mono')?.status).toBe(ExecutionRunStatus.enum.success);
+    });
+
+    // fails-when: a build-failed run is never pruned — the check-run reporter's state for it
+    // (latches included) lives for the process lifetime
+    it('onBuildFailed prunes the run', async () => {
+      vi.useFakeTimers();
+      try {
+        const onRunPruned = vi.fn();
+        const t = new ExecutionTracker({ db: mockDb.db as any, onRunPruned });
+        await start(t, 'run-prune-built');
+        await t.onBuildFailed('run-prune-built');
+        expect(onRunPruned).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+        expect(onRunPruned).toHaveBeenCalledWith('run-prune-built');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('onBuildFailedBeforeTracking prunes the run', async () => {
+      vi.useFakeTimers();
+      try {
+        const onRunPruned = vi.fn();
+        const t = new ExecutionTracker({ db: mockDb.db as any, onRunPruned });
+        await t.onBuildFailedBeforeTracking(
+          'run-prune-early',
+          'ci',
+          'github',
+          'acme/app',
+          'main',
+          'abc',
+          'd',
+          {},
+          'rk',
+        );
+        await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+        expect(onRunPruned).toHaveBeenCalledWith('run-prune-early');
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('onBuildFailed still fails a running run', async () => {

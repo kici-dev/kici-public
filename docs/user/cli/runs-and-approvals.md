@@ -395,11 +395,13 @@ rule. Any approval hold on the run is listed too, with its context, hold type,
 status and reason. If the run id is not on the Platform but exists in your
 local run history (from `kici run <event> --local`), the local record is shown instead.
 
-`kici runs show` and `kici runs logs` take a full run id or its first characters
-(at least 4), like a git short SHA. A prefix that matches several runs fails and
+`kici runs show`, `kici runs logs`, `kici runs rerun` and `kici runs cancel` take a
+full run id or its first characters (at least 4), like a git short SHA. A prefix that matches several runs fails and
 lists them, so type more characters. A prefix that matches none, or text that
 cannot start a run id, fails and says so. A prefix also matches archived runs and
-runs in your local run history. `kici runs list` shows full run ids.
+runs in your local run history. `kici runs list` shows full run ids. To cancel on
+an orchestrator directly (`--orchestrator-url`), give the full run id: the
+orchestrator does not look up a prefix.
 
 Steps are listed in the order they ran: a job's image build, then its `init`
 commands, then its steps. An `init` command is named `init[<n>]`, where `<n>` is
@@ -486,8 +488,23 @@ kici runs logs abc123 --follow
 
 #### kici runs rerun
 
-Re-trigger a completed run. Prints the new run id. The server enforces a short
-cooldown between reruns of the same run.
+Re-trigger a completed run. The server enforces a short cooldown between reruns
+of the same run. The cooldown also starts when the Platform cannot confirm the
+start.
+
+When you run the command again within 30 minutes of a rerun that was not
+confirmed, the Platform sends the first request again. You get the run that the
+first request started, and no second run starts. The command then prints
+`Rerun already queued by an earlier request: <id>`, and `--json` output
+contains `"alreadyAccepted": true`. This applies to the same user or API key
+only.
+
+The command prints the new run id as soon as the orchestrator accepts the rerun.
+The run then starts. If it cannot start, it fails, and `kici runs show <id>`
+shows why. If the Platform cannot confirm the start in time, the command says so
+and exits with code 1. The run can still start, so look for it before you retry:
+`kici runs list --trigger rerun --since <time>`. The command prints this command
+with the time filled in.
 
 The rerun builds the same commit as the original run and goes through the same
 steps: jobs wait for their `needs`, contexts and their approval gates apply,
@@ -535,7 +552,7 @@ always goes through the Platform, and it cannot be combined with
 ```bash
 KICI_ORCHESTRATOR_URL=http://127.0.0.1:4319 \
 KICI_ORCHESTRATOR_TOKEN="$(cat ~/.kici/local/admin-token)" \
-  kici runs cancel abc123 --force
+  kici runs cancel 0f1e2d3c-4b5a-4c6d-8e7f-0123456789ab --force
 ```
 
 #### kici runs artifacts list
@@ -821,9 +838,9 @@ Synopsis: `kici runs cancel [run-id] [options]`
 
 **Arguments**
 
-| Argument | Required | Variadic | Description      |
-| -------- | -------- | -------- | ---------------- |
-| `run-id` | no       | no       | Run ID to cancel |
+| Argument | Required | Variadic | Description                                         |
+| -------- | -------- | -------- | --------------------------------------------------- |
+| `run-id` | no       | no       | Run ID to cancel, or its first 4 or more characters |
 
 **Options**
 
@@ -881,9 +898,9 @@ Synopsis: `kici runs rerun <run-id> [options]`
 
 **Arguments**
 
-| Argument | Required | Variadic | Description     |
-| -------- | -------- | -------- | --------------- |
-| `run-id` | yes      | no       | Run ID to rerun |
+| Argument | Required | Variadic | Description                                        |
+| -------- | -------- | -------- | -------------------------------------------------- |
+| `run-id` | yes      | no       | Run ID to rerun, or its first 4 or more characters |
 
 **Options**
 

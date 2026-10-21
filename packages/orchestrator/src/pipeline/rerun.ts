@@ -27,7 +27,7 @@ import type { SourceCache } from '../cache/index.js';
 import type { BuildCoordinator } from '../cache/index.js';
 import type { DepCache } from '../cache/index.js';
 import type { PendingBuildTracker } from '../cache/index.js';
-import { claimRequestId } from './request-idempotency.js';
+import { claimRequestId, type RunStartAnswer } from './request-idempotency.js';
 import { ExecutionRunStatus, TERMINAL_RUN_STATES } from '@kici-dev/engine';
 import {
   dispatchGlobalWorkflowsForOtherRepos,
@@ -49,6 +49,7 @@ import {
 } from './rerun-inputs.js';
 import { isCrossRepoGlobalRun, rerunCrossRepoGlobalRun } from './rerun-global.js';
 import { rerunRepositoryRun } from './rerun-repo.js';
+import { startAcceptedDispatch } from './accepted-dispatch.js';
 import { registrationsAtHeldCommit } from './held-round-registrations.js';
 import type { WebhookInfo } from '../webhook/handler.js';
 import type { ProviderType, SimulatedEvent } from '@kici-dev/engine';
@@ -102,6 +103,11 @@ export interface RerunDeps {
    * means round re-runs are not available on this deployment.
    */
   processingDeps?: (() => ProcessingDeps) | null;
+  /**
+   * Test-only fault seam, awaited first inside an accepted dispatch (after the
+   * requester was answered). Undefined in the shipped orchestrator.
+   */
+  beforeAcceptedDispatch?: (() => Promise<void>) | null;
 }
 
 /** Original run row from execution_runs (selectAll). */
@@ -124,7 +130,7 @@ export async function handleRerun(
    * chunk under the right tenant prefix.
    */
   routingKeyHint?: string,
-): Promise<{ newRunId: string }> {
+): Promise<RunStartAnswer> {
   const originalRun = await loadAndValidateOriginalRun(originalRunId, routingKeyHint, deps);
 
   // A failed global eval round decided nothing, so it is re-evaluated, not
@@ -234,7 +240,7 @@ async function rerunGlobalEvalRound(
   originalRun: OriginalRunRow,
   deps: RerunDeps,
   requestId: string,
-): Promise<{ newRunId: string }> {
+): Promise<RunStartAnswer> {
   const payload = await loadWebhookPayload(originalRun.run_id, deps);
   if (!payload) {
     throw new Error(
@@ -261,14 +267,14 @@ async function rerunGlobalEvalRound(
   const event = normalizeRoundEvent(originalRun, binding.providerBundle, delivery, payload);
 
   // The re-evaluation dispatches, so the claim guards it; on a failover re-send
-  // the sibling that owns this requestId has already re-evaluated.
+  // or a Platform retry the earlier delivery has already re-evaluated.
   const { claimed } = await claimRequestId(deps.db, requestId);
   if (!claimed) {
-    logger.info('Eval-round rerun requestId already claimed by a sibling; returning', {
+    logger.info('Eval-round rerun requestId already accepted by an earlier delivery; returning', {
       runId: originalRun.run_id,
       requestId,
     });
-    return { newRunId: originalRun.run_id };
+    return { newRunId: originalRun.run_id, alreadyAccepted: true };
   }
 
   // The re-evaluation runs DETACHED and the request is answered now, like the
@@ -283,17 +289,21 @@ async function rerunGlobalEvalRound(
   // Answering early loses nothing: the response is the round's OWN run id (a
   // re-evaluation mints no run), and everything that can refuse has already run
   // above, so a later failure is operational and read from the round.
-  const reevaluation = reevaluateGlobalRound({
-    originalRun,
-    payload,
-    processingDeps: buildProcessingDeps(),
-    binding,
-    dispatch,
-    delivery,
-    workflowRepo,
-    event,
-  })
-    .then((outcome) => {
+  startAcceptedDispatch({
+    runId: originalRun.run_id,
+    kind: 'Evaluation round re-run',
+    context: { workflowRepo, requestId },
+    work: async () => {
+      const outcome = await reevaluateGlobalRound({
+        originalRun,
+        payload,
+        processingDeps: buildProcessingDeps(),
+        binding,
+        dispatch,
+        delivery,
+        workflowRepo,
+        event,
+      });
       logger.info('Re-evaluated a failed global eval round', {
         runId: originalRun.run_id,
         workflowRepo: outcome.workflowRepo,
@@ -302,39 +312,13 @@ async function rerunGlobalEvalRound(
         failedAgain: outcome.failedAgain,
         skippedByPolicy: outcome.skippedByPolicy,
       });
-    })
-    .catch((err: unknown) => {
-      // Reported here or nowhere: the requester was answered before this ran.
-      logger.error('Eval-round re-evaluation failed after the request was answered', {
-        runId: originalRun.run_id,
-        workflowRepo,
-        requestId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    })
-    .finally(() => {
-      pendingRoundReevaluations.delete(reevaluation);
-    });
-  pendingRoundReevaluations.add(reevaluation);
+    },
+    // A re-evaluation mints no run, so there is no run to fail: the helper's
+    // error log is the failure's only record.
+    recordFailure: async () => {},
+  });
 
   return { newRunId: originalRun.run_id };
-}
-
-/**
- * Detached re-evaluations not yet settled — the only handle on work nobody
- * awaits. Every entry carries its own `catch`, so none can reject.
- */
-const pendingRoundReevaluations = new Set<Promise<void>>();
-
-/**
- * Settle every detached re-evaluation started so far. A running orchestrator
- * never calls it; it lets a caller such as a test wait deterministically
- * instead of racing the microtask queue.
- */
-export async function settlePendingRoundReevaluations(): Promise<void> {
-  while (pendingRoundReevaluations.size > 0) {
-    await Promise.all([...pendingRoundReevaluations]);
-  }
 }
 
 /**

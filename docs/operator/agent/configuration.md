@@ -257,10 +257,10 @@ into the checkout, when all of these are true:
     so is the repository root's `package.json` or `.npmrc`. The manifest or
     the lockfile does not parse.
 - The agent has its own package manager for the project: the agent's npm
-  (below), version 11.10.0 or later, or pnpm `11.3.0` in the agent's corepack
+  (below), version 11.10.0 or later, or pnpm `11.28.6` in the agent's corepack
   cache (`COREPACK_HOME`, else `~/.cache/node/corepack`). The agent never runs
   a corepack shim, and never follows the project's `packageManager` field. The
-  agent image sets `COREPACK_HOME=/opt/corepack` and bakes pnpm `11.3.0` there,
+  agent image sets `COREPACK_HOME=/opt/corepack` and bakes pnpm `11.28.6` there,
   owned by root, so the agent user cannot change the pnpm the host install runs.
 - The agent's npm is present, for a pnpm project too. The agent reads every
   `.npmrc` with that npm's parser. The agent's npm is the first of these that

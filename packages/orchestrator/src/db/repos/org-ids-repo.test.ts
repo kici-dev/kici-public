@@ -8,6 +8,7 @@ import {
   ORG_ID_TABLES_NOT_LISTED,
   OrgIdSource,
   PlatformAttachment,
+  foreignSourceOrgs,
   groupOrgIdRows,
   listHeldOrgIds,
   readPlatformAttachment,
@@ -71,6 +72,35 @@ describe('readPlatformAttachment', () => {
       platformAttachment: PlatformAttachment.enum.attached,
       attachedOrgId: 'org_live',
     });
+  });
+});
+
+describe('foreignSourceOrgs', () => {
+  const orgs = [
+    { orgId: '__default__', sources: [S.source, S.registration] },
+    { orgId: 'org_A', sources: [S.platform, S.source, S.context] },
+    { orgId: 'org_G', sources: [S['generic-source']] },
+    { orgId: 'org_ctx', sources: [S.context, S.secret] },
+  ];
+
+  it('returns the orgs other than the attached one that hold a source', () => {
+    expect(
+      foreignSourceOrgs({
+        platformAttachment: PlatformAttachment.enum.attached,
+        attachedOrgId: 'org_A',
+        orgs,
+      }),
+    ).toEqual(['__default__', 'org_G']);
+  });
+
+  it('is empty unless the listing is attached', () => {
+    for (const platformAttachment of [
+      PlatformAttachment.enum.pending,
+      PlatformAttachment.enum.none,
+    ]) {
+      expect(foreignSourceOrgs({ platformAttachment, attachedOrgId: null, orgs })).toEqual([]);
+    }
+    expect(foreignSourceOrgs({ orgs })).toEqual([]);
   });
 });
 

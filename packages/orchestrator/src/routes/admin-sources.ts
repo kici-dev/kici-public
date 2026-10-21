@@ -14,6 +14,8 @@ import { validateGitHubSource } from '../sources/source-validator.js';
 import { WebhookUrlNote, type WebhookUrlResolution } from '../sources/webhook-url-resolvers.js';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import { enforceRoutingKeyScope } from '../secrets/routing-key-scope.js';
+import { PlatformAttachment, readPlatformAttachment } from '../db/repos/org-ids-repo.js';
+import { FOREIGN_ORG_CONSEQUENCE, resolveNewSourceOrg } from '../sources/source-org.js';
 import {
   fetchGithubAppIdentity,
   listGithubAppInstallations,
@@ -67,6 +69,12 @@ interface SourceRouteDeps {
   fetchAppInstallations?: FetchGithubAppInstallations;
   /** Test seam; defaults to `redeliverWindow`. */
   redeliverDeliveries?: RedeliverDeliveries;
+  /**
+   * The org this orchestrator authenticated to the Platform as; undefined
+   * until it authenticates. Absent on an independent orchestrator. Decides
+   * the org a new source is filed under.
+   */
+  getPlatformOrgId?: () => string | undefined;
 }
 
 /** Replay a delivery window for a GitHub App. Matches `redeliverWindow`. */
@@ -95,11 +103,22 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
   app.post('/sources', requireUnscoped, async (c) => {
     try {
       const body = await c.req.json();
-      const { provider, name, slug, appId, privateKey, webhookSecret } = body;
+      const { provider, name, slug, appId, privateKey, webhookSecret, customerId } = body;
 
       if (!provider || !name || !appId || !privateKey) {
         return c.json({ error: 'Missing required fields: provider, name, appId, privateKey' }, 400);
       }
+      if (customerId !== undefined && (typeof customerId !== 'string' || customerId === '')) {
+        return c.json({ error: 'customerId must be a non-empty string' }, 400);
+      }
+
+      // The org check runs before the credential validation: a refused org
+      // makes no call to GitHub.
+      const org = resolveNewSourceOrg({
+        requested: customerId,
+        attachment: readPlatformAttachment(deps.getPlatformOrgId),
+      });
+      if (!org.ok) return c.json({ error: org.error }, org.status);
 
       // GitHub is the source of truth for a GitHub source's name + slug: the
       // credential validation already calls `GET /app`, so adopt its values
@@ -124,6 +143,7 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
         appId,
         privateKey,
         webhookSecret,
+        customerId: org.orgId,
       });
 
       // Best effort: a resolver failure (disconnect/timeout) must not fail the
@@ -153,6 +173,7 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
           routingKey: source.routing_key,
           id: source.id,
           name: source.name,
+          customerId: source.customer_id,
           webhookUrl,
           ...(webhookNote && { webhookNote }),
         },
@@ -194,6 +215,7 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
       const all = await deps.sourceStore.listSources();
       const sources = tokenRoutingKey ? all.filter((s) => s.routing_key === tokenRoutingKey) : all;
       return c.json({
+        ...readPlatformAttachment(deps.getPlatformOrgId),
         sources: sources.map((s) => ({
           id: s.id,
           provider: s.provider,
@@ -242,7 +264,19 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
         config,
         customerId,
       });
-      return c.json({ routingKey: source.routing_key, name: source.name });
+      const { platformAttachment, attachedOrgId } = readPlatformAttachment(deps.getPlatformOrgId);
+      const warning =
+        customerId &&
+        platformAttachment === PlatformAttachment.enum.attached &&
+        customerId !== attachedOrgId
+          ? `${FOREIGN_ORG_CONSEQUENCE} This orchestrator is attached to org "${attachedOrgId}". ` +
+            `Run kici-admin source update ${routingKey} --org ${attachedOrgId} to move it back.`
+          : undefined;
+      return c.json({
+        routingKey: source.routing_key,
+        name: source.name,
+        ...(warning && { warning }),
+      });
     } catch (err) {
       logger.error('Failed to update source', { error: toErrorMessage(err) });
       return c.json({ error: toErrorMessage(err) }, 500);

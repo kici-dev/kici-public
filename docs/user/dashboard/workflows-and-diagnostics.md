@@ -7,7 +7,9 @@ description: Registered workflows, infrastructure health, and the per-cluster or
 
 The workflows page (`/orgs/:customerId/workflows`) shows permanently registered workflows listening for events. It displays a filterable table with columns for workflow name, repository, trigger types, last triggered time, next fire time (for scheduled workflows), source repos, and actions.
 
-Each row is expandable to show trigger configuration details. Rows include action controls: a "Run now" button for manual triggering, a toggle switch to enable/disable the workflow, and a delete button with a confirmation modal (optionally cancelling active runs). Stale workflows (no triggers in the last 30 days) show a yellow "Stale" badge. Registry health indicators (version, sync status, last updated) appear above the table.
+Each row is expandable to show trigger configuration details. Rows include action controls: a "Run now" button for manual triggering, a toggle switch to enable/disable the workflow, and a delete button with a confirmation modal (optionally cancelling active runs). Stale workflows (no triggers in the last 30 days) show a yellow "Stale" badge. A workflow whose lock declares a compile schema that the orchestrator's agents do not implement shows a red "Recompile needed" badge. Its tooltip names both schemas. Every run of that workflow fails until you recompile the lock; see [compile schema mismatch](../lock-file-and-drift.md#compile-schema-mismatch). Registry health indicators (version, sync status, last updated) appear above the table.
+
+If the orchestrator does not confirm a "Run now" start in time, the run can still start. When you click "Run now" again within 30 minutes, you get the run that the first click started. The notice then says "This run was already started".
 
 A [global workflow](../global-workflows.md) — one whose trigger carries `repos:`, so it runs on events from other repos in the org — shows a "Global" badge. Its "Source repos" column lists the `repos:` patterns it matches, exclusions included.
 

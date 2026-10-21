@@ -43,7 +43,7 @@ import { authEnvReferences, isToolReadEnvName, serializeNpmrc } from './npmrc-al
 const execFileAsync = promisify(execFile);
 
 /** The pnpm the agent image pins (packages/agent/Dockerfile, `corepack prepare`). */
-export const PINNED_PNPM_VERSION = '11.3.0';
+export const PINNED_PNPM_VERSION = '11.28.6';
 
 /** First npm with `--allow-remote` / `--allow-file` / `--allow-directory` (11.15.0). */
 const NPM_ALLOW_SOURCES_MIN: readonly number[] = [11, 15, 0];

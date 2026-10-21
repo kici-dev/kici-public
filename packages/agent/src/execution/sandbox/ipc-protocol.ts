@@ -650,6 +650,8 @@ export interface JobExecutionRequest {
   contentHash?: string;
   /** For content-addressed caching. */
   resolvedHashFiles?: string[];
+  /** Where the job's lock came from, named by a compile-schema mismatch. */
+  lockOrigin?: { repo?: string; rerun?: { repo: string; sha: string } };
 
   /** Per step, in bytes; the runner truncates past it. */
   maxLogSizeBytes?: number;

@@ -252,7 +252,11 @@ export class PlatformRunClient {
     body: PlatformTriggerInput,
   ): Promise<PlatformTriggerResponse> {
     const path = `/api/v1/orgs/${orgId}/test/trigger${clusterQuery(target.orchestrator, target.defaultCluster)}`;
-    const response = await this.request(path, { method: 'POST', body: JSON.stringify(body) });
+    const response = await this.request(
+      path,
+      { method: 'POST', body: JSON.stringify(body) },
+      { mintsRun: true },
+    );
     return (await response.json()) as PlatformTriggerResponse;
   }
 
@@ -299,9 +303,16 @@ export class PlatformRunClient {
    * Classifies errors: 401 → AuthenticationError, 403 → AccessDeniedError,
    * 404 → NotFoundError, 422 ambiguous_cluster → AmbiguousClusterError,
    * 422 no_cluster → NoClusterError, network failure → ConnectionError.
+   * `mintsRun` marks a request that starts a run: a timeout there does not
+   * mean the run did not start.
    */
-  private async request(path: string, init: RequestInit): Promise<Response> {
+  private async request(
+    path: string,
+    init: RequestInit,
+    opts: { mintsRun?: boolean } = {},
+  ): Promise<Response> {
     const url = `${this.baseUrl}${path}`;
+    const startedAt = new Date();
 
     let response: Response;
     try {
@@ -324,6 +335,12 @@ export class PlatformRunClient {
       return response;
     }
 
+    if (opts.mintsRun && response.status === 504) {
+      throw new Error(
+        `The run may still have started: the orchestrator did not confirm it in time. ` +
+          `Before you retry, look for it with: kici runs list --since ${startedAt.toISOString()}`,
+      );
+    }
     await this.throwForStatus(response);
     // Unreachable: throwForStatus always throws.
     return response;

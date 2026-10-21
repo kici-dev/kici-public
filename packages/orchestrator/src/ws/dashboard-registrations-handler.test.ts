@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { COMPILE_SCHEMA_VERSION } from '@kici-dev/shared';
 import {
   registrationsListRequestSchema,
   registrationsListResponseSchema,
@@ -408,6 +409,10 @@ describe('DashboardRegistrationsHandler', () => {
     expect(item.isGlobal).toBe(true);
     // The exclusion is carried through, not only the matches.
     expect(item.sourceRepos).toEqual(['myorg/*', '!myorg/archived-*']);
+    // fails-when: the handler omits the schema fields the dashboard's "Recompile needed"
+    // badge reads (the fixture lock declares schema 1)
+    expect(item.compileSchemaVersion).toBe(1);
+    expect(item.agentCompileSchemaVersion).toBe(COMPILE_SCHEMA_VERSION);
   });
 
   it('reports isGlobal false and no sourceRepos for a same-repo workflow', async () => {

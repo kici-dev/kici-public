@@ -49,3 +49,12 @@ export {
 } from './diagnostics-contract.js';
 export { docsUrl } from './docs-url.js';
 export { compareReleaseVersions } from './release-version.js';
+export {
+  COMPILE_SCHEMA_VERSION,
+  COMPILE_SCHEMA_MISMATCH_PREFIX,
+  lockCompileSchema,
+  formatCompileSchemaMismatch,
+  formatRerunLockNote,
+  isCompileSchemaMismatchMessage,
+  type CompileSchemaMismatchInput,
+} from './compile-schema.js';

@@ -10,7 +10,12 @@ import path from 'node:path';
 import { register, createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 
-import { normalizeLineEndings, sha256, toErrorMessage } from '@kici-dev/shared';
+import {
+  formatCompileSchemaMismatch,
+  normalizeLineEndings,
+  sha256,
+  toErrorMessage,
+} from '@kici-dev/shared';
 import {
   COMPILE_SCHEMA_VERSION,
   collectSourceSymlinks,
@@ -21,6 +26,8 @@ import {
 import type { Workflow, Job, StepInput, DynamicJobFn, OutputsMap, StepRefMap } from '@kici-dev/sdk';
 import { isDynamicJobFn } from '@kici-dev/sdk';
 import { buildGeneratorContext, type GeneratorRepoPair } from './generator-context.js';
+import { readAgentVersion } from '../version.js';
+import type { LockOrigin } from './lock-origin.js';
 
 /**
  * Output-map setters of the workflow module's OWN SDK copy (not the agent's
@@ -203,13 +210,15 @@ async function buildAssetDigestFromResolvedPaths(
  * With `expectedContentHash`, re-hashes the whole extracted `.kici/` tree, not
  * just the entry file, so a warm cache restoring a stale tarball cannot run an
  * old imported helper green. The drift error names the baked agent SDK
- * fingerprint, to spot an agent running a stale build.
+ * fingerprint, to spot an agent running a stale build. `lockOrigin` names the
+ * repository whose lock a compile-schema mismatch blames, and a re-run's lock.
  */
 export async function loadWorkflowSource(
   workDir: string,
   sourceFile: string,
   expectedContentHash?: string,
   resolvedHashFiles?: string[],
+  lockOrigin?: LockOrigin,
 ): Promise<{ module: Record<string, unknown>; sdkSetters: SdkOutputSetters }> {
   ensureLoaderHookRegistered();
 
@@ -226,15 +235,16 @@ export async function loadWorkflowSource(
     if (kiciDir) {
       const lockVersion = await readLockCompileSchemaVersion(kiciDir, sourceFile);
       if (lockVersion !== null && lockVersion !== COMPILE_SCHEMA_VERSION) {
+        const mismatch = formatCompileSchemaMismatch({
+          lockSchema: lockVersion,
+          implementedSchema: COMPILE_SCHEMA_VERSION,
+          implementer: 'agent',
+          lockRepo: lockOrigin?.repo,
+          rerun: lockOrigin?.rerun,
+          implementerRelease: readAgentVersion() ?? undefined,
+        });
         throw new Error(
-          `kici.lock.json was compiled by an incompatible @kici-dev/compiler: ` +
-            `the lock declares compile schema ${lockVersion}, this agent implements ` +
-            `${COMPILE_SCHEMA_VERSION}. The schema version is mixed into every ` +
-            `contentHash, so recompiling cannot reconcile them. Align the versions: ` +
-            `upgrade the agent to one implementing schema ${lockVersion}, or pin ` +
-            `@kici-dev/compiler to a release implementing schema ` +
-            `${COMPILE_SCHEMA_VERSION} and recompile ` +
-            `(agent baked @kici-dev/sdk@${AGENT_SDK_VERSION} bundleHash=${AGENT_SDK_BUNDLE_HASH}).`,
+          `${mismatch} (agent baked @kici-dev/sdk@${AGENT_SDK_VERSION} bundleHash=${AGENT_SDK_BUNDLE_HASH}).`,
         );
       }
     }

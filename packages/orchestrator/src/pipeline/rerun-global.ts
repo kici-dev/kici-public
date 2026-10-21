@@ -25,6 +25,7 @@ import type { GlobalDispatchIdentity } from './global-dispatch-identity.js';
 import { resolveTrustForPR } from './process-webhook.js';
 import type { TrustPolicyOutcome } from '../security/trust-policy-gate.js';
 import type { ProcessingDeps } from './processor.js';
+import type { RunStartAnswer } from './request-idempotency.js';
 import type { OriginalRunRow, RerunDeps } from './rerun.js';
 import {
   claimRerunRequest,
@@ -33,11 +34,13 @@ import {
   rerunSecurityDecision,
   loadWebhookPayload,
   normalizeRoundEvent,
+  recordRerunDispatchFailure,
   resolveRerunProviderBinding,
   withChangedFiles,
   type RerunProviderBinding,
   type RerunRefusal,
 } from './rerun-inputs.js';
+import { startAcceptedDispatch } from './accepted-dispatch.js';
 import { isOrganizationWideEntry, loadWorkflowLockEntryAtSha } from './workflow-lock-at-sha.js';
 
 const logger = createLogger({ prefix: 'rerun' });
@@ -92,6 +95,9 @@ interface GlobalRerunPlan {
  * Refuses, naming the workflow repository, when the run recorded no workflow
  * commit or the workflow is no longer registered there; nothing falls back to a
  * current lock file.
+ *
+ * The answer names the accepted run, before it is dispatched. A dispatch that
+ * throws afterwards fails that run.
  */
 export async function rerunCrossRepoGlobalRun(opts: {
   originalRun: OriginalRunRow;
@@ -99,14 +105,14 @@ export async function rerunCrossRepoGlobalRun(opts: {
   triggeredByAgentLabel: string | null;
   deps: RerunDeps;
   requestId: string;
-}): Promise<{ newRunId: string }> {
+}): Promise<RunStartAnswer> {
   const { originalRun, triggeredBy, triggeredByAgentLabel, deps, requestId } = opts;
   // Read-only reconstruction first: every step throws identically on both hops
   // of a relay failover re-send, so a refusal is never masked by the claim.
   const plan = await planCrossRepoGlobalRerun(originalRun, deps);
 
   const { newRunId, claimed } = await claimRerunRequest(deps, requestId, originalRun.run_id);
-  if (!claimed) return { newRunId };
+  if (!claimed) return { newRunId, alreadyAccepted: true };
   const rootRunId = originalRun.original_run_id ?? originalRun.run_id;
   logger.info('Re-running an organization-wide workflow', {
     originalRunId: originalRun.run_id,
@@ -121,55 +127,75 @@ export async function rerunCrossRepoGlobalRun(opts: {
   });
   const subjectEvent = originalRun.subject_trigger_event ?? originalRun.trigger_event ?? null;
 
-  // The pipeline stores the payload under the new run: storing it here as well
-  // appends a second copy, which no reader can parse.
-  await dispatchMatchedWorkflow({
-    info: globalRerunInfo(originalRun, plan, `rerun:${newRunId}`),
-    deps: plan.processingDeps,
-    bundle: plan.binding.providerBundle,
-    payload: plan.payload,
-    repoIdentifier: originalRun.repo_identifier,
-    workflowRepoIdentifier: plan.registration.repoIdentifier,
-    credentials: plan.binding.providerContext,
-    event: plan.event,
-    eventWithFiles: plan.eventWithFiles,
-    ref: originalRun.sha,
-    fullLockFile: globalRunLockFile(plan.workflow, {
-      sourceFile: plan.registration.sourceFile,
-      ...plan.depCacheKey,
-    }),
-    resolvedOrgId: originalRun.customer_id,
-    workflow: plan.workflow,
-    decision: {
-      workflowName: plan.workflow.name,
-      matched: true,
-      checks: [],
-      summary: 'Re-run of an organization-wide workflow',
-    },
+  const rerunLineage = { parentRunId: originalRun.run_id, originalRunId: rootRunId };
+  // Answered now: the dispatch can wait minutes on a cold cache, and the
+  // relayed request that asked for it has seconds.
+  startAcceptedDispatch({
     runId: newRunId,
-    trustResolution: plan.trustResolution,
-    lockFileSource: undefined,
-    localWorkingTree: false,
-    crossSource: false,
-    // Re-running is not approving: the trust policy holds or rejects a fork pull
-    // request again, as on the delivery. Context rules and `approval` gates
-    // still hold the run.
-    securityDecision: plan.securityDecision,
-    triggerEventOverride: 'rerun',
-    triggeredBy,
-    triggeredByAgentLabel,
-    rerunLineage: { parentRunId: originalRun.run_id, originalRunId: rootRunId },
-    // Read the original's inherited subject first, so a re-run of a re-run
-    // keeps the pull-request shape instead of decaying to `rerun`.
-    ...(subjectEvent !== null && { subjectTriggerEvent: subjectEvent }),
-    global: plan.global,
-  });
-
-  await emitWorkflowRerun(deps, {
-    originalRun,
-    newRunId,
-    workflowName: plan.workflow.name,
-    triggeredBy,
+    kind: 'Re-run',
+    context: { originalRunId: originalRun.run_id, newRunId },
+    work: async () => {
+      await deps.beforeAcceptedDispatch?.();
+      // The pipeline stores the payload under the new run: storing it here as well
+      // appends a second copy, which no reader can parse.
+      await dispatchMatchedWorkflow({
+        info: globalRerunInfo(originalRun, plan, `rerun:${newRunId}`),
+        deps: plan.processingDeps,
+        bundle: plan.binding.providerBundle,
+        payload: plan.payload,
+        repoIdentifier: originalRun.repo_identifier,
+        workflowRepoIdentifier: plan.registration.repoIdentifier,
+        credentials: plan.binding.providerContext,
+        event: plan.event,
+        eventWithFiles: plan.eventWithFiles,
+        ref: originalRun.sha,
+        fullLockFile: globalRunLockFile(plan.workflow, {
+          sourceFile: plan.registration.sourceFile,
+          ...plan.depCacheKey,
+        }),
+        resolvedOrgId: originalRun.customer_id,
+        workflow: plan.workflow,
+        decision: {
+          workflowName: plan.workflow.name,
+          matched: true,
+          checks: [],
+          summary: 'Re-run of an organization-wide workflow',
+        },
+        runId: newRunId,
+        trustResolution: plan.trustResolution,
+        lockFileSource: undefined,
+        localWorkingTree: false,
+        crossSource: false,
+        // Re-running is not approving: the trust policy holds or rejects a fork pull
+        // request again, as on the delivery. Context rules and `approval` gates
+        // still hold the run.
+        securityDecision: plan.securityDecision,
+        triggerEventOverride: 'rerun',
+        triggeredBy,
+        triggeredByAgentLabel,
+        rerunLineage,
+        // Read the original's inherited subject first, so a re-run of a re-run
+        // keeps the pull-request shape instead of decaying to `rerun`.
+        ...(subjectEvent !== null && { subjectTriggerEvent: subjectEvent }),
+        global: plan.global,
+      });
+      await emitWorkflowRerun(deps, {
+        originalRun,
+        newRunId,
+        workflowName: plan.workflow.name,
+        triggeredBy,
+      });
+    },
+    recordFailure: (reason) =>
+      recordRerunDispatchFailure(deps, {
+        originalRun,
+        newRunId,
+        reason,
+        workflowRepoIdentifier: plan.registration.repoIdentifier,
+        triggeredBy,
+        triggeredByAgentLabel,
+        rerunLineage,
+      }),
   });
   return { newRunId };
 }

@@ -5,9 +5,11 @@ import type { Database } from '../db/types.js';
 
 /**
  * Atomically claim a run-minting request by its Platform `requestId`, returning
- * the run id to use. `claimed: false` means a sibling coordinator owns it (a
- * relay failover re-send): the caller MUST return `{ newRunId }` WITHOUT
- * creating or dispatching a run, so one click yields exactly one run.
+ * the run id to use. `claimed: false` means an earlier delivery of the same
+ * request owns it (a relay failover re-send to a sibling coordinator, or a
+ * Platform retry that reuses the request id of an unconfirmed start): the caller
+ * MUST return `{ newRunId, alreadyAccepted: true }` WITHOUT creating or
+ * dispatching a run, so one click yields exactly one run.
  *
  * Used by `run.rerun.request` and `run.manual_schedule.request`, which both mint
  * a run and ride the Platform's timeout-driven failover. HA siblings share one
@@ -36,9 +38,16 @@ export async function claimRequestId(
   return { newRunId: existing.new_run_id, claimed: false };
 }
 
+/** The answer to a run-minting request; `alreadyAccepted` marks a run an earlier delivery started. */
+export interface RunStartAnswer {
+  newRunId: string;
+  alreadyAccepted?: true;
+}
+
 /**
- * Prune `request_idempotency` rows older than 1h: the request budget is ~10s,
- * so no claimed requestId is re-sent after an hour, and the table stays bounded.
+ * Prune `request_idempotency` rows older than 1h: the Platform re-sends a
+ * requestId for at most 30 minutes (its run-start intent window), so no claimed
+ * requestId is re-sent after an hour, and the table stays bounded.
  *
  * @returns the number of rows deleted.
  */

@@ -75,6 +75,31 @@ function gateForLabelSet(
 }
 
 /**
+ * The lowercased labels of label set `index` when it can take a job whose exact
+ * labels are `target`: its gate is satisfied and it carries every target label.
+ * `null` otherwise.
+ */
+function acceptingLabelSet(
+  scaler: {
+    labelSets: Array<{ labels: string[] }>;
+    labelSetMandatoryLabels?: string[][];
+  },
+  index: number,
+  target: ReadonlySet<string>,
+): Set<string> | null {
+  // Per set, not per scaler: a scaler mixing platforms gates each set
+  // differently, and a scaler-level check tests the union and rejects every set.
+  const mandatory = gateForLabelSet(scaler, index);
+  if (mandatory === null) return null;
+  if (!mandatory.every((m) => target.has(m.toLowerCase()))) return null;
+  const scalerLabels = new Set(scaler.labelSets[index].labels.map((l) => l.toLowerCase()));
+  for (const label of target) {
+    if (!scalerLabels.has(label)) return null;
+  }
+  return scalerLabels;
+}
+
+/**
  * The scaler and label-set index that handle a job's labels, or null.
  *
  * Subset matching: ['macos'] matches ['macos', 'darwin', 'bare-metal'], the same
@@ -111,34 +136,11 @@ export function findBackendForLabels(
 
   for (const scaler of scalers) {
     for (let i = 0; i < scaler.labelSets.length; i++) {
-      // Per set, not per scaler: a scaler mixing platforms gates each set
-      // differently, and a scaler-level check tests the union and rejects every set.
-      const mandatory = gateForLabelSet(scaler, i);
-      if (mandatory === null) continue;
-      if (mandatory.length > 0) {
-        const allMandatoryPresent = mandatory.every((m) => targetLabels.has(m.toLowerCase()));
-        if (!allMandatoryPresent) continue;
-      }
-
-      const scalerLabels = new Set(scaler.labelSets[i].labels.map((l) => l.toLowerCase()));
-
-      let allMatch = true;
-      for (const label of targetLabels) {
-        if (!scalerLabels.has(label)) {
-          allMatch = false;
-          break;
-        }
-      }
-
-      if (allMatch) {
-        if (excludeLabels.length > 0) {
-          const hasExcluded = excludeLabels.some((e) => scalerLabels.has(e.toLowerCase()));
-          if (hasExcluded) continue;
-        }
-
-        if (bestMatch === null || scalerLabels.size < bestMatch.size) {
-          bestMatch = { scalerName: scaler.name, labelSetIndex: i, size: scalerLabels.size };
-        }
+      const scalerLabels = acceptingLabelSet(scaler, i, targetLabels);
+      if (!scalerLabels) continue;
+      if (excludeLabels.some((e) => scalerLabels.has(e.toLowerCase()))) continue;
+      if (bestMatch === null || scalerLabels.size < bestMatch.size) {
+        bestMatch = { scalerName: scaler.name, labelSetIndex: i, size: scalerLabels.size };
       }
     }
   }
@@ -146,4 +148,30 @@ export function findBackendForLabels(
   return bestMatch
     ? { scalerName: bestMatch.scalerName, labelSetIndex: bestMatch.labelSetIndex }
     : null;
+}
+
+/**
+ * Every label set a job whose exact labels are `labels` could be spawned from:
+ * each one {@link findBackendForLabels} could pick once the job's exclusions or
+ * extra labels (a runtime label its shape demands) narrow the choice. A
+ * superset of that pick, for a caller that must not guess which one it is.
+ */
+export function findEligibleBackendsForLabels(
+  labels: string[],
+  scalers: Array<{
+    name: string;
+    labelSets: Array<{ labels: string[] }>;
+    labelSetMandatoryLabels?: string[][];
+  }>,
+): Array<{ scalerName: string; labelSetIndex: number }> {
+  const targetLabels = new Set(labels.map((l) => l.toLowerCase()));
+  const eligible: Array<{ scalerName: string; labelSetIndex: number }> = [];
+  for (const scaler of scalers) {
+    for (let i = 0; i < scaler.labelSets.length; i++) {
+      if (acceptingLabelSet(scaler, i, targetLabels)) {
+        eligible.push({ scalerName: scaler.name, labelSetIndex: i });
+      }
+    }
+  }
+  return eligible;
 }

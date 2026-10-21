@@ -109,6 +109,7 @@ import {
 } from './sandbox/index.js';
 import { stepsTotal, stepDurationSeconds, cloneDurationSeconds } from '../metrics/prometheus.js';
 import { BetweenJobsController, type AfterJobContext } from './between-jobs-controller.js';
+import { resolveLockOrigin } from './lock-origin.js';
 
 const logger = createLogger({ prefix: 'job-runner' });
 
@@ -1682,6 +1683,7 @@ export class JobRunner {
         sourceFile,
         contentHash: buildConfig.contentHash,
         resolvedHashFiles: buildConfig.resolvedHashFiles,
+        lockOrigin: resolveLockOrigin(dispatch),
       },
       emit: (line) => buildStreamer.addLine(line),
       signal,

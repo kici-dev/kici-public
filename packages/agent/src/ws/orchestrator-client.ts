@@ -40,6 +40,7 @@ import type {
 } from '../execution/sandbox/index.js';
 import { buildAgentMiniBundle } from '../diagnostics/mini-bundle.js';
 import { readAgentVersion } from '../version.js';
+import { COMPILE_SCHEMA_VERSION } from '@kici-dev/core/kici-source-digest';
 import { EventBuffer } from './event-buffer.js';
 import { LogBuffer } from './log-buffer.js';
 
@@ -1908,6 +1909,9 @@ export class OrchestratorClient {
       nodeVersion: process.versions.node,
       // The orchestrator routes work needing a capability only to an agent advertising it.
       capabilities: AGENT_CAPABILITIES,
+      // The orchestrator refuses a run before dispatch when every agent that could
+      // load its source reports a schema the lock does not declare.
+      compileSchemaVersion: COMPILE_SCHEMA_VERSION,
       ...(() => {
         const v = readAgentVersion();
         return v ? { version: v } : {};

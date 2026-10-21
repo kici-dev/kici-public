@@ -226,7 +226,7 @@ const TOOL_ENV_NAMES = new Set([
 ]);
 
 /**
- * Names in a tool namespace above that npm 11.12.1, pnpm 11.3.0 and Node 24 do
+ * Names in a tool namespace above that npm 11.12.1, pnpm 11.28.6 and Node 24 do
  * not read, and that registry-auth lines conventionally reference. Exact case
  * only, since npm reads its `npm_config_*` variables in any case.
  */

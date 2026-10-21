@@ -81,33 +81,8 @@ export interface KiciIgnoreRules {
   readonly warnings: readonly string[];
 }
 
-/**
- * Compile schema version — bump when the compilation approach changes (what the
- * digest covers, how the hash input is built, the artifact model).
- * This is NOT the lock file schema version.
- *
- * The compiler that writes a `contentHash` and the agent that re-verifies it
- * must mix in the same number, so `@kici-dev/compiler` `lockfile/hasher.ts` and
- * `@kici-dev/agent` `execution/workflow-loader.ts` both re-export this one
- * definition.
- *
- * What each version means:
- *
- * - 3 → 4: the agent artifact switched from a Rolldown-bundled `.compiled.mjs`
- *   to a raw `.kici/` source tarball extracted and imported via the shared
- *   oxc-transform ESM loader hook.
- * - 4 → 5: the hash input became line-ending-normalized (CRLF → LF) so a lock
- *   produced on Linux matches a Windows agent's checkout.
- * - 5 → 6: `bundleSource` became a digest over the whole `.kici/` tree
- *   (`hashKiciSourceTree`) rather than the workflow entry file's text, so the
- *   identity covers the same files the source tarball carries.
- * - 6 → 7: the covered set became declarative — `.kici/.kiciignore` — and the
- *   default exclusions grew to cover `.npmrc`, `package-lock.json` and
- *   `pnpm-lock.yaml`, which a run rewrites inside the tree the agent re-hashes
- *   (the drift gate rejected runs whose source had not moved). Every repo's
- *   `contentHash` moves; `kici compile` regenerates the stale lock files.
- */
-export const COMPILE_SCHEMA_VERSION = 7;
+/** Re-exported from the pure module that owns it; see `compile-schema.ts`. */
+export { COMPILE_SCHEMA_VERSION } from './compile-schema.js';
 
 /**
  * Resolve the exclusion rules for `kiciDir`, reading `.kici/.kiciignore`.

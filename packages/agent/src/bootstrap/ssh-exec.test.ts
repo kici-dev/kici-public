@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   defaultSpawn,
+  isPreSessionFailure,
+  SSH_SESSION_ATTEMPTS,
   sshExec,
   sshPush,
   sshPushFile,
@@ -231,5 +233,109 @@ describe('sshPushFile (binary-safe scp)', () => {
     await expect(
       sshPushFile(reach, KEY, '/tmp/p.tar.gz', '/tmp/p.tgz', {}, { spawnFn }),
     ).rejects.toThrow(/sshPushFile.*exit 1/s);
+  });
+});
+
+describe('pre-session connection retry', () => {
+  const BANNER_TIMEOUT: SshResult = {
+    exitCode: 255,
+    stdout: '',
+    stderr:
+      'Connection timed out during banner exchange\r\nConnection to 10.0.0.7 port 22 timed out\r\n',
+  };
+  const ok: SshResult = { exitCode: 0, stdout: 'done', stderr: '' };
+
+  /** A spawn whose `command` calls answer `results` in order, then succeed. */
+  function sequence(command: 'ssh' | 'scp', results: SshResult[]) {
+    const { spawnFn: base, calls } = makeSpawn();
+    const queue = [...results];
+    const spawnFn: SpawnFn = async (cmd, args, opts) => {
+      if (cmd !== command) return base(cmd, args, opts);
+      await base(cmd, args, opts);
+      return queue.shift() ?? ok;
+    };
+    const sleeps: number[] = [];
+    const sleep = async (ms: number) => {
+      sleeps.push(ms);
+    };
+    const attempts = () => calls.filter((c) => c.command === command).length;
+    return { deps: { spawnFn, sleep }, attempts, sleeps };
+  }
+
+  it('classifies only an exit-255 failure before the session as pre-session', () => {
+    expect(isPreSessionFailure(BANNER_TIMEOUT)).toBe(true);
+    expect(
+      isPreSessionFailure({
+        exitCode: 255,
+        stdout: '',
+        stderr: 'ssh: connect to host 10.0.0.7 port 22: Connection timed out\r\n',
+      }),
+    ).toBe(true);
+    expect(
+      isPreSessionFailure({
+        exitCode: 255,
+        stdout: '',
+        stderr: 'kex_exchange_identification: read: Connection reset by peer\r\n',
+      }),
+    ).toBe(true);
+    // A remote command that itself exited 255 carries none of ssh's messages.
+    expect(isPreSessionFailure({ exitCode: 255, stdout: '', stderr: 'boom' })).toBe(false);
+    // The same text on another exit code is a remote command's output.
+    expect(isPreSessionFailure({ ...BANNER_TIMEOUT, exitCode: 1 })).toBe(false);
+    // An established session that drops (a pre-boot unlock rebooting the box) is not retried.
+    expect(
+      isPreSessionFailure({
+        exitCode: 255,
+        stdout: '',
+        stderr: 'Connection to 10.0.0.7 closed by remote host.\r\n',
+      }),
+    ).toBe(false);
+    expect(
+      isPreSessionFailure({ exitCode: 255, stdout: '', stderr: 'Permission denied (publickey).' }),
+    ).toBe(false);
+  });
+
+  // fails-when: a banner-exchange timeout is returned as-is — the bring-up then fails on one
+  // slow connection, as fresh-box-bringup-arm did against a loaded Raspberry Pi.
+  it('sshPush retries a banner-exchange timeout and succeeds', async () => {
+    const { deps, attempts, sleeps } = sequence('ssh', [BANNER_TIMEOUT]);
+    await sshPush(reach, KEY, 'launcher', '/tmp/kici-init-runner.sh', {}, deps);
+    expect(attempts()).toBe(2);
+    expect(sleeps).toHaveLength(1);
+  });
+
+  it('sshExec returns the command result after a pre-session retry', async () => {
+    const { deps, attempts } = sequence('ssh', [BANNER_TIMEOUT, BANNER_TIMEOUT]);
+    const result = await sshExec(reach, KEY, 'true', {}, deps);
+    expect(result).toEqual(ok);
+    expect(attempts()).toBe(3);
+  });
+
+  it('sshPushFile retries scp the same way', async () => {
+    const { deps, attempts } = sequence('scp', [BANNER_TIMEOUT]);
+    await sshPushFile(reach, KEY, '/tmp/p.tar.gz', '/tmp/p.tgz', {}, deps);
+    expect(attempts()).toBe(2);
+  });
+
+  it(`gives up after ${SSH_SESSION_ATTEMPTS} attempts and reports the last failure`, async () => {
+    const { deps, attempts } = sequence(
+      'ssh',
+      Array.from({ length: SSH_SESSION_ATTEMPTS + 1 }, () => BANNER_TIMEOUT),
+    );
+    await expect(sshPush(reach, KEY, 'x', '/tmp/x', {}, deps)).rejects.toThrow(
+      /exit 255.*banner exchange/s,
+    );
+    expect(attempts()).toBe(SSH_SESSION_ATTEMPTS);
+  });
+
+  // breaks-if-wrong: a remote command that ran and failed must never run a second time.
+  it('never re-runs a command that ran and failed', async () => {
+    const { deps, attempts, sleeps } = sequence('ssh', [
+      { exitCode: 255, stdout: '', stderr: 'remote script exited 255' },
+    ]);
+    const result = await sshExec(reach, KEY, 'exit 255', {}, deps);
+    expect(result.exitCode).toBe(255);
+    expect(attempts()).toBe(1);
+    expect(sleeps).toHaveLength(0);
   });
 });

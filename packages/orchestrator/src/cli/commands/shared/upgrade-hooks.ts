@@ -12,9 +12,92 @@ import { createDbBackup } from '../db-backup.js';
 import type { AdminApiClient } from '../../api-client.js';
 import { waitForQuiesce, type MigrationStatusRow } from './upgrade-safety.js';
 import type { UpgradeHooks } from './versioned-upgrade.js';
+import { formatStaleLockWarning } from '../../../registration/compile-schema-staleness.js';
 
 /** How often the drain poller asks whether the coordinator is quiet. */
 const DRAIN_POLL_INTERVAL_MS = 2_000;
+
+/** How long the post-start report waits for the restarted service's admin API. */
+const AFTER_START_WAIT_MS = 30_000;
+const AFTER_START_POLL_INTERVAL_MS = 2_000;
+
+/** The post-start report's fallback when it cannot read the registrations. */
+export const COMPILE_SCHEMA_DIAGNOSE_HINT =
+  'Run "kici-admin diagnose" to check that every registered workflow lock matches the ' +
+  "compile schema of this release's agents.";
+
+/** A GET /api/v1/admin/registrations row, as far as the post-start report reads it. */
+interface RegistrationSchemaRow {
+  repo_identifier: string;
+  workflow_name: string;
+  is_global?: boolean;
+  disabled?: boolean;
+  compileSchemaVersion?: number | null;
+  agentCompileSchemaVersion?: number;
+}
+
+/**
+ * Print the stale-lock warnings of the running service, or the all-clear line.
+ * Waits briefly for the restarted service's admin API; on no client or no
+ * answer it prints the `kici-admin diagnose` hint. Never throws.
+ */
+export async function reportCompileSchemaAfterStart(
+  client: AdminApiClient | null,
+  io: { sleep?: (ms: number) => Promise<void>; waitMs?: number } = {},
+): Promise<void> {
+  if (!client) {
+    console.log(COMPILE_SCHEMA_DIAGNOSE_HINT);
+    return;
+  }
+  const sleep = io.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const deadline = Date.now() + (io.waitMs ?? AFTER_START_WAIT_MS);
+  let rows: RegistrationSchemaRow[] | null = null;
+  for (;;) {
+    try {
+      rows = (
+        await client.get<{ registrations: RegistrationSchemaRow[] }>('/api/v1/admin/registrations')
+      ).registrations;
+      break;
+    } catch {
+      if (Date.now() >= deadline) break;
+      await sleep(AFTER_START_POLL_INTERVAL_MS);
+    }
+  }
+  if (!rows) {
+    console.log(COMPILE_SCHEMA_DIAGNOSE_HINT);
+    return;
+  }
+  const active = rows.filter((r) => !r.disabled);
+  const agentSchema = active.find(
+    (r) => typeof r.agentCompileSchemaVersion === 'number',
+  )?.agentCompileSchemaVersion;
+  if (agentSchema === undefined) {
+    // No row carries the field: an empty registry, or a service too old to report it.
+    if (active.length === 0) console.log('No workflow locks are registered.');
+    else console.log(COMPILE_SCHEMA_DIAGNOSE_HINT);
+    return;
+  }
+  const stale = active.filter(
+    (r) => typeof r.compileSchemaVersion === 'number' && r.compileSchemaVersion !== agentSchema,
+  );
+  if (stale.length === 0) {
+    console.log(`All registered workflow locks match compile schema ${agentSchema}.`);
+    return;
+  }
+  for (const r of stale) {
+    console.warn(
+      `Warning: ${formatStaleLockWarning(
+        {
+          repoIdentifier: r.repo_identifier,
+          workflowName: r.workflow_name,
+          lockSchema: r.compileSchemaVersion as number,
+          isGlobal: r.is_global === true,
+        },
+        agentSchema,
+      )}`,
+    );
+  }
+}
 
 /**
  * The pre-upgrade dump's database URL. The service's own env file is the
@@ -92,6 +175,8 @@ export function buildUpgradeHooks(
         name: head,
       });
     },
+
+    afterStart: () => reportCompileSchemaAfterStart(tryGetClient()),
 
     backup: async ({ outputPath, envFilePath }) => {
       const databaseUrl = resolveDatabaseUrl(envFilePath, readFile);

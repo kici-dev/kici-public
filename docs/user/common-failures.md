@@ -72,6 +72,8 @@ but this orchestrator understands <= vY — upgrade the orchestrator to a newer
 version.`
 - a "stale or compiled by an older engine — recompile with `kici compile`"
   message about an invalid label matcher.
+- `The workflow lock was compiled for a different compile schema: ...`, which
+  names the repository that holds the lock.
 
 **Cause.** The committed `kici.lock.json` no longer matches the workflow source
 at that commit, or it was compiled by a different toolchain version than the one
@@ -97,6 +99,12 @@ the orchestrator to the version the error names. Never force an out-of-window lo
 through. Full detail on the two-artifact model, the compatibility window, and how
 the hashes are computed is in
 [Lock file and workflow drift](./lock-file-and-drift.md).
+
+For a compile schema mismatch, `kici compile` with the same compiler does not
+help. Recompile the lock with the `@kici-dev/compiler` release of your agents,
+in the repository the error names, and commit it. A re-run keeps the old lock, so
+push a new commit to run the recompiled one. See
+[compile schema mismatch](./lock-file-and-drift.md#compile-schema-mismatch).
 
 ## The webhook never arrives
 

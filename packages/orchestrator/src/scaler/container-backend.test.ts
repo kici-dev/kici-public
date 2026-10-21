@@ -1460,3 +1460,39 @@ describe('ContainerScalerBackend per-job image', () => {
     expect((created as { Cmd?: string[] }).Cmd).toBeUndefined();
   });
 });
+
+describe('ContainerScalerBackend spawnSourceFingerprint', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockImageInspect.mockResolvedValue({ Id: 'sha256:agent-image' });
+    mockGetImage.mockReturnValue({ inspect: mockImageInspect });
+    mockListNetworks.mockResolvedValue([]);
+  });
+
+  it('is the agent image id', async () => {
+    const backend = await createBackend();
+    expect(await backend.spawnSourceFingerprint(['linux', 'docker'])).toBe('sha256:agent-image');
+    expect(mockGetImage).toHaveBeenCalledWith('ghcr.io/org/kici-agent:latest');
+  });
+
+  // fails-when: an Always-pull label set reports a stable fingerprint — each spawn may
+  // start a newer image than the one an agent reported its schema from
+  it('is null under imagePullPolicy Always', async () => {
+    const backend = await createBackend({
+      labelSets: [
+        {
+          labels: ['linux', 'docker'],
+          image: 'ghcr.io/org/kici-agent:latest',
+          imagePullPolicy: 'Always',
+        },
+      ],
+    });
+    expect(await backend.spawnSourceFingerprint(['linux', 'docker'])).toBeNull();
+  });
+
+  it('is null when the image is absent', async () => {
+    mockImageInspect.mockRejectedValue(new Error('no such image'));
+    const backend = await createBackend();
+    expect(await backend.spawnSourceFingerprint(['linux', 'docker'])).toBeNull();
+  });
+});

@@ -266,6 +266,46 @@ describe('runsShowCommand', () => {
     expect(printed).toContain('Lock file not found on ref main');
   });
 
+  it('prints a run-level failure that no init failure explains', async () => {
+    vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
+      getRun: async () => ({
+        ...runSummary(ExecutionRunStatus.enum.failed),
+        failureReason: 'Re-run could not be dispatched: boom',
+      }),
+      getRunDetailWithSource: proxied({ jobs: [] }),
+    } as never);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    expect(await runsShowCommand(RUN, {})).toBe(true);
+    // fails-when: the run shows as failed with no reason anywhere
+    expect(printedPlain(log)).toContain('Failure: Re-run could not be dispatched: boom');
+  });
+
+  it('prints the init failure once, not again as a run-level failure', async () => {
+    vi.spyOn(clientMod.DashboardClient, 'load').mockResolvedValue({
+      getRun: async () => ({
+        ...runSummary(ExecutionRunStatus.enum.failed),
+        failureReason: 'Lock file not found on ref main',
+      }),
+      getRunDetailWithSource: proxied({
+        jobs: [],
+        initFailure: {
+          scope: 'run',
+          category: InitFailureCategory.enum.lock_resolution,
+          message: 'Lock file not found on ref main',
+        },
+      }),
+    } as never);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    expect(await runsShowCommand(RUN, {})).toBe(true);
+    const printed = printedPlain(log);
+    // breaks-if-wrong: a run with an init failure keeps its block, and its reason prints once
+    expect(printed).toContain('Init failure');
+    expect(printed).not.toContain('Failure: ');
+    expect(printed.split('Lock file not found on ref main')).toHaveLength(2);
+  });
+
   it('renders a rejected job with the context rule that rejected it', async () => {
     const reason =
       "multi-context gate: 'production' rejected (branch_restricted: branch 'feature' not allowed)";

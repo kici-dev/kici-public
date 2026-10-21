@@ -1412,7 +1412,8 @@ describe('npm-source paths end in restartOntoInstalledPackage', () => {
 
   it('--restart-only registers a Windows service again', async () => {
     const { manager, spec, resolvedInstance, config } = fixture('windows');
-    await restartOnlyUpgrade({
+    // The caller runs the post-start report only on true: a started service.
+    const restarted = await restartOnlyUpgrade({
       component: 'agent',
       config,
       resolvedInstance,
@@ -1422,6 +1423,7 @@ describe('npm-source paths end in restartOntoInstalledPackage', () => {
       platform: 'windows',
       spec,
     });
+    expect(restarted).toBe(true);
     expect(manager.install).toHaveBeenCalledTimes(1);
     expect(manager.start).toHaveBeenCalledTimes(1);
     expect(manifestVersion()).toBe('0.2.0');

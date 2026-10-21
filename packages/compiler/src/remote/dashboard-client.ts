@@ -108,7 +108,11 @@ const issueReportListSchema = z.object({
 });
 export type IssueReportListResponse = z.infer<typeof issueReportListSchema>;
 
-const rerunResponseSchema = z.object({ newRunId: z.string() });
+// `alreadyAccepted`: an earlier request for the same re-run started `newRunId`. Absent means not reported.
+const rerunResponseSchema = z.object({
+  newRunId: z.string(),
+  alreadyAccepted: z.boolean().optional(),
+});
 // An orchestrator predating `alreadyTerminal` omits it: absent means "not reported", not "false".
 const cancelResponseSchema = z.object({
   cancelledJobs: z.number().optional(),
@@ -365,7 +369,7 @@ export class DashboardClient {
     );
   }
 
-  async rerunRun(runId: string): Promise<{ newRunId: string }> {
+  async rerunRun(runId: string): Promise<{ newRunId: string; alreadyAccepted?: boolean }> {
     return rerunResponseSchema.parse(await this.postJson(`/runs/${runId}/rerun`));
   }
 

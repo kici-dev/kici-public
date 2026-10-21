@@ -819,6 +819,24 @@ describe('agentRegisterSchema', () => {
     expect(agentRegisterSchema.parse({ ...validRegister, labels: [] })).toBeDefined();
   });
 
+  it('accepts compileSchemaVersion and keeps it', () => {
+    expect(agentRegisterSchema.parse({ ...validRegister, compileSchemaVersion: 7 })).toEqual({
+      ...validRegister,
+      compileSchemaVersion: 7,
+    });
+  });
+
+  // fails-when: the 0 "no bundle" sentinel or a fraction is accepted as a schema claim
+  it.each([0, -1, 6.5])('rejects compileSchemaVersion %s', (v) => {
+    expect(() =>
+      agentRegisterSchema.parse({ ...validRegister, compileSchemaVersion: v }),
+    ).toThrow();
+  });
+
+  it('a register without compileSchemaVersion still parses', () => {
+    expect(agentRegisterSchema.parse(validRegister).compileSchemaVersion).toBeUndefined();
+  });
+
   it('rejects missing agentId', () => {
     const { agentId, ...rest } = validRegister;
     expect(() => agentRegisterSchema.parse(rest)).toThrow();

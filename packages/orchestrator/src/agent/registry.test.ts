@@ -64,6 +64,16 @@ describe('AgentRegistry', () => {
       registry.register('a2', mockWs(), ['linux']);
       expect(registry.get('a2')?.tokenAgentType).toBeNull();
     });
+
+    it('stores the reported compile schema, null when the agent reports none', () => {
+      registry.register('a1', mockWs(), ['linux'], 'linux', 'x64', '0.24.0', 1, {
+        compileSchemaVersion: 7,
+      });
+      expect(registry.get('a1')?.compileSchemaVersion).toBe(7);
+
+      registry.register('a2', mockWs(), ['linux']);
+      expect(registry.get('a2')?.compileSchemaVersion).toBeNull();
+    });
   });
 
   describe('host roster reconcile', () => {

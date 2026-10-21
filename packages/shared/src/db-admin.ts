@@ -1491,6 +1491,12 @@ export interface RegisterWorkflowManualOpts {
 export interface RegisterWorkflowManualResult {
   workflowCount: number;
   registryVersion: number;
+  /**
+   * One line per registered workflow whose lock declares a compile schema the
+   * orchestrator release's agents do not implement. The admin API sets it; the
+   * direct-DB path leaves it to the caller.
+   */
+  warnings?: string[];
 }
 
 /**

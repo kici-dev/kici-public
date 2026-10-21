@@ -23,6 +23,7 @@ describe('ts-loader-hook load()', () => {
         'export const answer = (42 satisfies number);',
         'export type Id<K extends string> = K;',
         'export enum Color { Red = "red", Blue = "blue" }',
+        'export enum Level { Low, High }',
         'export const pick = <const T extends string>(v: T): T => v;',
         'export const chosen = pick("blue");',
       ].join('\n');
@@ -46,6 +47,11 @@ describe('ts-loader-hook load()', () => {
       expect(mod.answer).toBe(42);
       expect(mod.chosen).toBe('blue');
       expect(mod.Color.Red).toBe('red');
+      // tsc semantics: a string enum has no reverse mapping; a numeric one does.
+      // fails-when: the transform emits `Color["red"] = "Red"` for string members.
+      expect(Object.keys(mod.Color).sort()).toEqual(['Blue', 'Red']);
+      // breaks-if-wrong: numeric members must keep their reverse mapping.
+      expect(mod.Level[mod.Level.High]).toBe('High');
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

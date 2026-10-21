@@ -38,6 +38,7 @@ import type { GlobalEvalRoundCache } from '../cache/global-eval-round-cache.js';
 import type { CheckRunReporter } from '../reporting/check-run-reporter.js';
 import type { ExecutionTracker } from '../reporting/execution-tracker.js';
 import type { AgentRegistry } from '../agent/registry.js';
+import type { CompileSchemaView } from './compile-schema-gate.js';
 import type { HostRosterStore } from '../agent/host-roster.js';
 import type { RunCoordinator } from '../cluster/coordinator.js';
 import type { ClusterSettingsReader } from '../cluster/cluster-settings-reader.js';
@@ -893,6 +894,11 @@ export interface ProcessingDeps {
   executionTracker?: ExecutionTracker;
   /** Picks the execution target platform/arch; absent defaults to linux/x64. */
   agentRegistry?: AgentRegistry;
+  /**
+   * What this instance sees of the agents a run could reach, for the dispatch-time
+   * compile-schema gate. Absent: the gate never refuses.
+   */
+  compileSchemaView?: CompileSchemaView;
   /** Multi-orchestrator job routing; absent dispatches every job locally. */
   coordinator?: RunCoordinator;
   /** Dispatch-time secret resolution; absent leaves secrets unresolved. */

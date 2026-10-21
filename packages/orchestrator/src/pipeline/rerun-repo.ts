@@ -49,6 +49,7 @@ import {
 import { MANUAL_SCHEDULE_TRIGGER_EVENT } from './manual-schedule.js';
 import { resolveTrustForPR } from './process-webhook.js';
 import { resolveOrgId, type ProcessingDeps } from './processor.js';
+import type { RunStartAnswer } from './request-idempotency.js';
 import type { OriginalRunRow, RerunDeps } from './rerun.js';
 import { loadRerunChainRoot } from './rerun-global.js';
 import {
@@ -58,11 +59,13 @@ import {
   rerunSecurityDecision,
   loadWebhookPayload,
   normalizeRoundEvent,
+  recordRerunDispatchFailure,
   resolveRerunProviderBinding,
   withChangedFiles,
   type RerunProviderBinding,
   type RerunRefusal,
 } from './rerun-inputs.js';
+import { startAcceptedDispatch } from './accepted-dispatch.js';
 
 const logger = createLogger({ prefix: 'rerun' });
 
@@ -103,6 +106,9 @@ interface RepoRerunPlan {
  * Re-run a per-repository run. Every input is rebuilt and checked before the
  * request id is claimed, so a refusal reads the same on both hops of a relay
  * failover re-send.
+ *
+ * The answer names the accepted run, before it is dispatched. A dispatch that
+ * throws afterwards fails that run, so the requester reads the failure there.
  */
 export async function rerunRepositoryRun(opts: {
   originalRun: OriginalRunRow;
@@ -110,12 +116,12 @@ export async function rerunRepositoryRun(opts: {
   triggeredByAgentLabel: string | null;
   deps: RerunDeps;
   requestId: string;
-}): Promise<{ newRunId: string }> {
+}): Promise<RunStartAnswer> {
   const { originalRun, triggeredBy, triggeredByAgentLabel, deps, requestId } = opts;
   const plan = await planRepositoryRerun(originalRun, deps);
 
   const { newRunId, claimed } = await claimRerunRequest(deps, requestId, originalRun.run_id);
-  if (!claimed) return { newRunId };
+  if (!claimed) return { newRunId, alreadyAccepted: true };
 
   const rootRunId = originalRun.original_run_id ?? originalRun.run_id;
   logger.info('Re-running workflow', {
@@ -127,20 +133,40 @@ export async function rerunRepositoryRun(opts: {
     triggeredBy,
   });
 
-  await plan.dispatch({
+  const rerunLineage = { parentRunId: originalRun.run_id, originalRunId: rootRunId };
+  // Answered now: the dispatch can wait minutes on a cold cache, and the
+  // relayed request that asked for it has seconds.
+  startAcceptedDispatch({
     runId: newRunId,
-    triggeredBy,
-    triggeredByAgentLabel,
-    rerunLineage: { parentRunId: originalRun.run_id, originalRunId: rootRunId },
-    subjectTriggerEvent:
-      originalRun.subject_trigger_event ?? originalRun.trigger_event ?? undefined,
-  });
-
-  await emitWorkflowRerun(deps, {
-    originalRun,
-    newRunId,
-    workflowName: plan.workflow.name,
-    triggeredBy,
+    kind: 'Re-run',
+    context: { originalRunId: originalRun.run_id, newRunId },
+    work: async () => {
+      await deps.beforeAcceptedDispatch?.();
+      await plan.dispatch({
+        runId: newRunId,
+        triggeredBy,
+        triggeredByAgentLabel,
+        rerunLineage,
+        subjectTriggerEvent:
+          originalRun.subject_trigger_event ?? originalRun.trigger_event ?? undefined,
+      });
+      await emitWorkflowRerun(deps, {
+        originalRun,
+        newRunId,
+        workflowName: plan.workflow.name,
+        triggeredBy,
+      });
+    },
+    recordFailure: (reason) =>
+      recordRerunDispatchFailure(deps, {
+        originalRun,
+        newRunId,
+        reason,
+        workflowRepoIdentifier: originalRun.repo_identifier,
+        triggeredBy,
+        triggeredByAgentLabel,
+        rerunLineage,
+      }),
   });
   return { newRunId };
 }

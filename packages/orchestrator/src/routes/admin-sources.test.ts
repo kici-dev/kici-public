@@ -1,6 +1,7 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createSourceRoutes } from './admin-sources.js';
 import type { SourceStore } from '../sources/source-store.js';
+import { validateGitHubSource } from '../sources/source-validator.js';
 
 vi.mock('../sources/source-validator.js', () => ({
   validateGitHubSource: vi.fn().mockResolvedValue({ valid: true, appName: 'Test' }),
@@ -347,5 +348,135 @@ describe('GET /sources ingressUrl', () => {
     expect(body.sources).toHaveLength(1);
     expect(body.sources[0].routingKey).toBe('github:42');
     expect(body.sources[0].ingressUrl).toBeNull();
+  });
+});
+
+describe('source org on a Platform-attached orchestrator', () => {
+  const validator = vi.mocked(validateGitHubSource);
+  const addedRow = (customerId: string) => ({
+    id: 's1',
+    provider: 'github',
+    name: 'Test',
+    routing_key: 'github:42',
+    customer_id: customerId,
+  });
+  const post = (app: ReturnType<typeof createSourceRoutes>, body: Record<string, unknown>) =>
+    app.request('/sources', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: 'github',
+        name: 'n',
+        appId: '42',
+        privateKey: 'k',
+        ...body,
+      }),
+    });
+
+  beforeEach(() => {
+    validator.mockClear();
+  });
+
+  it('files a new source under the attached org', async () => {
+    // fails-when: the route ignores the attachment and files under __default__.
+    const addSource = vi.fn().mockResolvedValue(addedRow('org_A'));
+    const app = createSourceRoutes({
+      sourceStore: createMockSourceStore({ addSource }),
+      getPlatformOrgId: () => 'org_A',
+    });
+    const res = await post(app, {});
+    expect(res.status).toBe(201);
+    expect(addSource).toHaveBeenCalledWith(expect.objectContaining({ customerId: 'org_A' }));
+    expect(((await res.json()) as { customerId: string }).customerId).toBe('org_A');
+  });
+
+  it('refuses a mismatched customerId with 400 before validating', async () => {
+    const addSource = vi.fn();
+    const app = createSourceRoutes({
+      sourceStore: createMockSourceStore({ addSource }),
+      getPlatformOrgId: () => 'org_A',
+    });
+    const res = await post(app, { customerId: 'org_B' });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toContain('"org_A"');
+    expect(validator).not.toHaveBeenCalled();
+    expect(addSource).not.toHaveBeenCalled();
+  });
+
+  it('refuses a non-string customerId', async () => {
+    const app = createSourceRoutes({ sourceStore: createMockSourceStore() });
+    const res = await post(app, { customerId: 7 });
+    expect(res.status).toBe(400);
+  });
+
+  it('refuses with 503 while the attachment is pending', async () => {
+    const addSource = vi.fn();
+    const app = createSourceRoutes({
+      sourceStore: createMockSourceStore({ addSource }),
+      getPlatformOrgId: () => undefined,
+    });
+    const res = await post(app, {});
+    expect(res.status).toBe(503);
+    expect(addSource).not.toHaveBeenCalled();
+  });
+
+  it('independent orchestrator keeps __default__', async () => {
+    // breaks-if-wrong: an independent orchestrator files exactly as before.
+    const addSource = vi.fn().mockResolvedValue(addedRow('__default__'));
+    const app = createSourceRoutes({ sourceStore: createMockSourceStore({ addSource }) });
+    const res = await post(app, {});
+    expect(res.status).toBe(201);
+    expect(addSource).toHaveBeenCalledWith(expect.objectContaining({ customerId: '__default__' }));
+  });
+
+  it('GET /sources reports platformAttachment and attachedOrgId', async () => {
+    const attachedApp = createSourceRoutes({
+      sourceStore: createMockSourceStore(),
+      getPlatformOrgId: () => 'org_A',
+    });
+    expect(await (await attachedApp.request('/sources')).json()).toMatchObject({
+      platformAttachment: 'attached',
+      attachedOrgId: 'org_A',
+      sources: [],
+    });
+    const independent = createSourceRoutes({ sourceStore: createMockSourceStore() });
+    expect(await (await independent.request('/sources')).json()).toMatchObject({
+      platformAttachment: 'none',
+      attachedOrgId: null,
+    });
+  });
+
+  describe('PATCH warning', () => {
+    const existing = { ...addedRow('org_A'), config: JSON.stringify({ appId: '42' }) };
+    const patch = async (getPlatformOrgId: (() => string | undefined) | undefined, org: string) => {
+      const app = createSourceRoutes({
+        sourceStore: createMockSourceStore({
+          getSource: vi.fn().mockResolvedValue(existing),
+          updateSource: vi.fn().mockResolvedValue(existing),
+        }),
+        ...(getPlatformOrgId && { getPlatformOrgId }),
+      });
+      const res = await app.request('/sources/github%3A42', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ customerId: org }),
+      });
+      expect(res.status).toBe(200);
+      return (await res.json()) as { warning?: string };
+    };
+
+    it('succeeds with a warning when the org is not the attached one', async () => {
+      const body = await patch(() => 'org_A', 'org_B');
+      expect(body.warning).toContain('"org_A"');
+      expect(body.warning).toContain('kici-admin source update github:42 --org org_A');
+    });
+
+    it('carries no warning for the attached org', async () => {
+      expect((await patch(() => 'org_A', 'org_A')).warning).toBeUndefined();
+    });
+
+    it('carries no warning on an independent orchestrator', async () => {
+      expect((await patch(undefined, 'org_B')).warning).toBeUndefined();
+    });
   });
 });

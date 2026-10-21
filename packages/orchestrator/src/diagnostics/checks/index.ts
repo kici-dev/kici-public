@@ -9,6 +9,7 @@ import { checkConfigValidity } from './config.js';
 import { checkCertificateExpiry } from './certs.js';
 import { checkScalerProvisioning } from './scaler.js';
 import { checkFirecrackerNetwork } from './firecracker-network.js';
+import { checkCompileSchema } from './compile-schema.js';
 
 /** All diagnostic checks in display order. */
 export const defaultChecks: DiagnosticCheck[] = [
@@ -22,6 +23,7 @@ export const defaultChecks: DiagnosticCheck[] = [
   checkCertificateExpiry,
   checkScalerProvisioning,
   checkFirecrackerNetwork,
+  checkCompileSchema,
 ];
 
 export {

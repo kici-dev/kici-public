@@ -7,6 +7,7 @@
  */
 
 import type { ChildProcess } from 'node:child_process';
+import { realpath as fsRealpath, stat as fsStat } from 'node:fs/promises';
 import { PassThrough } from 'node:stream';
 import { createInterface } from 'node:readline';
 import {
@@ -17,7 +18,7 @@ import {
   ScalerBackendType,
 } from '@kici-dev/engine';
 import { createLogger, stderrTail, toErrorMessage, type ToolRequirement } from '@kici-dev/shared';
-import { normalizeLabelSet } from './label-matcher.js';
+import { labelSetsMatch, normalizeLabelSet } from './label-matcher.js';
 import { ScalerEventType } from './types.js';
 import Docker from 'dockerode';
 import { detectRuntime } from './container-backend.js';
@@ -461,6 +462,24 @@ export class BareMetalScalerBackend implements ScalerBackend {
 
   get labelSets(): LabelSetConfig[] {
     return this._labelSets;
+  }
+
+  /**
+   * Identity of the agent binary a spawn of this label set would run:
+   * `realpath:inode:size:mtime` of `binaryPath`. A version-manager or npm
+   * upgrade replaces the file, so the fingerprint changes with the build.
+   * `null` in job-image mode or when the file cannot be read.
+   */
+  async spawnSourceFingerprint(labelSet: string[]): Promise<string | null> {
+    const ls = this._labelSets.find((l) => labelSetsMatch(l.labels, labelSet));
+    if (!ls?.binaryPath || spawnsInJobImage(this.type, ls)) return null;
+    try {
+      const real = await fsRealpath(ls.binaryPath);
+      const st = await fsStat(real);
+      return `${real}:${st.ino}:${st.size}:${st.mtimeMs}`;
+    } catch {
+      return null;
+    }
   }
 
   getActiveCount(): number {

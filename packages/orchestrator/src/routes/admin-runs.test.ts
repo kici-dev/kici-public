@@ -390,6 +390,7 @@ describe('admin run routes', () => {
         workflow_repo_identifier: 'acme/org-workflows',
         workflow_sha: 'def5678',
         workflow_branch: 'main',
+        customer_id: 'org_A',
       });
       const res = await request(app, `/${ID5}`, { token: validToken });
       expect(res.status).toBe(200);
@@ -398,6 +399,8 @@ describe('admin run routes', () => {
       expect(body.run.workflowRepoIdentifier).toBe('acme/org-workflows');
       expect(body.run.workflowSha).toBe('def5678');
       expect(body.run.workflowBranch).toBe('main');
+      // fails-when: the run detail does not name the org the run belongs to
+      expect(body.run.orgId).toBe('org_A');
     });
 
     it('returns null workflow provenance for a run whose workflow lives in its own repo', async () => {
@@ -496,6 +499,25 @@ describe('admin run routes', () => {
       expect(body.jobs[0].runsOnLabels).toEqual(['kici:os:linux']);
       expect(body.jobs[0].needs).toBeNull();
       expect(body.jobs[0].steps).toBeUndefined();
+      expect(body.jobs[0].envWarning).toBeNull();
+    });
+
+    it('returns a job env warning', async () => {
+      const now = new Date();
+      deps.mockDb.mockExecuteTakeFirst.mockResolvedValueOnce({ run_id: ID1 });
+      deps.mockDb.mockExecute.mockResolvedValueOnce([
+        {
+          job_id: 'job-w',
+          job_name: 'deploy',
+          status: 'success',
+          created_at: now,
+          env_warning: "Context 'pages' is not configured in org 'org_A'.",
+        },
+      ]);
+      deps.mockDb.mockExecute.mockResolvedValueOnce([]);
+      const body = await (await request(app, `/${ID1}/jobs`, { token: validToken })).json();
+      // fails-when: the route drops env_warning from the job rows
+      expect(body.jobs[0].envWarning).toBe("Context 'pages' is not configured in org 'org_A'.");
     });
 
     it('attaches resolved dependency edges (needs) grouped by downstream job', async () => {

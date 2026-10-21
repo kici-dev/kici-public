@@ -130,6 +130,7 @@ import {
   dispatchReadyJob,
   type ProcessingDeps,
 } from './processor.js';
+import { warnStaleCompileSchemas } from '../registration/compile-schema-staleness.js';
 
 const logger = createLogger({ prefix: 'pipeline' });
 
@@ -2733,6 +2734,16 @@ async function registerWorkflowsOnDefaultBranchPush(args: {
     workflowCount: registerableWorkflows.length,
     registryVersion: newVersion,
   });
+  // The run would fail on every agent of this release; say so while the push is fresh.
+  warnStaleCompileSchemas(
+    logger,
+    registerableWorkflows.map((w) => ({
+      repoIdentifier,
+      workflowName: w.name,
+      isGlobal: globalWorkflowNames.has(w.name),
+      lockEntry: w,
+    })),
+  );
 
   if (deps.eventRouter) {
     await deps.eventRouter.emit({

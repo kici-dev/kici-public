@@ -44,6 +44,13 @@ across a floor change (protocol 3 → 4) every not-yet-upgraded agent stays
 disconnected until its own upgrade, so upgrade the agents right after the
 orchestrator.
 
+**Agents and locks share a compile schema.** An agent runs only a lock compiled
+for the compile schema it implements. When a release changes that schema, pin
+the new agent image (or `binaryPath`) and recompile your locks with the same
+release's `@kici-dev/compiler` together. Until a lock is recompiled, every run
+of it fails. See
+[compile schema mismatch](../user/lock-file-and-drift.md#compile-schema-mismatch).
+
 **Upgrade the coordinators of one cluster together.** A release can change how
 the orchestrator stores queued jobs, and an older coordinator cannot read what a
 newer one wrote. For example, a coordinator from before queued job secrets were
@@ -157,6 +164,13 @@ with. The `KICI_STORAGE_*` variables of your shell are not used, so you do not
 have to export the storage config before you upgrade. See
 [Auto-package on orchestrator upgrade](./distribution/distribution.md#auto-package-on-orchestrator-upgrade)
 for the full rules.
+
+Once the upgraded service runs, `kici-admin orchestrator upgrade` reports the
+compile schema of the registered workflow locks through the admin API. It prints
+one warning per lock that the new release's agents reject, or
+`All registered workflow locks match compile schema <N>.` Without an admin
+token, or when the API does not answer, it prints a line that points to
+`kici-admin diagnose` instead. The report never fails the upgrade.
 
 ## Rolling back
 

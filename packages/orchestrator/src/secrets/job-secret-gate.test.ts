@@ -1,4 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { mockLogger } = vi.hoisted(() => ({
+  mockLogger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+vi.mock('@kici-dev/shared', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  createLogger: () => mockLogger,
+}));
 import { ContextType } from '@kici-dev/engine';
 
 import type { ContextStore } from '../contexts/context-store.js';
@@ -6,6 +14,7 @@ import type { JobDispatchContext } from '../contexts/protection/pipeline.js';
 import type { SecretResolverApi } from './secret-resolver.js';
 import {
   assertResolvableJobScope,
+  JobSecretRefusalKind,
   JobSecretRefusedError,
   RESERVED_ORG_ID,
   resolveJobQualifiedSecret,
@@ -51,8 +60,11 @@ function contextRow(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function storeReturning(row: unknown): ContextStore {
-  return { matchContext: vi.fn().mockResolvedValue(row) } as unknown as ContextStore;
+function storeReturning(row: unknown, otherOrgs: string[] = []): ContextStore {
+  return {
+    matchContext: vi.fn().mockResolvedValue(row),
+    orgsMatchingContext: vi.fn().mockResolvedValue(otherOrgs),
+  } as unknown as ContextStore;
 }
 
 /**
@@ -220,6 +232,60 @@ describe('resolveJobQualifiedSecret', () => {
     expect(resolver.resolveForContext).not.toHaveBeenCalled();
   });
 
+  it('tags each refusal with the check that refused it', async () => {
+    const base = {
+      orgId: ORG,
+      context: 'prod',
+      key: 'DEPLOY_TOKEN',
+      dispatchCtx: dispatchCtx(),
+      trustTier: 'trusted' as const,
+    };
+    const kindOf = (p: Promise<unknown>) =>
+      p.then(
+        () => undefined,
+        (e: JobSecretRefusedError) => e.kind,
+      );
+    const K = JobSecretRefusalKind.enum;
+    expect(
+      await kindOf(
+        resolveJobQualifiedSecret({
+          ...base,
+          resolver: resolverReturning('s'),
+          contextStore: storeReturning(contextRow()),
+          context: '__source__/x',
+        }),
+      ),
+    ).toBe(K['reserved-namespace']);
+    expect(
+      await kindOf(
+        resolveJobQualifiedSecret({
+          ...base,
+          resolver: resolverReturning('s'),
+          contextStore: storeReturning(contextRow()),
+          trustTier: 'unknown',
+        }),
+      ),
+    ).toBe(K.untrusted);
+    expect(
+      await kindOf(
+        resolveJobQualifiedSecret({
+          ...base,
+          resolver: resolverReturning('s'),
+          contextStore: storeReturning(contextRow({ enabled: false })),
+        }),
+      ),
+    ).toBe(K['context-rejected']);
+    expect(
+      await kindOf(
+        resolveJobQualifiedSecret({
+          ...base,
+          resolver: resolverReturning(null),
+          contextStore: storeReturning(contextRow()),
+        }),
+      ),
+    ).toBe(K['missing-secret']);
+  });
+
   it('refuses a disabled context', async () => {
     const resolver = resolverReturning('s3cret');
     await expect(
@@ -286,18 +352,47 @@ describe('resolveJobQualifiedSecret', () => {
     expect(resolver.resolveForContext).not.toHaveBeenCalled();
   });
 
-  it('refuses a context that does not exist', async () => {
-    await expect(
-      resolveJobQualifiedSecret({
-        resolver: resolverReturning('s3cret'),
-        contextStore: storeReturning(null),
-        orgId: ORG,
-        context: 'ghost',
-        key: 'K',
-        dispatchCtx: dispatchCtx(),
-        trustTier: 'trusted',
-      }),
-    ).rejects.toThrow(/does not exist/);
+  function refuseMissing(otherOrgs: string[]) {
+    return resolveJobQualifiedSecret({
+      resolver: resolverReturning('s3cret'),
+      contextStore: storeReturning(null, otherOrgs),
+      orgId: ORG,
+      context: 'ghost',
+      key: 'K',
+      dispatchCtx: dispatchCtx(),
+      trustTier: 'trusted',
+    }).then(
+      () => {
+        throw new Error('expected a refusal');
+      },
+      (e: unknown) => e as JobSecretRefusedError,
+    );
+  }
+
+  it('refuses a context that does not exist, naming the run org', async () => {
+    mockLogger.warn.mockClear();
+    const err = await refuseMissing([]);
+    expect(err).toBeInstanceOf(JobSecretRefusedError);
+    expect(err.kind).toBe(JobSecretRefusalKind.enum['missing-context']);
+    expect(err.context).toBe('ghost');
+    expect(err.message).toBe(
+      "Secret reference names context 'ghost', which does not exist in org 'org-acme'.",
+    );
+    // breaks-if-wrong: no other org holds it, so nothing is logged about one.
+    expect(mockLogger.warn).not.toHaveBeenCalled();
+  });
+
+  it('says another org has the context without naming it, and logs the org ids', async () => {
+    mockLogger.warn.mockClear();
+    const others = ['org_other', 'org_second'];
+    const err = await refuseMissing(others);
+    expect(err.message).toContain('Another org on this orchestrator has a context with that name');
+    // fails-when: the other org id is interpolated into run-visible text.
+    for (const id of others) expect(err.message).not.toContain(id);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      'Secret reference names a context missing in the run org',
+      expect.objectContaining({ orgId: ORG, context: 'ghost', otherOrgIds: others }),
+    );
   });
 
   it('throws rather than returning null on a miss', async () => {

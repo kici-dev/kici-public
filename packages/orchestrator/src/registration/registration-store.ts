@@ -134,43 +134,36 @@ export class RegistrationStore {
       const existingByName = new Map(existing.map((r) => [r.workflow_name, r]));
       const incomingNames = new Set(workflows.map((w) => w.name));
 
-      // Self-heal: if any existing row has customer_id='__default__' AND the
-      // incoming options.customerId is a real tenant, rewrite the stale rows
-      // in this same transaction.
-      //
-      // Why this matters: workflow_registrations rows can be created with
-      // customer_id='__default__' when processor.resolveOrgId() returned the
-      // sentinel because sources.customer_id was not yet populated. Once
-      // sources.customer_id is set to the real tenant, those
-      // workflow_registrations rows stay stale until replaceAll() re-runs on
-      // a real push event, and a stale row breaks the cross-provider
+      // Self-heal: when the incoming org is a real tenant, rewrite every
+      // existing row of this routing key + repo whose customer_id differs, in
+      // this same transaction. A row keeps a stale org when it was registered
+      // before its source's customer_id was set ('__default__'), or before
+      // the source moved to another org. A stale row routes the repo's runs,
+      // contexts and secrets to the wrong org and breaks the cross-provider
       // lock-file fallback.
       //
-      // We do NOT rewrite __default__ to __default__ (no heal needed, no
-      // noisy log). We do NOT rewrite real-to-real (the upsert loop already
-      // handles updates per workflow row).
+      // The heal never targets '__default__': resolveOrgId falls back to it
+      // when its DB lookup fails, and a transient failure must not move real
+      // rows out of their org.
       if (options.customerId !== '__default__') {
-        const staleRows = existing.filter((r) => r.customer_id === '__default__');
+        const staleRows = existing.filter((r) => r.customer_id !== options.customerId);
         if (staleRows.length > 0) {
           await trx
             .updateTable('workflow_registrations')
             .set({ customer_id: options.customerId, updated_at: new Date() })
             .where('routing_key', '=', routingKey)
             .where('repo_identifier', '=', repoIdentifier)
-            .where('customer_id', '=', '__default__')
+            .where('customer_id', '<>', options.customerId)
             .execute();
 
           logger.info('Registration self-heal: rewrote stale customer_id', {
             routingKey,
             repoIdentifier,
-            oldCustomerId: '__default__',
+            oldCustomerIds: [...new Set(staleRows.map((r) => r.customer_id))],
             newCustomerId: options.customerId,
             rowsHealed: staleRows.length,
           });
 
-          // Patch the in-memory `existing` rows so the upsert loop below
-          // sees the corrected customer_id (defensive — the loop doesn't
-          // currently read customer_id, but a future change might).
           for (const row of staleRows) {
             (row as { customer_id: string }).customer_id = options.customerId;
           }

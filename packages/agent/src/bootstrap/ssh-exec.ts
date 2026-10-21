@@ -80,6 +80,47 @@ export const defaultSpawn: SpawnFn = (command, args, opts) =>
 
 export interface SshDeps {
   spawnFn?: SpawnFn;
+  /** Wait between connection attempts; injectable so tests do not sleep. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** Attempts for a connection that fails before the SSH session exists. */
+export const SSH_SESSION_ATTEMPTS = 3;
+const SSH_SESSION_RETRY_DELAY_MS = 3_000;
+
+/**
+ * ssh and scp exit 255 for their own failures. These messages mean the session
+ * never started (the TCP connect or the banner exchange timed out, or sshd
+ * dropped the connection before key exchange), so no remote command ran and
+ * retrying cannot run one twice. A loaded target, such as a small board
+ * unpacking the agent payload, can miss the `ConnectTimeout` deadline on one
+ * connection and answer the next.
+ */
+const PRE_SESSION_FAILURE =
+  /during banner exchange|kex_exchange_identification|connect to host .*: Connection timed out/i;
+
+export function isPreSessionFailure(result: SshResult): boolean {
+  return result.exitCode === 255 && PRE_SESSION_FAILURE.test(result.stderr);
+}
+
+const defaultSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Run an `ssh` / `scp` invocation, retrying only a {@link isPreSessionFailure}. */
+async function spawnSshSession(
+  command: 'ssh' | 'scp',
+  args: string[],
+  opts: { env: NodeJS.ProcessEnv; stdin?: string },
+  deps: SshDeps,
+): Promise<SshResult> {
+  const spawnFn = deps.spawnFn ?? defaultSpawn;
+  const sleep = deps.sleep ?? defaultSleep;
+  let result = await spawnFn(command, args, opts);
+  for (let attempt = 2; attempt <= SSH_SESSION_ATTEMPTS && isPreSessionFailure(result); attempt++) {
+    await sleep(SSH_SESSION_RETRY_DELAY_MS);
+    result = await spawnFn(command, args, opts);
+  }
+  return result;
 }
 
 const SSH_USER_DEFAULT = 'root';
@@ -128,7 +169,7 @@ export async function sshExec(
   const { dest, port } = resolveTarget(reach, opts.port);
   return withEphemeralAgent(privateKey, spawnFn, async (env) => {
     const args = [...baseSshOptions(hostKeyMode), '-p', String(port), dest, command];
-    return spawnFn('ssh', args, { env, stdin: opts.stdin });
+    return spawnSshSession('ssh', args, { env, stdin: opts.stdin }, deps);
   });
 }
 
@@ -156,7 +197,7 @@ export async function sshPush(
       dest,
       `cat > '${remotePath.replace(/'/g, `'\\''`)}'`,
     ];
-    return spawnFn('ssh', args, { env, stdin: localBytes });
+    return spawnSshSession('ssh', args, { env, stdin: localBytes }, deps);
   });
   if (result.exitCode !== 0) {
     throw new Error(
@@ -194,7 +235,7 @@ export async function sshPushFile(
       localFilePath,
       `${dest}:${remotePath}`,
     ];
-    return spawnFn('scp', args, { env });
+    return spawnSshSession('scp', args, { env }, deps);
   });
   if (result.exitCode !== 0) {
     throw new Error(

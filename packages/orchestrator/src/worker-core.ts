@@ -1233,7 +1233,7 @@ export async function bootstrapWorker(
       );
     },
     onScalerAgentRegistered: scalerManager
-      ? (agentId, labels) => scalerManager.onAgentRegistered(agentId, labels)
+      ? (agentId, labels, reported) => scalerManager.onAgentRegistered(agentId, labels, reported)
       : undefined,
     onScalerAgentDisconnected: scalerManager
       ? (agentId, reason) => scalerManager.onAgentDisconnected(agentId, reason)

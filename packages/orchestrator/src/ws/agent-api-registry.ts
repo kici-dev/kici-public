@@ -7,7 +7,9 @@
  * 2. Call registry.register('namespace.method', 'read', handler) here
  *
  * The agent sends { type: 'agent.api.request', method, params } and receives
- * { type: 'agent.api.response', result?, error? } back.
+ * { type: 'agent.api.response', result?, error? } back. The error text reaches the
+ * workflow author only for the typed rejections below (an unknown method, a
+ * denied role, a handler's refusal); any other failure becomes a fixed string.
  */
 
 import { createLogger } from '@kici-dev/shared';
@@ -34,6 +36,22 @@ export class UnknownApiMethodError extends Error {
   constructor(method: string) {
     super(`Unknown API method '${method}'`);
     this.name = 'UnknownApiMethodError';
+  }
+}
+
+/**
+ * A handler refused the request for a reason the caller may read.
+ *
+ * A deliberate, bounded rejection: a handler throws it only with a message
+ * written for the workflow author (it names the caller's own job, repository
+ * or context, and never another org or an internal detail), so the agent WS
+ * handler forwards it verbatim instead of replacing it with a safe fixed
+ * string.
+ */
+export class AgentApiRefusalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AgentApiRefusalError';
   }
 }
 

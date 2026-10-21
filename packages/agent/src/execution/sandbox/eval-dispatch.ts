@@ -37,6 +37,7 @@ import { serializeJobsToLock } from '../dynamic-job-serializer.js';
 import { runGlobalEvalRound } from '../global-eval-runner.js';
 import type { GlobalEvalRoundJobConfig } from '../global-eval-types.js';
 import { withTimeout } from '../timeout-util.js';
+import { resolveLockOrigin, type LockOrigin } from '../lock-origin.js';
 import { describePathsVerdict, evaluateDeferredPaths } from '../deferred-paths.js';
 
 /** What an evaluation needs from its host: a log sink and the `ctx.kici` API. */
@@ -138,6 +139,11 @@ interface InitEvalConfig {
   resolvedHashFiles?: string[];
 }
 
+/** The repository a compile-schema mismatch names: the job's lock origin. */
+function lockOriginOf(request: EvalRequest): LockOrigin {
+  return resolveLockOrigin({ repoUrl: request.dispatch.repoUrl, jobConfig: request.config });
+}
+
 /** A filter or deferred paths read the diff. */
 function needsDiff(config: { hasFilter?: boolean; deferredPaths?: string[][] }): boolean {
   return config.hasFilter === true || (config.deferredPaths?.length ?? 0) > 0;
@@ -152,7 +158,9 @@ async function runInit(request: EvalRequest, deps: EvalDispatchDeps): Promise<un
     const filterInput = needsDiff(config)
       ? await buildJobFilterInput(request, target, config.event, deps)
       : undefined;
-    return runCaptured(makeSink(deps), () => evaluateInit(target, config, filterInput, deps));
+    return runCaptured(makeSink(deps), () =>
+      evaluateInit(target, config, filterInput, deps, lockOriginOf(request)),
+    );
   });
 }
 
@@ -162,6 +170,7 @@ async function evaluateInit(
   config: InitEvalConfig,
   filterInput: FilterEvalInput | undefined,
   deps: EvalDispatchDeps,
+  lockOrigin: LockOrigin,
 ): Promise<unknown> {
   // Deferred paths decide before the module loads, as the dynamic-job and
   // global-round gates do: a workflow whose paths did not match never
@@ -181,6 +190,7 @@ async function evaluateInit(
     config.source,
     config.contentHash,
     config.resolvedHashFiles,
+    lockOrigin,
   );
   const workflow = extractWorkflow(module, config.workflowName);
   deps.emit(
@@ -243,6 +253,7 @@ async function runDynamicJob(request: EvalRequest, deps: EvalDispatchDeps): Prom
         config.source.file,
         config.contentHash,
         config.resolvedHashFiles,
+        lockOriginOf(request),
       );
       deps.emit('Workflow loaded');
 
@@ -304,6 +315,7 @@ async function runBuildVerify(request: EvalRequest, deps: EvalDispatchDeps): Pro
     sourceFile: string;
     contentHash?: string;
     resolvedHashFiles?: string[];
+    lockOrigin?: LockOrigin;
   };
   await runCaptured(makeSink(deps), () =>
     loadWorkflowSource(
@@ -311,6 +323,7 @@ async function runBuildVerify(request: EvalRequest, deps: EvalDispatchDeps): Pro
       config.sourceFile,
       config.contentHash,
       config.resolvedHashFiles,
+      config.lockOrigin,
     ),
   );
   return null;

@@ -88,6 +88,11 @@ interface JobDTO {
   routingReason?: string | null;
   runsOnLabels: string[] | null;
   createdAt: string;
+  /**
+   * Why the job runs without some of its environment, such as a bound context
+   * missing in the run's org; absent from an older orchestrator.
+   */
+  envWarning?: string | null;
   /** Present only when ?includeSteps=true. */
   steps?: StepDTO[];
 }
@@ -129,6 +134,8 @@ interface RunDetailDTO {
   workflowSha?: string | null;
   /** The workflow repository's registered branch. */
   workflowBranch?: string | null;
+  /** The org whose contexts, secrets and trust policy the run uses; absent from an older orchestrator. */
+  orgId?: string;
 }
 
 interface RunDetailResponse {
@@ -217,6 +224,14 @@ function workflowListCell(run: { workflowName: string; workflowNames?: string[] 
  */
 function jobLabel(job: JobDTO, spansWorkflows: boolean): string {
   return spansWorkflows && job.workflowName ? `${job.workflowName} / ${job.jobName}` : job.jobName;
+}
+
+/** One `!` line per job that runs without some of its environment. */
+function printEnvWarnings(jobs: JobDTO[], spansWorkflows: boolean): void {
+  const warned = jobs.filter((j) => j.envWarning);
+  if (warned.length === 0) return;
+  console.log('');
+  for (const job of warned) console.log(`  ! ${jobLabel(job, spansWorkflows)}: ${job.envWarning}`);
 }
 
 /**
@@ -437,6 +452,7 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
         console.log(`  Ref:         ${run.ref}`);
         console.log(`  SHA:         ${run.sha}`);
         console.log(`  Provider:    ${run.provider}`);
+        if (run.orgId) console.log(`  Org:         ${run.orgId}`);
         console.log(`  Started:     ${run.startedAt ?? '-'}`);
         console.log(`  Completed:   ${run.completedAt ?? '-'}`);
         console.log(`  Duration:    ${formatDuration(run.durationMs)}`);
@@ -483,6 +499,7 @@ export function registerRunsCommands(program: Command, getClient: () => AdminApi
             console.log(`  ! ${jobLabel(job, spansWorkflows)}: ${job.routingReason}`);
           }
         }
+        printEnvWarnings(jobs, spansWorkflows);
 
         const jobsWithSteps = jobs.filter((j) => (j.steps?.length ?? 0) > 0);
         if (jobsWithSteps.length > 0) {

@@ -158,13 +158,17 @@ describe('git.credential.request, relay through gate', () => {
   });
 
   it("refuses a declared ref whose named context's protection rule rejects", async () => {
-    await expect(
-      request({
-        jobId: JOB_ID,
-        repositories: ['acme/main'],
-        ref: { kind: 'token', tokenSecret: 'locked:GITCRED_TOKEN' },
-      }),
-    ).rejects.toThrow(/does not admit this run/);
+    const err = await request({
+      jobId: JOB_ID,
+      repositories: ['acme/main'],
+      ref: { kind: 'token', tokenSecret: 'locked:GITCRED_TOKEN' },
+    }).then(
+      () => new Error('expected a refusal'),
+      (e: Error) => e,
+    );
+    expect(err.message).toMatch(/context 'locked' did not provide it for this run in org/);
+    // The rule that refused it stays in the orchestrator log.
+    expect(err.message).not.toContain('does not admit this run');
   });
 
   it('refuses a request for a job this agent was never dispatched', async () => {

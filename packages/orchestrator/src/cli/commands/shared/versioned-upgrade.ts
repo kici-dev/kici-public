@@ -150,6 +150,22 @@ export interface UpgradeHooks {
     outputPath: string;
     envFilePath: string;
   }) => Promise<{ outputPath: string; byteSize: number }>;
+  /**
+   * Report, once the upgraded service runs, anything the new release flags in
+   * the registered state (workflow locks with a stale compile schema). Prints
+   * only; never fails the upgrade.
+   */
+  afterStart?: () => Promise<void>;
+}
+
+/** Run {@link UpgradeHooks.afterStart}; the upgrade already succeeded, so nothing it does fails it. */
+async function runAfterStart(hooks: UpgradeHooks): Promise<void> {
+  if (!hooks.afterStart) return;
+  try {
+    await hooks.afterStart();
+  } catch (err) {
+    console.log(`Post-start check skipped: ${toErrorMessage(err)}`);
+  }
 }
 
 /** The manifest-backed target; `installBase` is the manifest's, never re-derived from the name. */
@@ -1000,7 +1016,11 @@ export async function performVersionedUpgrade(
     }
 
     if (!opts.from && !opts.url) {
-      await performNpmSourceUpgrade(component, config, resolvedInstance, manager, opts, platform);
+      if (
+        await performNpmSourceUpgrade(component, config, resolvedInstance, manager, opts, platform)
+      ) {
+        await runAfterStart(hooks);
+      }
       return resolvedInstance;
     }
 
@@ -1146,6 +1166,7 @@ export async function performVersionedUpgrade(
     } else {
       console.log(`Upgrade to ${version} complete.`);
     }
+    await runAfterStart(hooks);
     return resolvedInstance;
   } catch (err) {
     console.error(`Error: ${toErrorMessage(err)}`);
@@ -1169,7 +1190,7 @@ async function performNpmSourceUpgrade(
   manager: ServiceManager,
   opts: VersionedUpgradeOptions,
   platform: ServicePlatform,
-): Promise<void> {
+): Promise<boolean> {
   const installed = await manager.isInstalled(config);
   if (!installed) {
     console.error(`Error: service "${config.name}" is not installed`);
@@ -1200,7 +1221,7 @@ async function performNpmSourceUpgrade(
   }
 
   if (action.kind === 'restart-only') {
-    await restartOnlyUpgrade({
+    return restartOnlyUpgrade({
       component,
       config,
       resolvedInstance,
@@ -1210,10 +1231,9 @@ async function performNpmSourceUpgrade(
       platform,
       spec,
     });
-    return;
   }
 
-  await performSelfDrivingInstall({
+  return performSelfDrivingInstall({
     component,
     config,
     resolvedInstance,
@@ -1245,8 +1265,9 @@ export interface SelfDriveArgs extends Omit<RestartOnlyArgs, 'verdict'> {
 /**
  * Restart-only path: the operator pre-installed the package. Verify the unit
  * launches the invoking CLI's version, restart onto it, persist the version.
+ * True once the service restarted; false when the operator cancelled.
  */
-export async function restartOnlyUpgrade(args: RestartOnlyArgs): Promise<void> {
+export async function restartOnlyUpgrade(args: RestartOnlyArgs): Promise<boolean> {
   const { config, resolvedInstance, manager, verdict, opts, platform, spec } = args;
   if (!verdict.ok) {
     console.error(`Error: ${verdict.reason}`);
@@ -1273,7 +1294,7 @@ export async function restartOnlyUpgrade(args: RestartOnlyArgs): Promise<void> {
     const ok = await confirm('Proceed with upgrade?');
     if (!ok) {
       console.log('Upgrade cancelled.');
-      return;
+      return false;
     }
   }
 
@@ -1292,10 +1313,14 @@ export async function restartOnlyUpgrade(args: RestartOnlyArgs): Promise<void> {
   console.log(
     `Upgrade complete: service "${config.name}" is now running version ${verdict.version}.`,
   );
+  return true;
 }
 
-/** Self-driving path: install under the unit's pinned node/npm, restart, verify the version. */
-export async function performSelfDrivingInstall(args: SelfDriveArgs): Promise<void> {
+/**
+ * Self-driving path: install under the unit's pinned node/npm, restart, verify the version.
+ * True once the service restarted; false when the operator cancelled.
+ */
+export async function performSelfDrivingInstall(args: SelfDriveArgs): Promise<boolean> {
   const { component, config, resolvedInstance, manager, action, opts, platform, spec } = args;
   const { target, version } = action;
 
@@ -1341,7 +1366,7 @@ export async function performSelfDrivingInstall(args: SelfDriveArgs): Promise<vo
     const ok = await confirm('Proceed with upgrade?');
     if (!ok) {
       console.log('Upgrade cancelled.');
-      return;
+      return false;
     }
   }
 
@@ -1378,6 +1403,7 @@ export async function performSelfDrivingInstall(args: SelfDriveArgs): Promise<vo
     kiciVersion: version,
   });
   console.log(`Upgrade complete: service "${config.name}" is now running version ${version}.`);
+  return true;
 }
 
 /** `--pick`: choose an installed version, confirm, then {@link switchToInstalledVersion}. */

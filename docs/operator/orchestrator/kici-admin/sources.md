@@ -10,9 +10,10 @@ description: 'Webhook source and remote-run anchor management'
 ```bash
 # GitHub App sources
 # One-click setup: create AND configure a brand-new GitHub App via the App Manifest flow
-kici-admin source add github --name <name> --manifest [--github-org <slug>] [--webhook-url <url>] [--no-browser] [--json]
+kici-admin source add github --name <name> --manifest [--github-org <slug>] [--webhook-url <url>] [--org <orgId>] [--no-browser] [--json]
 # Manual: store credentials for a GitHub App you already created
-kici-admin source add github --name <name> --app-id <id> --private-key <value|@file> [--webhook-secret <secret>] [--from-env <var>] [--stdin]
+kici-admin source add github --name <name> --app-id <id> --private-key <value|@file> [--webhook-secret <secret>] [--from-env <var>] [--stdin] [--org <orgId>]
+# Move a GitHub source and its registrations to another org
 kici-admin source update <routingKey> [--name <name>] [--private-key <value|@file>] [--webhook-secret <secret>] [--from-env <var>] [--stdin] [--org <orgId>]
 # Re-sync a GitHub source's display name + slug from GitHub (GitHub is the source of truth);
 # also reports missing events, permissions and installations pending approval
@@ -40,7 +41,7 @@ kici-admin source trigger-local <id> [--event push|pull_request] [--ref <ref>] [
 kici-admin source install-hook <id> [--repo <path>] [--base-url <url>]
 
 # List all sources (without --org, only GitHub sources are shown).
-# GitHub rows show the direct ingress URL (`ingress:`)
+# GitHub rows end with the source's org (`org:`) and show the direct ingress URL (`ingress:`)
 kici-admin source list [--org <orgId>] [--include-deleted]
 ```
 
@@ -57,6 +58,26 @@ kici-admin source list [--org <orgId>] [--include-deleted]
 **`source refresh`**: re-reads a GitHub source's display name + slug from GitHub (`GET /app`) and updates the orchestrator + dashboard if they drifted (e.g. after renaming the App in GitHub's UI). For GitHub App sources GitHub is the source of truth for the displayed name — `--name` is only the name requested at creation. Pass a `<routingKey>` for one source or `--all` for every GitHub source; the command prints `old → new` for any changed field and is a no-op when GitHub already matches. The orchestrator also runs this refresh automatically once a day (`KICI_GITHUB_APP_NAME_REFRESH_INTERVAL_MS`, default 24h). Non-GitHub routing keys are rejected. It also compares the App with what KiCI needs: it warns when the App lacks a permission or an event, and lists the installations that have not accepted a new permission yet. `--json` carries the same findings as `missingEvents`, `missingPermissions` and `installationsPendingApproval`.
 
 See the [GitHub provider guide](../../../user/providers/github.md) for the full one-click walkthrough. The manifest flow works in every mode. In **platform** and **hybrid** mode it bakes the hosted Platform's webhook URL into the App. In **observed** and **independent** mode it bakes the orchestrator's own org-scoped URL, `<KICI_WEBHOOK_PUBLIC_URL>/webhook/<orgId>/github`, so set `KICI_WEBHOOK_PUBLIC_URL` first.
+
+#### Which org a source belongs to
+
+Every source belongs to one org. The runs of a source use that org's contexts, secrets and trust policy.
+
+- **Platform-attached orchestrator:** `source add github` files the source under the org the orchestrator is attached to. This is the org that `kici-admin orchestrator status`, `kici compile` and the dashboard show. `--org` accepts only that org. Any other org is refused with an error that names the attached org. Before the orchestrator authenticates with the Platform, `source add github` without `--org` is refused: retry when `orchestrator status` shows the org. The command prints the org on an `Org:` line. With `--manifest`, the CLI checks the org before it creates the App on GitHub.
+- **Independent orchestrator:** a source added without `--org` belongs to `__default__`.
+
+A source added before the orchestrator filed new sources under the attached org can still belong to `__default__`. It keeps working, with the contexts, secrets and trust policy of `__default__`. A context or secret that you create in the attached org is then not used by its runs. The CLI shows the split:
+
+- `source list` ends each GitHub line with `org: <orgId>`, and prints a note on stderr for a source outside the attached org. `--json` adds `platformAttachment` and `attachedOrgId`.
+- `org list` prints the same note. `orchestrator status` adds an `Other orgs` row. `trust-policy show` adds a note about which policy the sources use.
+- `runs show` prints the run's org on an `Org:` line. A job that binds a context that does not exist in the run's org, while another org on the orchestrator has it, gets a `!` warning line.
+
+To move a source to the attached org:
+
+1. Make sure that the attached org has the contexts, the secrets and the trust policy that the source's workflows use (`kici-admin context list --org <attachedOrg>`).
+2. Run `kici-admin source update <routingKey> --org <attachedOrg>`. The source's workflow registrations move with it. Its next runs use the attached org.
+
+`source update --org` with an org other than the attached one still succeeds, and prints a warning on stderr.
 
 **Secret input modes** (for private keys and webhook secrets — the manual path):
 
@@ -204,6 +225,7 @@ Synopsis: `kici-admin source add github [options]`
 | `--no-browser`                |         | Headless manifest setup: print a URL and paste the setup code back                                                                                                                                     |
 | `--github-org <slug>`         |         | Create the App under a GitHub org instead of your personal account                                                                                                                                     |
 | `--webhook-url <url>`         |         | Advanced/self-hosted: bake this https:// URL into the App webhook verbatim instead of the URL the orchestrator resolves for its mode. KiCI adds no ingress at this URL — your own infra owns delivery. |
+| `--org <orgId>`               |         | Org the source belongs to (default: the org this orchestrator is attached to; kici-admin org list prints the org ids)                                                                                  |
 | `--json`                      |         | Emit raw JSON (the API response) instead of formatted text                                                                                                                                             |
 
 ### `kici-admin source add local`
@@ -443,15 +465,15 @@ Synopsis: `kici-admin source update <routingKey> [options]`
 
 **Options**
 
-| Option                        | Default | Description                                               |
-| ----------------------------- | ------- | --------------------------------------------------------- |
-| `--name <name>`               |         | New name                                                  |
-| `--private-key <pathOrValue>` |         | New private key (prefix with @ for file)                  |
-| `--webhook-secret <secret>`   |         | New webhook secret                                        |
-| `--from-env <varName>`        |         | Read new private key from environment variable            |
-| `--stdin`                     |         | Read new private key from stdin                           |
-| `--org <orgId>`               |         | Update the org ID used for secret and environment scoping |
-| `--database-url <url>`        |         | Use direct DB access instead of HTTP (offline mode)       |
+| Option                        | Default | Description                                                                                                             |
+| ----------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `--name <name>`               |         | New name                                                                                                                |
+| `--private-key <pathOrValue>` |         | New private key (prefix with @ for file)                                                                                |
+| `--webhook-secret <secret>`   |         | New webhook secret                                                                                                      |
+| `--from-env <varName>`        |         | Read new private key from environment variable                                                                          |
+| `--stdin`                     |         | Read new private key from stdin                                                                                         |
+| `--org <orgId>`               |         | Move the source and its workflow registrations to this org (its runs use that org's contexts, secrets and trust policy) |
+| `--database-url <url>`        |         | Use direct DB access instead of HTTP (offline mode)                                                                     |
 
 ### `kici-admin source update-generic`
 

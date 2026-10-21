@@ -117,9 +117,9 @@ function dbOver(pool: ReturnType<typeof fakePool>) {
 }
 
 describe('closeDatabase', () => {
-  // Positive control: the defect this guards. A plain destroy() while a new
-  // connection is still being acquired leaks that client and never finishes.
-  it('a raw destroy() during an acquire never finishes', async () => {
+  // Positive control: what this guards. A plain destroy() while a new
+  // connection is still being acquired fails the query that is waiting for it.
+  it('a raw destroy() during an acquire fails the waiting query', async () => {
     const pool = fakePool();
     const db = dbOver(pool);
     await sql`select 1`.execute(db);
@@ -130,8 +130,10 @@ describe('closeDatabase', () => {
       db.destroy().then(() => 'destroyed'),
       sleep(500).then(() => 'hung'),
     ]);
-    expect(outcome).toBe('hung');
-    expect(await query).toBeInstanceOf(TypeError);
+    expect(outcome).toBe('destroyed');
+    expect(await query).toEqual(
+      expect.objectContaining({ message: 'driver has already been destroyed' }),
+    );
   });
 
   // fails-when: the close destroys the database while a new connection for a

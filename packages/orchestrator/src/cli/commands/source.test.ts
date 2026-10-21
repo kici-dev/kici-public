@@ -870,3 +870,106 @@ describe('kici-admin source refresh', () => {
     }
   });
 });
+
+describe('source orgs', () => {
+  const row = {
+    id: 's1',
+    provider: 'github',
+    name: 'main',
+    routingKey: 'github:42',
+    customerId: '__default__',
+    config: { appId: '42' },
+    createdAt: '2024-01-01T00:00:00.000Z',
+    updatedAt: '2024-01-01T00:00:00.000Z',
+  };
+
+  async function addGithub(extraArgs: string[], response: Record<string, unknown>) {
+    let posted: Record<string, unknown> | undefined;
+    const client: Partial<AdminApiClient> = {
+      post: (async (_path: string, body: Record<string, unknown>) => {
+        posted = body;
+        return { routingKey: 'github:1', id: 's', name: 'n', webhookUrl: null, ...response };
+      }) as AdminApiClient['post'],
+    };
+    const args = ['source', 'add', 'github', '--name', 'n', '--app-id', '1', '--private-key', 'k'];
+    const result = await runCommand([...args, ...extraArgs], client);
+    return { ...result, posted };
+  }
+
+  it('source add github --org sends customerId and prints the Org line', async () => {
+    const { stdout, exitCode, posted } = await addGithub(['--org', 'org_A'], {
+      customerId: 'org_A',
+    });
+    expect(exitCode).toBeNull();
+    expect(posted?.customerId).toBe('org_A');
+    expect(stdout).toMatch(/Org:\s+org_A/);
+  });
+
+  it('source add github without --org sends no customerId', async () => {
+    const { stdout, posted } = await addGithub([], {});
+    expect(posted).not.toHaveProperty('customerId');
+    // An older orchestrator reports no org: no Org line.
+    expect(stdout).not.toContain('Org:');
+  });
+
+  const listWith = (body: Record<string, unknown>): Partial<AdminApiClient> => ({
+    get: async <T>(): Promise<T> => body as unknown as T,
+  });
+
+  it('source list names each GitHub source org and notes a split on stderr', async () => {
+    // fails-when: a source outside the attached org lists with no sign of it.
+    const { stdout, stderr } = await runCommand(
+      ['source', 'list'],
+      listWith({ platformAttachment: 'attached', attachedOrgId: 'org_A', sources: [row] }),
+    );
+    expect(stdout).toMatch(/github:42 .*\(github\) {2}org: __default__/);
+    expect(stderr).toContain("sources in org(s) '__default__'");
+    expect(stderr).toContain('--org org_A');
+  });
+
+  it('source list prints no note when every source is in the attached org', async () => {
+    const { stderr } = await runCommand(
+      ['source', 'list'],
+      listWith({
+        platformAttachment: 'attached',
+        attachedOrgId: 'org_A',
+        sources: [{ ...row, customerId: 'org_A' }],
+      }),
+    );
+    expect(stderr).not.toContain('Note:');
+  });
+
+  it('source list from an older orchestrator prints no org field and no note', async () => {
+    // breaks-if-wrong: the response without the new fields renders as before.
+    const { customerId: _c, ...older } = row;
+    const { stdout, stderr } = await runCommand(['source', 'list'], listWith({ sources: [older] }));
+    expect(stdout).not.toContain('org:');
+    expect(stderr).not.toContain('Note:');
+  });
+
+  it('source list --json carries the attachment fields', async () => {
+    const { stdout } = await runCommand(
+      ['source', 'list', '--json'],
+      listWith({ platformAttachment: 'attached', attachedOrgId: 'org_A', sources: [row] }),
+    );
+    expect(JSON.parse(stdout)).toMatchObject({
+      platformAttachment: 'attached',
+      attachedOrgId: 'org_A',
+    });
+  });
+
+  it('source update prints the response warning on stderr', async () => {
+    const client: Partial<AdminApiClient> = {
+      patch: (async () => ({
+        routingKey: 'github:42',
+        warning: 'This orchestrator is attached to org "org_A".',
+      })) as AdminApiClient['patch'],
+    };
+    const { stdout, stderr } = await runCommand(
+      ['source', 'update', 'github:42', '--org', 'org_B'],
+      client,
+    );
+    expect(stdout).toContain('Source updated: github:42');
+    expect(stderr).toContain('Warning: This orchestrator is attached to org "org_A".');
+  });
+});

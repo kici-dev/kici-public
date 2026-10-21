@@ -33,7 +33,7 @@ Each workflow entry includes:
 | `name`                 | Workflow name.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `source`               | Per-workflow source file and export reference.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `contentHash`          | SHA-256 of a digest over the whole `.kici/` directory mixed with `compileSchemaVersion` (and an `assetDigest` of declared `hashFiles` when present): `SHA-256(compileSchemaVersion + ":" + treeDigest [+ "\0" + assetDigest])`. The tree digest covers every file under `.kici/` except the paths declared in `.kici/.kiciignore` — see [files the content hash skips](#files-the-content-hash-skips-kicikiciignore). Paths are sorted and line endings normalized. The orchestrator uses this as the source-tarball cache key and the agent re-computes it against the extracted tree to detect drift. |
-| `compileSchemaVersion` | Compiler schema version used when computing `contentHash` (currently `7`). The hash input is line-ending-normalized (CRLF → LF) so a lock file produced on Linux matches the agent's hash on Windows where Git's `core.autocrlf=true` rewrites checked-out text to CRLF. Bumping the schema version invalidates every existing source cache entry even if source is unchanged, which is the correct behavior when the compile-time or runtime contract changes.                                                                                                                                         |
+| `compileSchemaVersion` | Compiler schema version used when computing `contentHash` (currently `7`). The hash input is line-ending-normalized (CRLF → LF) so a lock file produced on Linux matches the agent's hash on Windows where Git's `core.autocrlf=true` rewrites checked-out text to CRLF. Bumping the schema version invalidates every existing source cache entry even if source is unchanged, which is the correct behavior when the compile-time or runtime contract changes. An agent rejects a lock whose `compileSchemaVersion` differs from its own; see [compile schema mismatch](#compile-schema-mismatch).     |
 | `triggers`             | Trigger definitions extracted from the workflow (used by the orchestrator for event matching).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `jobs`                 | Job definitions with scheduling metadata (runsOn, needs, matrix, contexts, concurrency, container, checkout, gracePeriod, label routing, dynamic fields, etc.).                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `rules`                | Workflow-level conditional rules (optional). Stored as dynamic references since rule functions cannot be serialized.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
@@ -92,6 +92,58 @@ A lock can require the compiler's own schema version. This happens right after a
 schema change, while the compiler's version is also the oldest supported version. For such a
 lock, `kici compile` prints a one-line notice that orchestrators older than that version
 cannot read it. It is informational only — the orchestrator is the authoritative check.
+
+## Compile schema mismatch
+
+Each lock entry records the **compile schema** of the compiler that wrote it
+(`compileSchemaVersion`). The schema is part of every content hash, so an agent
+can only run a lock compiled for the schema it implements. Recompiling with the
+same compiler gives the same schema, so it does not help.
+
+A run of such a lock fails with an error that starts like this:
+
+```
+The workflow lock was compiled for a different compile schema: .kici/kici.lock.json in acme/ci-workflows declares compile schema 5, and the agents that run it implement schema 7.
+```
+
+The error names the repository that holds the lock. For an
+[organization-wide workflow](global-workflows.md), that is the workflow
+repository, not the repository whose event started the run.
+
+**The remedy depends on the direction:**
+
+- **The lock is older than the agents** (the usual case after an upgrade).
+  Install the `@kici-dev/compiler` release of your agents, run
+  `npx kici compile`, and commit `.kici/kici.lock.json` in the repository the
+  error names.
+- **The lock is newer than the agents.** Upgrade the agents to the KiCI release
+  whose compiler wrote the lock, or recompile with the compiler release of your
+  agents.
+
+**Where KiCI flags a stale lock before it runs:**
+
+- The workflows page of the dashboard shows a **Recompile needed** badge.
+- `kici-admin workflow list` marks the lock as `<schema> (stale)` in its
+  `schema` column and prints a warning line.
+- `kici-admin diagnose` reports a **Workflow lock compile schema** row with
+  status `warn`.
+- The orchestrator log warns when it registers the lock and when it starts.
+- `kici-admin orchestrator upgrade` lists each stale lock once the upgraded
+  service runs.
+
+These checks compare each lock with the compile schema of the orchestrator's
+own release. Run the orchestrator and its agents on the same release.
+
+**What happens to a run of a stale lock.** On a single orchestrator, KiCI knows
+the schema of each agent that could run the job. When every such agent rejects
+the lock, the run fails before any agent starts, with the failure category
+"Lock-file / dependency resolution failed". When an agent's schema is unknown,
+or the orchestrator runs in a cluster, the run starts and the agent rejects
+the lock with the same error.
+
+**A re-run keeps the recorded lock.** A re-run uses the lock that the original
+run recorded, so it fails again after you recompile. Only a new event runs the
+recompiled lock. The error of a re-run says so.
 
 ## Rule: commit both together
 

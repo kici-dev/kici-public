@@ -3937,6 +3937,7 @@ describe('processWebhook — context integration', () => {
   function createMockContextStore(matchResult: Record<string, unknown> | null = null) {
     return {
       matchContext: vi.fn().mockResolvedValue(matchResult),
+      orgsMatchingContext: vi.fn().mockResolvedValue([]),
       list: vi.fn().mockResolvedValue([]),
       get: vi.fn().mockResolvedValue(null),
       getByName: vi.fn().mockResolvedValue(null),

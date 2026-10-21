@@ -273,6 +273,15 @@ describe('DashboardClient typed methods', () => {
     expect(out.newRunId).toBe('r2');
   });
 
+  it('rerunRun keeps alreadyAccepted when the Platform reports it', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ newRunId: 'r2', alreadyAccepted: true }), { status: 200 }),
+    );
+    const client = DashboardClient.fromConfig(baseConfig);
+    // fails-when: the response schema strips the field
+    expect(await client.rerunRun('r1')).toEqual({ newRunId: 'r2', alreadyAccepted: true });
+  });
+
   it('listRegistrations hits /registrations and passes filters', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(

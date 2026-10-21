@@ -145,7 +145,7 @@ describe('runGithubManifestSetup', () => {
   });
 
   it('uses --webhook-url verbatim instead of the URL the orchestrator resolves for its mode', async () => {
-    const get = vi.fn(); // pre-flight resolver must NOT be called
+    const get = vi.fn().mockResolvedValue({}); // only the source listing is read
     const startLoopback = vi.fn().mockResolvedValue({
       formUrl: 'http://127.0.0.1:1/',
       redirectUrl: 'http://127.0.0.1:1/cb',
@@ -162,7 +162,7 @@ describe('runGithubManifestSetup', () => {
     );
 
     // The pre-flight GET was bypassed.
-    expect(get).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalledWith('/api/v1/admin/sources/github-webhook-url');
     // The override URL is baked into the served manifest verbatim.
     const secondCall = startLoopback.mock.calls[1]?.[0] as { manifestJson: string };
     expect(secondCall.manifestJson).toContain('https://my.org/kici-hook');
@@ -179,5 +179,67 @@ describe('runGithubManifestSetup', () => {
       ),
     ).rejects.toThrow(/https/i);
     expect(deps.convert).not.toHaveBeenCalled();
+  });
+});
+
+describe('runGithubManifestSetup source org', () => {
+  const attachedGet = (path: string) =>
+    Promise.resolve(
+      path === '/api/v1/admin/sources'
+        ? { platformAttachment: 'attached', attachedOrgId: 'org_A', sources: [] }
+        : { webhookUrl: 'https://api.kici.dev/webhook/o/github' },
+    );
+
+  it('refuses an org other than the attached one before creating the App', async () => {
+    // fails-when: the org is only checked by the store route, after the App exists.
+    const deps = makeDeps();
+    await expect(
+      runGithubManifestSetup(
+        { name: 'acme', customerId: 'org_B' },
+        makeClient({ get: vi.fn(attachedGet) }) as never,
+        deps,
+      ),
+    ).rejects.toThrow(/does not match this orchestrator's Platform organization "org_A"/);
+    expect(deps.startLoopback).not.toHaveBeenCalled();
+    expect(deps.convert).not.toHaveBeenCalled();
+  });
+
+  it('refuses a pending attachment with no --org before creating the App', async () => {
+    const get = vi.fn((path: string) =>
+      Promise.resolve(
+        path === '/api/v1/admin/sources'
+          ? { platformAttachment: 'pending', attachedOrgId: null, sources: [] }
+          : { webhookUrl: 'https://api.kici.dev/webhook/o/github' },
+      ),
+    );
+    const deps = makeDeps();
+    await expect(
+      runGithubManifestSetup({ name: 'acme' }, makeClient({ get }) as never, deps),
+    ).rejects.toThrow(/not authenticated with the Platform yet/);
+    expect(deps.startLoopback).not.toHaveBeenCalled();
+  });
+
+  it('posts the requested org', async () => {
+    const client = makeClient({ get: vi.fn(attachedGet) });
+    await runGithubManifestSetup(
+      { name: 'acme', customerId: 'org_A' },
+      client as never,
+      makeDeps(),
+    );
+    expect(client.post).toHaveBeenCalledWith(
+      '/api/v1/admin/sources',
+      expect.objectContaining({ customerId: 'org_A' }),
+    );
+  });
+
+  it('proceeds against an orchestrator that does not report its attachment', async () => {
+    // breaks-if-wrong: an older orchestrator still runs the flow.
+    const deps = makeDeps();
+    await runGithubManifestSetup(
+      { name: 'acme', customerId: 'org_B' },
+      makeClient() as never,
+      deps,
+    );
+    expect(deps.convert).toHaveBeenCalled();
   });
 });

@@ -37,7 +37,7 @@ scalers:
         # orchestrator, set the same version here and restart it;
         # `kici-admin orchestrator upgrade` warns when this image is older
         # than the upgrade target.
-        image: quay.io/kici-dev/kici-agent:0.24.0@sha256:e10a5006a16c06446a9d0c2846c23edbdb9c44a3fbfb621189331cb9f83331b5
+        image: quay.io/kici-dev/kici-agent:0.25.0@sha256:f2491a3a6f26280e564d9058bb36ccadaae0d123317d03373989b7095f7eb9c5
 
   - name: bare-metal-default
     type: bare-metal

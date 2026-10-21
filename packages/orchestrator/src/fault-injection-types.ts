@@ -42,6 +42,13 @@ export interface OrchestratorFaultInjection {
   /**
    * Invoked by `handleRerunRequest` before `onRerun`, so an HA test can make
    * the first coordinator slow enough that the Platform relay fails over.
+   * `KICI_TEST_RERUN_DELAY_MS` delays every call; `KICI_TEST_RERUN_DELAY_ONCE_MS`
+   * delays only the first, so a retry after the Platform's timeout is answered.
    */
   beforeRerun?: () => Promise<void>;
+  /**
+   * Awaited first inside an accepted dispatch, after the requester was
+   * answered, so a test can make a re-run's dispatch slow.
+   */
+  beforeAcceptedDispatch?: () => Promise<void>;
 }

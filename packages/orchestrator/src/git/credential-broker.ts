@@ -76,6 +76,20 @@ export interface BrokerResolveArgs {
   gate: BrokerGateContext;
 }
 
+/**
+ * The broker refused a request for a reason derived from the request itself:
+ * no source credential for the repository, a malformed or incomplete
+ * reference, a `needs:` output the job did not inherit. Its message names only
+ * what the job asked for, so the relay may show it to the job. A mint or store
+ * failure stays a plain `Error`.
+ */
+export class GitCredentialRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'GitCredentialRefusedError';
+  }
+}
+
 export class GitCredentialBroker {
   private readonly secretResolver: SecretResolverApi;
   private readonly contextStore: ContextStore;
@@ -165,7 +179,7 @@ export class GitCredentialBroker {
     const primary = args.repositories[0]!;
     const auth = await this.sourceAuth(primary);
     if (!auth) {
-      throw new Error(
+      throw new GitCredentialRefusedError(
         `No source credential is configured for '${primary}'. ` +
           `Supply an explicit credential for this repository.`,
       );
@@ -194,11 +208,13 @@ export class GitCredentialBroker {
 
     const qualified = bag[`${name}Secret`];
     if (!qualified) {
-      throw new Error(`git credential is missing '${name}Secret' (or '${name}Value')`);
+      throw new GitCredentialRefusedError(
+        `git credential is missing '${name}Secret' (or '${name}Value')`,
+      );
     }
     const idx = qualified.indexOf(':');
     if (idx <= 0 || idx >= qualified.length - 1) {
-      throw new Error(
+      throw new GitCredentialRefusedError(
         `git credential '${name}Secret' must be a qualified <context>:<secret-name> ` +
           `reference (got: ${qualified})`,
       );
@@ -252,7 +268,7 @@ export class GitCredentialBroker {
     }
     const inherited = await this.secretOutputs(args.runId, args.jobId, key);
     if (inherited === null) {
-      throw new Error(
+      throw new GitCredentialRefusedError(
         `No secret output '${key}' was inherited by this job. Check that the ` +
           `producing job calls ctx.setSecretOutput('${key}', …) and is listed in \`needs\`.`,
       );

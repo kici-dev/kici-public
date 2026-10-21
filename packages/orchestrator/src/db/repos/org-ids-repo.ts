@@ -140,6 +140,25 @@ export function withPlatformOrg(orgs: readonly HeldOrg[], attachedOrgId: string 
   ]);
 }
 
+/**
+ * The orgs other than the attached one that hold a webhook source. The runs of
+ * those sources use that org's contexts, secrets and trust policy, not the ones
+ * the Platform manages. Empty unless the listing reports an attached org.
+ */
+export function foreignSourceOrgs(list: OrgListResponse): string[] {
+  if (list.platformAttachment !== PlatformAttachment.enum.attached || !list.attachedOrgId) {
+    return [];
+  }
+  return list.orgs
+    .filter(
+      (o) =>
+        o.orgId !== list.attachedOrgId &&
+        (o.sources.includes(OrgIdSource.enum.source) ||
+          o.sources.includes(OrgIdSource.enum['generic-source'])),
+    )
+    .map((o) => o.orgId);
+}
+
 /** The attachment the admin API reports, from the Platform client's org id reader. */
 export function readPlatformAttachment(getPlatformOrgId: (() => string | undefined) | undefined): {
   platformAttachment: PlatformAttachment;

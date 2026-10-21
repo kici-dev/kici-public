@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/compiler",
-  "version": "0.24.0",
+  "version": "0.25.0",
   "description": "Compiler and CLI for KiCI workflows. Compiles `.kici/workflows/*.ts` to a `kici.lock.json` file consumed by the orchestrator and agents, and runs workflows locally or against a remote orchestrator.",
   "keywords": [
     "ci",
@@ -54,7 +54,7 @@
     "prepack": "pnpm exec tsx ../../hack/generate-sbom.ts --package packages/compiler --name @kici-dev/compiler"
   },
   "dependencies": {
-    "@inquirer/prompts": "^8.7.2",
+    "@inquirer/prompts": "^8.7.3",
     "@kici-dev/agent": "workspace:*",
     "@kici-dev/core": "workspace:*",
     "@kici-dev/engine": "workspace:*",
@@ -68,10 +68,10 @@
     "picocolors": "^1.1.1",
     "picomatch": "^4.0.7",
     "tar": "^7.5.22",
-    "ws": "^8.21.3",
-    "wsl-utils": "^1.0.0",
+    "ws": "^8.22.0",
+    "wsl-utils": "^1.0.1",
     "yaml": "^2.9.1",
-    "zod": "^4.6.5",
+    "zod": "^4.6.7",
     "zx": "^8.8.5"
   },
   "devDependencies": {

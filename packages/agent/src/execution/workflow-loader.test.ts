@@ -14,7 +14,7 @@ import {
   COMPILE_SCHEMA_VERSION,
 } from './workflow-loader.js';
 import type { Workflow } from '@kici-dev/sdk';
-import { normalizeLineEndings } from '@kici-dev/shared';
+import { COMPILE_SCHEMA_MISMATCH_PREFIX, normalizeLineEndings } from '@kici-dev/shared';
 import { hashKiciSourceTree } from '@kici-dev/core/kici-source-digest';
 
 let tempDir: string;
@@ -761,7 +761,7 @@ describe('compile schema version gate', () => {
     await writeLock(COMPILE_SCHEMA_VERSION + 1);
     const anyHash = 'a'.repeat(64);
     await expect(loadWorkflowSource(workDir, '.kici/workflows/w.ts', anyHash)).rejects.toThrow(
-      /compiled by an incompatible @kici-dev\/compiler/,
+      COMPILE_SCHEMA_MISMATCH_PREFIX,
     );
   });
 
@@ -772,8 +772,10 @@ describe('compile schema version gate', () => {
       (e: Error) => e,
     );
     expect(err).toBeInstanceOf(Error);
-    expect((err as Error).message).toContain(`compile schema ${COMPILE_SCHEMA_VERSION + 1}`);
-    expect((err as Error).message).toContain(`agent implements ${COMPILE_SCHEMA_VERSION}`);
+    expect((err as Error).message).toContain(
+      `declares compile schema ${COMPILE_SCHEMA_VERSION + 1}`,
+    );
+    expect((err as Error).message).toContain(`agent implements schema ${COMPILE_SCHEMA_VERSION}`);
     expect((err as Error).message).not.toMatch(/Run 'kici compile'/);
   });
 
@@ -781,8 +783,38 @@ describe('compile schema version gate', () => {
     await writeLock(COMPILE_SCHEMA_VERSION - 1);
     const anyHash = 'a'.repeat(64);
     await expect(loadWorkflowSource(workDir, '.kici/workflows/w.ts', anyHash)).rejects.toThrow(
-      /compiled by an incompatible @kici-dev\/compiler/,
+      COMPILE_SCHEMA_MISMATCH_PREFIX,
     );
+  });
+
+  // fails-when: the agent omits the repository that holds the stale lock
+  it('names the lock repository when given', async () => {
+    await writeLock(COMPILE_SCHEMA_VERSION - 1);
+    const err = await loadWorkflowSource(workDir, '.kici/workflows/w.ts', 'a'.repeat(64), [], {
+      repo: 'o/r',
+    }).catch((e: Error) => e);
+    expect((err as Error).message).toContain('.kici/kici.lock.json in o/r');
+  });
+
+  // fails-when: an agent rejecting a re-run's lock does not say a re-run keeps the recorded lock
+  it('says a re-run keeps its recorded lock', async () => {
+    await writeLock(COMPILE_SCHEMA_VERSION - 1);
+    const err = await loadWorkflowSource(workDir, '.kici/workflows/w.ts', 'a'.repeat(64), [], {
+      repo: 'o/r',
+      rerun: { repo: 'o/r', sha: '1889df900fd4886706990f81ef150fe052a70f18' },
+    }).catch((e: Error) => e);
+    expect((err as Error).message).toContain('re-run');
+    expect((err as Error).message).toContain('o/r@1889df9');
+  });
+
+  // fails-when: the remedy tells the operator to move the agent back to the lock's schema
+  it('does not suggest an agent downgrade for an older lock', async () => {
+    await writeLock(COMPILE_SCHEMA_VERSION - 1);
+    const err = await loadWorkflowSource(workDir, '.kici/workflows/w.ts', 'a'.repeat(64)).catch(
+      (e: Error) => e,
+    );
+    expect((err as Error).message).not.toMatch(/upgrade the agent/i);
+    expect((err as Error).message).toContain('npx kici compile');
   });
 
   it('still reports genuine source drift when the schema versions agree', async () => {

@@ -26,6 +26,7 @@ import type {
 } from './ipc-protocol.js';
 import { withAgentSshCapability } from './git-grant-capability.js';
 import { sshCredentialNames } from './ssh-client-preflight.js';
+import { resolveLockOrigin } from '../lock-origin.js';
 import { buildSanitizedEnv } from './env-sanitizer.js';
 import { encryptSecretOutputs } from './secret-encryption.js';
 import { toErrorMessage } from '@kici-dev/shared';
@@ -214,6 +215,7 @@ export function buildRequest(
     sourceFile: (jobConfig.source as { file?: string } | undefined)?.file,
     contentHash: jobConfig.contentHash as string | undefined,
     resolvedHashFiles: jobConfig.resolvedHashFiles as string[] | undefined,
+    lockOrigin: resolveLockOrigin(dispatch),
 
     maxLogSizeBytes: dispatch.maxLogSizeBytes,
     jobTimeoutMs: jobConfig.timeout as number | undefined,

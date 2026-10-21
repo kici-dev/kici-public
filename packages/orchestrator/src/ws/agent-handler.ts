@@ -81,6 +81,7 @@ import type { CacheStorage } from '../storage/types.js';
 import { setAgentsActive } from '../metrics/prometheus.js';
 import type { AgentMetricsAggregator } from '../metrics/agent-metrics-aggregator.js';
 import {
+  AgentApiRefusalError,
   ApiRoleDeniedError,
   UnknownApiMethodError,
   type AgentApiRegistry,
@@ -429,6 +430,8 @@ export interface AgentWsHandlerDeps {
   onScalerAgentRegistered?: (
     agentId: string,
     labels: string[],
+    /** What the agent reported about its own build, for the scaler's compile-schema memory. */
+    reported?: { compileSchemaVersion?: number; version?: string },
   ) => Promise<{ boundJobId?: string; mandatoryLabels: string[] } | null>;
   /**
    * Optional callback when an agent disconnects (for scaler lifecycle). `reason`
@@ -1413,7 +1416,10 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
           // Folded: the scaler's label sets are folded at config load, so
           // `Docker` must arrive as `docker` or it matches no pool.
           scalerInfo =
-            (await onScalerAgentRegistered?.(agentId, canonicalizeLabels(labels))) ?? null;
+            (await onScalerAgentRegistered?.(agentId, canonicalizeLabels(labels), {
+              compileSchemaVersion: parsed.data.compileSchemaVersion,
+              version,
+            })) ?? null;
         } catch (err) {
           // Registering without the spawn record would drop the agent's
           // `mandatoryLabels` gate for life, so an untainted job could land on
@@ -1462,6 +1468,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
           version,
           maxConcurrency ?? 1,
           {
+            compileSchemaVersion: parsed.data.compileSchemaVersion,
             hostname: parsed.data.hostname,
             osRelease: parsed.data.osRelease,
             osVersion: parsed.data.osVersion,
@@ -1678,6 +1685,7 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
             msg.version,
             msg.maxConcurrency ?? 1,
             {
+              compileSchemaVersion: msg.compileSchemaVersion,
               hostname: msg.hostname,
               osRelease: msg.osRelease,
               osVersion: msg.osVersion,
@@ -2977,12 +2985,15 @@ export function createAgentWsHandler(deps: AgentWsHandlerDeps): AgentWsEvents {
               method: msg.method,
               error: toErrorMessage(err),
             });
-            // The registry's typed rejections name only the caller's method and
-            // roles, so they pass through. Any other text can carry
+            // The typed rejections pass through: the registry's name only the
+            // caller's method and roles, and a handler's refusal carries a
+            // message written for the workflow author. Any other text can carry
             // infrastructure detail and gets a fixed error. The gate is the
             // error's type, never its wording.
             const deliberate =
-              err instanceof UnknownApiMethodError || err instanceof ApiRoleDeniedError;
+              err instanceof UnknownApiMethodError ||
+              err instanceof ApiRoleDeniedError ||
+              err instanceof AgentApiRefusalError;
             sendJson(ws, {
               type: 'agent.api.response',
               requestId: msg.requestId,

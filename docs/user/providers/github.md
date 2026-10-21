@@ -97,6 +97,15 @@ In `platform` and `hybrid` mode the baked webhook URL is the hosted Platform's
 | `--webhook-url <url>` | **Advanced / self-hosted.** Bake this `https://` URL into the App's webhook verbatim instead of the URL the orchestrator resolves for its mode. See [Self-hosted webhook URL](#self-hosted-webhook-url-override).   |
 | `--no-browser`        | Headless mode: the CLI prints a `kici.dev` URL to open, then reads the setup code you paste back. The page is pure client-side — it only displays the short-lived code, which is useless once the CLI exchanges it. |
 
+**The org of the source.** On an orchestrator attached to the Platform, the
+new source belongs to the org the orchestrator is attached to: the org that
+`kici-admin orchestrator status`, `kici compile` and the dashboard show. Its
+runs use that org's contexts, secrets and fork policy. `--org <orgId>` accepts
+only that org; the CLI checks it before it creates the App. On an
+`independent` orchestrator the source belongs to `__default__`. The command
+prints the org on an `Org:` line. See
+[Which org a source belongs to](../../operator/orchestrator/kici-admin/sources.md#which-org-a-source-belongs-to).
+
 The manifest flow always creates a **new** App on GitHub. If a source for
 that App id already exists on the orchestrator, the command refuses — use
 `source update` to rotate an existing App's credentials.

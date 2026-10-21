@@ -168,6 +168,11 @@ For each configured scaler backend, `diagnose` emits a `scaler:<name>` row repor
 
 These rows fold into the command's exit code (0 pass / 1 warn / 2 fail) like every other check. The window is in-process, so it resets when the orchestrator restarts.
 
+The **Workflow lock compile schema** row compares each enabled workflow registration with the compile schema of this orchestrator's release:
+
+- **pass** -- every registered lock declares that schema (or declares none).
+- **warn** -- at least one lock declares another schema. Agents of this release reject such a lock, so every run of it fails. `details.stale` lists the repository, workflow and lock schema of each one. Recompile each lock with the matching `@kici-dev/compiler` release and commit it. See [compile schema mismatch](../../../user/lock-file-and-drift.md#compile-schema-mismatch).
+
 ### debug-bundle -- diagnostic bundle
 
 ```bash

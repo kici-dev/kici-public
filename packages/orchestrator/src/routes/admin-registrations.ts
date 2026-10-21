@@ -5,7 +5,12 @@
 
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { createLogger, depCacheKeyOf } from '@kici-dev/shared';
+import {
+  COMPILE_SCHEMA_VERSION,
+  createLogger,
+  depCacheKeyOf,
+  lockCompileSchema,
+} from '@kici-dev/shared';
 import type { RegistrationStore } from '../registration/registration-store.js';
 import type { RegistrationIndex } from '../registration/registration-index.js';
 import type { TokenManager } from '../secrets/token-manager.js';
@@ -16,6 +21,26 @@ import { assertWorkflowsSatisfiable } from '../contexts/protection/satisfiabilit
 import { enforceRoutingKeyScope } from '../secrets/routing-key-scope.js';
 import { createBearerAuthMiddleware } from './admin-auth.js';
 import { type AdminEnv, createAdminApp } from './admin-env.js';
+import {
+  formatStaleLockWarning,
+  staleCompileSchemaEntries,
+} from '../registration/compile-schema-staleness.js';
+
+/**
+ * A registration row plus the compile schema its lock declares and the one this
+ * release's agents implement, so a client can flag a lock the agents reject.
+ */
+function withCompileSchema<T extends { lock_entry: unknown }>(
+  row: T,
+): T & { compileSchemaVersion: number | null; agentCompileSchemaVersion: number } {
+  return {
+    ...row,
+    compileSchemaVersion: lockCompileSchema(
+      row.lock_entry as { compileSchemaVersion?: unknown } | null,
+    ),
+    agentCompileSchemaVersion: COMPILE_SCHEMA_VERSION,
+  };
+}
 
 const logger = createLogger({ prefix: 'admin-registrations' });
 
@@ -125,7 +150,10 @@ export function createAdminRegistrationRoutes(deps: AdminRegistrationRoutesDeps)
       });
     }
 
-    return c.json({ registrations, total: registrations.length }, 200);
+    return c.json(
+      { registrations: registrations.map(withCompileSchema), total: registrations.length },
+      200,
+    );
   });
 
   app.get('/api/v1/admin/registrations/:id', async (c) => {
@@ -139,7 +167,7 @@ export function createAdminRegistrationRoutes(deps: AdminRegistrationRoutesDeps)
     const denied = enforceRoutingKeyScope(c, registration.routing_key);
     if (denied) return denied;
 
-    return c.json({ registration }, 200);
+    return c.json({ registration: withCompileSchema(registration) }, 200);
   });
 
   // Upsert workflow_registrations from a lock file (break-glass / test seeding).
@@ -210,7 +238,16 @@ export function createAdminRegistrationRoutes(deps: AdminRegistrationRoutesDeps)
       registryVersion,
     });
 
-    return c.json({ workflowCount, registryVersion }, 200);
+    // Every run of a stale lock fails on this release's agents: say so now.
+    const warnings = staleCompileSchemaEntries(
+      (lockFile.workflows as Array<{ name?: unknown }>).map((w) => ({
+        repoIdentifier: parsed.repoIdentifier,
+        workflowName: typeof w?.name === 'string' ? w.name : '(unnamed)',
+        lockEntry: w,
+      })),
+    ).map((e) => formatStaleLockWarning(e));
+
+    return c.json({ workflowCount, registryVersion, warnings }, 200);
   });
 
   // Force re-register from lock file (bumps registry version)

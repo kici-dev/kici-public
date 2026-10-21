@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 import {
+  agentImageId,
   agentImageLabels,
   pullImageIfMissing,
   runtimeInjectBind,
@@ -182,6 +183,24 @@ describe('agentImageLabels', () => {
     const inspect = vi.fn().mockResolvedValue({ Config: { Labels: null } });
     const getImage = vi.fn().mockReturnValue({ inspect });
     expect(await agentImageLabels({ getImage } as never, 'kici-agent:x')).toBeUndefined();
+  });
+});
+
+describe('agentImageId', () => {
+  it('returns the image ID', async () => {
+    const inspect = vi.fn().mockResolvedValue({ Id: 'sha256:abc' });
+    const getImage = vi.fn().mockReturnValue({ inspect });
+    expect(await agentImageId({ getImage } as never, 'kici-agent:x')).toBe('sha256:abc');
+    expect(getImage).toHaveBeenCalledWith('kici-agent:x');
+  });
+
+  // fails-when: a missing image throws into the spawn path instead of reading as unknown
+  it('returns null when the image is absent', async () => {
+    const inspect = vi
+      .fn()
+      .mockRejectedValue(Object.assign(new Error('no such image'), { statusCode: 404 }));
+    const getImage = vi.fn().mockReturnValue({ inspect });
+    expect(await agentImageId({ getImage } as never, 'kici-agent:x')).toBeNull();
   });
 });
 

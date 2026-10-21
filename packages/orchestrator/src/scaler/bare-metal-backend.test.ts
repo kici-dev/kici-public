@@ -1084,3 +1084,41 @@ describe('BareMetalScalerBackend', () => {
     });
   });
 });
+
+describe('BareMetalScalerBackend spawnSourceFingerprint', () => {
+  // fails-when: the fingerprint reads the symlink itself, or omits the inode — an
+  // upgrade that replaces the target file would keep the old schema knowledge
+  it('follows the symlink and changes when the file is replaced', async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-bm-fp-'));
+    const target = path.join(tmp, 'agent-a');
+    fs.writeFileSync(target, '#!/bin/sh\n');
+    const link = path.join(tmp, 'kici-agent');
+    fs.symlinkSync(target, link);
+    const backend = createBackend({
+      labelSets: [{ labels: ['linux', 'bare-metal'], binaryPath: link }],
+    });
+
+    const first = await backend.spawnSourceFingerprint(['linux', 'bare-metal']);
+    expect(first).toMatch(new RegExp(`^${fs.realpathSync(target)}:`));
+    expect(await backend.spawnSourceFingerprint(['linux', 'bare-metal'])).toBe(first);
+
+    const replacement = path.join(tmp, 'agent-a.new');
+    fs.writeFileSync(replacement, '#!/bin/sh\necho upgraded\n');
+    fs.renameSync(replacement, target);
+    expect(await backend.spawnSourceFingerprint(['linux', 'bare-metal'])).not.toBe(first);
+  });
+
+  it('is null in job-image mode', async () => {
+    const backend = createBackend({
+      labelSets: [{ labels: ['linux', 'bare-metal'], image: 'ghcr.io/org/kici-agent:latest' }],
+    });
+    expect(await backend.spawnSourceFingerprint(['linux', 'bare-metal'])).toBeNull();
+  });
+
+  it('is null when the binary is missing', async () => {
+    const backend = createBackend({
+      labelSets: [{ labels: ['linux', 'bare-metal'], binaryPath: '/nonexistent/kici-agent' }],
+    });
+    expect(await backend.spawnSourceFingerprint(['linux', 'bare-metal'])).toBeNull();
+  });
+});

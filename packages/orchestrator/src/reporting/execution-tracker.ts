@@ -177,6 +177,70 @@ function rerunLineageColumns(lineage: RerunLineage | undefined): {
 }
 
 /**
+ * The identity of a run recorded as failed before it started: what
+ * {@link ExecutionTracker.recordInitFailureRun} and
+ * {@link ExecutionTracker.recordAcceptedDispatchFailure} write besides the
+ * failure itself.
+ */
+export interface NeverStartedRunIdentity {
+  runId: string;
+  workflowName: string;
+  provider: string;
+  repoIdentifier: string;
+  ref: string;
+  sha: string;
+  deliveryId: string | null;
+  providerContext: Record<string, unknown>;
+  routingKey: string;
+  triggerEvent?: string;
+  commitMessage?: string;
+  /**
+   * The repository that DEFINES the workflow this run was about to execute.
+   * REQUIRED so a caller that omits it does not compile: a null marker means
+   * "the workflow lives in this run's own repository", not "unknown", and the
+   * defining-repository predicate reads it as fact.
+   *
+   * Narrowed to the differing case as in `onExecutionStarted`, so passing
+   * `repoIdentifier` (the per-repository case) records nothing.
+   */
+  workflowRepoIdentifier: string;
+  /**
+   * Workflow repository commit and registered branch, recorded only for a
+   * cross-repository workflow, as a hold records them: a re-run of the
+   * failed run resolves the workflow at this commit.
+   */
+  workflowSha?: string | null;
+  workflowBranch?: string | null;
+  /**
+   * Inherited invoke-chain depth for a run summoned by an invoke gate.
+   *
+   * Unlike a hold ({@link ExecutionTracker.recordRunHeld}), a never-started
+   * failure is terminal and never fires a gate, so nothing reads it to bound
+   * recursion. It is recorded because this row is the run's ONLY record, and a
+   * `0` claims it started the chain it died inside.
+   */
+  chainDepth?: number;
+  /**
+   * True when a failure-lifecycle trigger dispatched this run, recorded as
+   * the run's `trigger_decision` marker
+   * (`EventRouter.isFailureLifecycleRun`).
+   *
+   * For consistency, not a live reader: this path emits no
+   * `__workflow_complete`. The row then agrees with the one
+   * {@link ExecutionTracker.recordRunHeld} writes for the same dispatch, and a
+   * later emit here cannot silently re-open the self-retrigger loop.
+   */
+  dispatchedByFailureLifecycle?: boolean;
+  /** Re-run lineage, when this run re-runs another. */
+  rerunLineage?: RerunLineage;
+  /**
+   * Set for a `kici run` test run, so its init failure stays readable on the
+   * test-run status and log routes, which serve only test runs.
+   */
+  testRun?: { fixtureId: string };
+}
+
+/**
  * The `trigger_decision` blob for a run recorded by a pre-dispatch path.
  *
  * These paths write the row before any decision summary exists, so the column
@@ -3003,6 +3067,8 @@ export class ExecutionTracker {
       this.runs.delete(runId);
       this.jobLogBytes.delete(runId);
     }
+    // Releases the run's per-run state elsewhere (the check-run reporter's) via `onRunPruned`.
+    this.scheduleRunPrune(runId);
 
     logger.info('Execution marked failed due to build failure', { runId });
   }
@@ -3040,10 +3106,18 @@ export class ExecutionTracker {
       chainDepth?: number;
       dispatchedByFailureLifecycle?: boolean;
       rerunLineage?: RerunLineage;
+      /**
+       * The repository that defines the workflow, with the commit the run
+       * dispatched from it. Recorded only when it differs from `repoIdentifier`
+       * (a global run), as every other run row records it: a re-run resolves the
+       * workflow at this commit, and the run stays attributed to its workflow repo.
+       */
+      workflowRepo?: WorkflowRepoProvenance;
     },
   ): Promise<void> {
     const now = new Date();
     const reason = failureReason ?? 'Build job timed out before execution tracking started';
+    const crossRepoProvenance = crossRepoProvenanceOf(repoIdentifier, provenance?.workflowRepo);
 
     const customerId = await this.resolveCustomerId(routingKey);
     await this.db
@@ -3066,6 +3140,7 @@ export class ExecutionTracker {
         failure_reason: reason,
         ...inheritedChainDepth(provenance?.chainDepth),
         ...rerunLineageColumns(provenance?.rerunLineage),
+        ...(crossRepoProvenance && workflowProvenanceColumns(crossRepoProvenance)),
         ...(initFailure && { init_failure: JSON.stringify(initFailure) }),
       })
       .execute();
@@ -3075,6 +3150,8 @@ export class ExecutionTracker {
       workflowName,
       reason,
     });
+    // The build check this run created holds reporter state until the prune reaches it.
+    this.scheduleRunPrune(runId);
   }
 
   /**
@@ -3092,63 +3169,102 @@ export class ExecutionTracker {
    * Without this, the secret / install-secret / all-jobs-rejected early exits in
    * dispatch-matched-workflow leave no trace on the dashboard.
    */
-  async recordInitFailureRun(args: {
-    runId: string;
-    workflowName: string;
-    provider: string;
-    repoIdentifier: string;
-    ref: string;
-    sha: string;
-    deliveryId: string | null;
-    providerContext: Record<string, unknown>;
-    routingKey: string;
-    initFailure: InitFailure;
-    triggerEvent?: string;
-    commitMessage?: string;
-    /**
-     * The repository that DEFINES the workflow this run was about to execute.
-     * REQUIRED so a caller that omits it does not compile: a null marker means
-     * "the workflow lives in this run's own repository", not "unknown", and the
-     * defining-repository predicate reads it as fact.
-     *
-     * Narrowed to the differing case as in `onExecutionStarted`, so passing
-     * `repoIdentifier` (the per-repository case) records nothing.
-     */
-    workflowRepoIdentifier: string;
-    /**
-     * Inherited invoke-chain depth for a run summoned by an invoke gate.
-     *
-     * Unlike a hold ({@link ExecutionTracker.recordRunHeld}), an init failure is
-     * terminal and never fires a gate, so nothing reads it to bound recursion.
-     * It is recorded because this row is the run's ONLY record, and a `0`
-     * claims it started the chain it died inside.
-     */
-    chainDepth?: number;
-    /**
-     * True when a failure-lifecycle trigger dispatched this run, recorded as
-     * the run's `trigger_decision` marker
-     * (`EventRouter.isFailureLifecycleRun`).
-     *
-     * For consistency, not a live reader: this path emits no
-     * `__workflow_complete`. The row then agrees with the one
-     * {@link ExecutionTracker.recordRunHeld} writes for the same dispatch, and a
-     * later emit here cannot silently re-open the self-retrigger loop.
-     */
-    dispatchedByFailureLifecycle?: boolean;
-    /** Re-run lineage, when this run re-runs another. */
-    rerunLineage?: RerunLineage;
-    /**
-     * Set for a `kici run` test run, so its init failure stays readable on the
-     * test-run status and log routes, which serve only test runs.
-     */
-    testRun?: { fixtureId: string };
-  }): Promise<void> {
+  async recordInitFailureRun(
+    args: NeverStartedRunIdentity & { initFailure: InitFailure },
+  ): Promise<void> {
+    const applied = await this.recordNeverStartedRun({
+      ...args,
+      failureReason: args.initFailure.message,
+    });
+    if (!applied) return;
+    logger.info('Recorded init-failure execution run', {
+      runId: args.runId,
+      workflowName: args.workflowName,
+      category: args.initFailure.category,
+      scope: args.initFailure.scope,
+    });
+  }
+
+  /**
+   * Write a `failed` execution_runs row for a run whose dispatch threw after
+   * the requester was told its run id (a re-run, a schedule fired by hand).
+   * The requester reads the failure from that run.
+   *
+   * The same guarded upsert as {@link ExecutionTracker.recordInitFailureRun},
+   * with no `init_failure`: the dispatch failed as a whole, so no init phase
+   * names it. A row the dispatch already registered is overwritten while live,
+   * and a row the dispatch already failed (`failRun` in its own `catch`) is
+   * terminal, so it is kept as written.
+   */
+  async recordAcceptedDispatchFailure(
+    args: NeverStartedRunIdentity & {
+      failureReason: string;
+      triggerEvent: string;
+      triggeredBy: string | null;
+      triggeredByAgentLabel: string | null;
+    },
+  ): Promise<void> {
+    const lineage = args.rerunLineage;
+    const applied = await this.recordNeverStartedRun({
+      ...args,
+      extraColumns: {
+        trigger_event: args.triggerEvent,
+        triggered_by: args.triggeredBy,
+        triggered_by_agent_label: args.triggeredByAgentLabel,
+      },
+      forwardContext: {
+        triggeredBy: args.triggeredBy,
+        triggeredByAgentLabel: args.triggeredByAgentLabel,
+        ...(lineage && {
+          parentRunId: lineage.parentRunId,
+          originalRunId: lineage.originalRunId,
+        }),
+      },
+    });
+    if (!applied) return;
+    logger.info('Recorded a failed accepted dispatch', {
+      runId: args.runId,
+      workflowName: args.workflowName,
+      reason: args.failureReason,
+    });
+  }
+
+  /**
+   * The guarded upsert behind {@link ExecutionTracker.recordInitFailureRun}
+   * and {@link ExecutionTracker.recordAcceptedDispatchFailure}: insert a
+   * `failed`, `never_started` row, overwrite a live one, keep a terminal one.
+   * Forwards the failure and stamps any in-memory run complete only when the
+   * write applied. Returns whether it applied.
+   */
+  private async recordNeverStartedRun(
+    args: NeverStartedRunIdentity & {
+      failureReason: string;
+      initFailure?: InitFailure;
+      /** Columns only the insert writes; a conflicting row already has its own. */
+      extraColumns?: {
+        trigger_event?: string;
+        triggered_by?: string | null;
+        triggered_by_agent_label?: string | null;
+      };
+      /** Extra fields of the `execution.status` forward. */
+      forwardContext?: Partial<ExecutionContext>;
+    },
+  ): Promise<boolean> {
     const now = new Date();
     const customerId = await this.resolveCustomerId(args.routingKey);
     const testRunColumns = args.testRun
       ? { is_test_run: true, fixture_id: args.testRun.fixtureId }
       : {};
-    const crossRepoWorkflowRepo = crossRepoWorkflowRepoOf(args);
+    const crossRepoProvenance = crossRepoProvenanceOf(args.repoIdentifier, {
+      identifier: args.workflowRepoIdentifier,
+      sha: args.workflowSha ?? null,
+      branch: args.workflowBranch ?? null,
+    });
+    const crossRepoWorkflowRepo = crossRepoProvenance?.identifier;
+    // Written only when given, so the upsert never stores a stringified `undefined`.
+    const initFailureColumn = args.initFailure && {
+      init_failure: JSON.stringify(args.initFailure),
+    };
     const applied = await this.db
       .insertInto('execution_runs')
       .values({
@@ -3166,12 +3282,13 @@ export class ExecutionTracker {
         started_at: now,
         completed_at: now,
         status: ExecutionRunStatus.enum.failed,
-        failure_reason: args.initFailure.message,
+        failure_reason: args.failureReason,
         failure_class: RunFailureClass.enum.never_started,
-        init_failure: JSON.stringify(args.initFailure),
+        ...initFailureColumn,
+        ...args.extraColumns,
         ...inheritedChainDepth(args.chainDepth),
         ...rerunLineageColumns(args.rerunLineage),
-        ...(crossRepoWorkflowRepo && { workflow_repo_identifier: crossRepoWorkflowRepo }),
+        ...(crossRepoProvenance && workflowProvenanceColumns(crossRepoProvenance)),
         ...testRunColumns,
       })
       // Overwrite a non-terminal row: a `pending` row left untouched strands
@@ -3186,9 +3303,9 @@ export class ExecutionTracker {
             // path's zero duration.
             duration_ms: sql<number>`extract(epoch from (${now} - execution_runs.started_at)) * 1000`,
             status: ExecutionRunStatus.enum.failed,
-            failure_reason: args.initFailure.message,
+            failure_reason: args.failureReason,
             failure_class: RunFailureClass.enum.never_started,
-            init_failure: JSON.stringify(args.initFailure),
+            ...initFailureColumn,
             // Restate the depth (only ever set, never cleared): a row from any
             // path but dispatch keeps the `0` default, which reads as "starts a
             // chain", not "unknown".
@@ -3201,20 +3318,20 @@ export class ExecutionTracker {
             // Restate the marker too (only ever set, never cleared): a row from
             // any path but `onExecutionStarted` keeps a null marker, read as
             // "the workflow lives in this run's own repository", not "unknown".
-            ...(crossRepoWorkflowRepo && { workflow_repo_identifier: crossRepoWorkflowRepo }),
+            ...(crossRepoProvenance && workflowProvenanceColumns(crossRepoProvenance)),
             ...testRunColumns,
           })
           .where('execution_runs.status', 'not in', [...TERMINAL_RUN_STATES]),
       )
       .executeTakeFirst();
 
-    // A kept terminal row means our record has no init failure, so neither the
-    // metric nor the Platform forward may claim one (see `guardedWriteApplied`).
+    // A kept terminal row means our record is not the run's, so neither the
+    // metric nor the Platform forward may claim it (see `guardedWriteApplied`).
     if (!guardedWriteApplied(applied)) {
-      logger.debug('Init-failure record skipped: run already terminal in DB', {
+      logger.debug('Never-started failure record skipped: run already terminal in DB', {
         runId: args.runId,
       });
-      return;
+      return false;
     }
 
     executionsTotal.add(1, { status: ExecutionRunStatus.enum.failed });
@@ -3233,22 +3350,16 @@ export class ExecutionTracker {
         triggerEvent: args.triggerEvent,
         commitMessage: args.commitMessage,
         failureClass: RunFailureClass.enum.never_started,
+        ...args.forwardContext,
       },
       0,
       now.getTime(),
       now.getTime(),
       0,
-      args.initFailure.message,
+      args.failureReason,
       0,
       args.initFailure,
     );
-
-    logger.info('Recorded init-failure execution run', {
-      runId: args.runId,
-      workflowName: args.workflowName,
-      category: args.initFailure.category,
-      scope: args.initFailure.scope,
-    });
 
     // Stamp the in-memory run complete so a late job status cannot roll it up
     // over this failure. Not dropped: the next status would rehydrate it, and
@@ -3259,6 +3370,7 @@ export class ExecutionTracker {
       memRun.completedAt = now.getTime();
       this.scheduleRunPrune(args.runId);
     }
+    return true;
   }
 
   /**

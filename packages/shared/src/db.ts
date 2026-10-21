@@ -224,11 +224,10 @@ function refuseNewAcquires(pool: pg.Pool): void {
  * Close a Kysely database and the pg pool it runs on, without hanging.
  *
  * Kysely's PostgresDriver.destroy() drops its pool reference and then calls
- * pool.end(). An acquire whose pool.connect() is still pending at that moment
- * gets a client it can no longer wrap, so the client is never released, and
- * pool.end(), which waits for every client, never returns. So this refuses new
- * acquires first, waits for the in-flight ones to finish and every checked-out
- * client to come back, and destroys the database only then.
+ * pool.end(). A query whose pool.connect() is still pending at that moment fails
+ * with "driver has already been destroyed". So this refuses new acquires first, waits for the
+ * in-flight ones to finish and every checked-out client to come back, and
+ * destroys the database only then.
  *
  * A query that outlives `drainTimeoutMs` is logged by count and left running:
  * the process exits after its shutdown, and PostgreSQL ends the backend when

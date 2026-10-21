@@ -10,6 +10,22 @@
  * - registration index: DB-backed workflow matching
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { COMPILE_SCHEMA_VERSION } from '@kici-dev/shared';
+
+// The startup compile-schema scan, wrapped so a test sees which stale locks it reported.
+const { staleScan } = vi.hoisted(() => ({ staleScan: vi.fn() }));
+vi.mock('../registration/compile-schema-staleness.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('../registration/compile-schema-staleness.js')>();
+  return {
+    ...actual,
+    warnStaleCompileSchemas: (...args: Parameters<typeof actual.warnStaleCompileSchemas>) => {
+      const stale = actual.warnStaleCompileSchemas(...args);
+      staleScan(stale);
+      return stale;
+    },
+  };
+});
 
 // Mock Kysely's sql tagged template to avoid needing a real DB executor for pg_notify
 vi.mock('kysely', async (importOriginal) => {
@@ -263,6 +279,7 @@ function createMockRegistrationIndex(registrations: RegisteredWorkflow[] = []): 
     getByTriggerType: vi.fn().mockReturnValue([]),
     getByCustomerAndRepo: vi.fn().mockReturnValue([]),
     getCronSchedules: vi.fn().mockReturnValue([]),
+    getAll: vi.fn().mockReturnValue(registrations),
     getByEventType: vi.fn().mockImplementation((eventType: string) => {
       return registrations.filter((r) => r.triggerTypes.includes(eventType));
     }),
@@ -579,6 +596,27 @@ describe('EventRouter', () => {
       await router.start();
 
       expect(mockIndex.loadFromDb).toHaveBeenCalledTimes(1);
+    });
+
+    // fails-when: the startup scan does not run, so a lock the upgrade made stale is first
+    // noticed when its runs fail
+    it('scans the registered locks for a stale compile schema at startup', async () => {
+      const stale = makeRegisteredWorkflow('old', 'evt');
+      (stale.lockEntry as { compileSchemaVersion?: number }).compileSchemaVersion = 1;
+      const current = makeRegisteredWorkflow('new', 'evt');
+      (current.lockEntry as { compileSchemaVersion?: number }).compileSchemaVersion =
+        COMPILE_SCHEMA_VERSION;
+      const opts = createRouterOptions({
+        registrationIndex: createMockRegistrationIndex([stale, current]),
+        eventStore: createMockEventStore({ events: [] }),
+      });
+      staleScan.mockClear();
+
+      await new EventRouter(opts).start();
+
+      expect(staleScan).toHaveBeenCalledTimes(1);
+      const reported = staleScan.mock.calls[0]![0] as Array<{ workflowName: string }>;
+      expect(reported.map((e) => e.workflowName)).toEqual(['old']);
     });
   });
 

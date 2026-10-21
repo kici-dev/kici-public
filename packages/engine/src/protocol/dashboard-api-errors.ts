@@ -17,5 +17,12 @@ export const DashboardApiErrorCode = z.enum([
    * dashboard explain the retention window.
    */
   'run_outside_retention',
+  /**
+   * A run-minting route (a re-run, a schedule fired by hand) relayed the
+   * request and the orchestrator did not answer in time. Returned with 504.
+   * The orchestrator may still have accepted the request, so the run may still
+   * start: a client says so and points at the run list, never "retry".
+   */
+  'run_start_unconfirmed',
 ]);
 export type DashboardApiErrorCode = z.infer<typeof DashboardApiErrorCode>;

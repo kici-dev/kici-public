@@ -74,8 +74,13 @@ allowBuilds:
 # from this file and silently ignores `pnpm.overrides` in package.json
 # when a workspace manifest exists. Sourced from the weekly CVE scan.
 overrides:
-  axios: '>=1.15.2'
-  'brace-expansion@>=2.0.0 <3.0.0': '>=2.0.3'
+  # axios 1.x: GHSA-3pq3-5fj3-cg6v, GHSA-542g-h47m-68v8, GHSA-c29m-xwm3-cm6r, GHSA-m8m8-qj5v-23w3,
+  # GHSA-mghh-pgcx-3jjj, GHSA-r4gj-5m52-g5wh, GHSA-x97p-jq2g-jp4f (>=1.20.0, via hashi-vault-js, whose
+  # `>=1.19.0` range a resolved lock node never re-resolves). Bounded below 2.0.0 so no cross-major is forced.
+  axios: '>=1.20.0 <2.0.0'
+  # Bounded to the 2.x line: the unbounded '>=2.0.3' resolved every 2.x consumer (minimatch 9) to 5.x.
+  # 2.1.6 clears GHSA-6j4f-fj2g-mc7p and GHSA-qhr7-859c-m2p7 on the 2.x line.
+  'brace-expansion@>=2.0.0 <3.0.0': '>=2.1.6 <3.0.0'
   defu: '>=6.1.5'
   # GHSA-gv7w-rqvm-qjhr (esbuild Deno-path RCE, CVSS 8.1). We consume
   # esbuild only via Node (transitive build/bundling dep) so the Deno
@@ -108,7 +113,8 @@ overrides:
   '@xhmikosr/decompress': '>=11.1.4'
   # Upgrade sweep CVE clamps — transitive deps whose parents' ranges pin them
   # below the patched version, so a plain `pnpm update` cannot lift them:
-  #   brace-expansion 5.x  GHSA-mh99-v99m-4gvg / GHSA-rgw5-rvv9-x895 (>=5.0.9)
+  #   brace-expansion 5.x  GHSA-mh99-v99m-4gvg / GHSA-rgw5-rvv9-x895 / GHSA-6j4f-fj2g-mc7p /
+  #                        GHSA-qhr7-859c-m2p7 (>=5.0.11)
   #   fast-uri 3.x         GHSA-4c8g-83qw-93j6 / GHSA-7p8r-x3mc-p8w7 / GHSA-v2hh-gcrm-f6hx (>=3.1.5, via ajv)
   #   ip-address 10.x      GHSA-mwp4-54f8-5fhr (>=10.3.1, via express-rate-limit)
   #   hono 4.x             GHSA-8j4g-w8fx-2239 + cohort (>=4.12.34, via @modelcontextprotocol/sdk)
@@ -116,15 +122,15 @@ overrides:
   # Scoped to the affected major so no cross-major is forced. Drop each clamp
   # once every parent's range reaches the patched line. Tracked by the
   # upgrade sweep (/vulnerability-scan).
-  # The hono clamp is written as ^4.13.7 — above the CVE floor, and matching
+  # The hono clamp is written as ^4.13.13 — above the CVE floor, and matching
   # every workspace manifest verbatim. pnpm applies overrides before resolving,
   # so an importer records the overridden specifier; its up-to-date check then
   # compares that against the raw manifest and warns "out of sync" whenever the
   # two differ. Keeping the clamp equal to the declared range avoids that.
-  'brace-expansion@5': '>=5.0.9'
-  'fast-uri@3': '>=3.1.5 <4.0.0'
-  'ip-address@10': '>=10.3.1'
-  'hono@4': '^4.13.7'
+  'brace-expansion@5': '>=5.0.11'
+  'fast-uri@3': '>=3.1.8 <4.0.0'
+  'ip-address@10': '>=10.7.1 <11.0.0'
+  'hono@4': '^4.13.13'
   '@hono/node-server@1': '>=1.19.15'
   # 2026-09-14 additions, same shape (parents' ranges admit the patched line,
   # but a resolved lock node is never re-resolved by `pnpm update <direct>`):
@@ -146,6 +152,15 @@ overrides:
   'piscina@4': '>=4.9.4 <5.0.0'
   'seroval@1': '>=1.6.2 <2.0.0'
   'seroval-plugins@1': '>=1.6.2 <2.0.0'
+  # 2026-10-20 upgrade sweep: @grpc/grpc-js 1.14.x GHSA-m9gg-hp2v-232j (>=1.14.5, via dockerode and the
+  # OTel gRPC exporters; both ranges admit it, but the resolved 1.14.4 lock node is never re-resolved).
+  '@grpc/grpc-js@1': '>=1.14.5 <2.0.0'
+  # Same sweep, MEDIUM advisories with a fix on the installed line:
+  #   fast-uri 3.x    GHSA-hrr3-gc8f-f4qj (>=3.1.8; the fast-uri@3 clamp above)
+  #   ip-address 10.x GHSA-2vr4-cq9g-pvrc / GHSA-h3mg-xc3c-68pw / GHSA-j6r3-76f7-8jcv / GHSA-rpw4-54j3-4h4q
+  #                   (>=10.7.1; the ip-address@10 clamp above)
+  #   moment 2.x      GHSA-4p3w-j4w9-5jqw (>=2.31.0, via winston-daily-rotate-file -> file-stream-rotator)
+  'moment@2': '>=2.31.0 <3.0.0'
 
 minimumReleaseAge: 2880 # 48 hours
 
@@ -199,8 +214,3 @@ minimumReleaseAgeExclude:
   # queued upgrade.
   - 'kysely@0.29.0'
   - 'kysely-ctl@0.21.0'
-
-# Dependency patches, each keyed to one exact version. patches/README.md
-# records the upstream fix each one carries and when to remove it.
-patchedDependencies:
-  vitest@5.0.1: patches/vitest@5.0.1.patch

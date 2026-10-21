@@ -328,6 +328,7 @@ import { decryptPrivateKey, decryptSecretOutput } from './secrets/ephemeral-keys
 import { ProviderRegistry } from './provider-registry.js';
 import { ClusterIdentity } from './cluster/cluster-identity.js';
 import { InstanceHeartbeat, instanceLivenessGraceMs } from './cluster/instance-heartbeat.js';
+import { createCompileSchemaView, type CompileSchemaView } from './pipeline/compile-schema-gate.js';
 import { ClusterSettingsReader, clampCacheMaxEntries } from './cluster/cluster-settings-reader.js';
 import { resolveAndPersistClusterName } from './config/cluster-name.js';
 import { getClusterId } from './config/cluster-id.js';
@@ -376,6 +377,12 @@ export interface OrchestratorSubsystems {
   queue: JobQueue;
   scalerManager: ScalerManager | null;
   scalerConfig: ScalerConfig | null;
+  /**
+   * What this instance sees of the agents a run could reach, for the
+   * dispatch-time compile-schema gate. Every ProcessingDeps bag carries it:
+   * the direct-ingress one, the Platform-relay one and the re-run one.
+   */
+  compileSchemaView: CompileSchemaView;
   cacheStorage: CacheStorage | undefined;
   /**
    * Provenance trust root used to verify build-provenance bundles at ingest:
@@ -4252,6 +4259,16 @@ export async function bootstrapOrchestrator(
     queue,
     scalerManager,
     scalerConfig,
+    compileSchemaView: createCompileSchemaView({
+      registry: agentRegistry,
+      scaler: scalerManager ?? undefined,
+      db,
+      instanceId: config.instanceId,
+      livenessGraceMs: instanceLivenessGraceMs(
+        config.agentMaxReconnectDelayMs * 2,
+        config.clusterInstanceHeartbeatMs,
+      ),
+    }),
     cacheStorage,
     provenanceTrustRoot,
     provenanceSigning: provenanceSigningEnabled
@@ -4756,6 +4773,7 @@ export async function bootstrapOrchestrator(
     ingestOverflowBuffer,
     ingestOverflowReplayer,
     scalerManager: scalerManager ?? undefined,
+    compileSchemaView: subsystems.compileSchemaView,
     tokenStore,
     ownershipTracker,
     fleetAgentCollector,

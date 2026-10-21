@@ -209,6 +209,11 @@ export class RegistrationIndex {
     return this.version;
   }
 
+  /** Every registration in the index, disabled ones included. */
+  getAll(): RegisteredWorkflow[] {
+    return [...this.entries.values()].flat();
+  }
+
   /**
    * Look up a single registration by ID (includes disabled entries).
    * Used by manual schedule to distinguish "not found" from "disabled".

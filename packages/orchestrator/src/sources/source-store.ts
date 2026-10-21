@@ -10,6 +10,7 @@ import { type Kysely, sql } from 'kysely';
 import type { Database, Source } from '../db/types.js';
 import type { PgSecretStore } from '../secrets/pg-secret-store.js';
 import { createLogger } from '@kici-dev/shared';
+import { rehomeSourceRegistrations } from './source-org.js';
 
 const logger = createLogger({ prefix: 'source-store' });
 
@@ -150,7 +151,9 @@ export class SourceStore {
   }
 
   /**
-   * Update a source's name/config and optionally rotate secrets.
+   * Update a source's name/config and optionally rotate secrets. A new
+   * `customerId` moves the source's registrations to that org in the same
+   * transaction, so the source and its registrations never disagree.
    */
   async updateSource(
     routingKey: string,
@@ -185,12 +188,24 @@ export class SourceStore {
 
     // Apply DB updates (always runs -- at minimum updates updated_at)
     {
-      const updated = await this.db
-        .updateTable('sources')
-        .set(dbUpdates)
-        .where('routing_key', '=', routingKey)
-        .returningAll()
-        .executeTakeFirstOrThrow();
+      const orgChanged = !!updates.customerId && updates.customerId !== source.customer_id;
+      const updated = await this.db.transaction().execute(async (trx) => {
+        const row = await trx
+          .updateTable('sources')
+          .set(dbUpdates)
+          .where('routing_key', '=', routingKey)
+          .returningAll()
+          .executeTakeFirstOrThrow();
+        if (orgChanged) {
+          const moved = await rehomeSourceRegistrations(trx, routingKey, updates.customerId!);
+          logger.info('Moved source registrations to its new org', {
+            routingKey,
+            orgId: updates.customerId,
+            moved,
+          });
+        }
+        return row;
+      });
 
       const scope = `__source__/${source.id}`;
       if (updates.privateKey) {

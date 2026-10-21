@@ -27,6 +27,8 @@ Nothing else about a fork pull request is configurable. There is no separate pol
 - An organization that has never opened **Settings > CI trust** has no stored policy, and its orchestrator applies `ignore`. That state can last indefinitely, because the policy is created on the first dashboard read.
 - If the orchestrator cannot **read** its stored policy, it applies `hold` instead. A read failure says nothing about what you chose, so fork pull requests are parked visibly rather than dropped silently. Both answers are fail-closed; the hold is the one you can act on.
 
+The switch is set per org, and a pull request uses the switch of its source's org. On a Platform-attached orchestrator, the dashboard sets the switch of the attached org. A source in another org, such as a `__default__` source that the orchestrator holds from before it filed new sources under the attached org, uses the switch of that other org. `kici-admin source list` and `kici-admin trust-policy show` report this split. See [which org a source belongs to](../orchestrator/kici-admin/sources.md#which-org-a-source-belongs-to).
+
 The switch applies to sources that model forks — GitHub today. A generic webhook, a local source, or a plain Git remote has no fork signal, so a pull request from one resolves no trust tier and never reaches the switch.
 
 ### What an allowed or approved fork pull request may do

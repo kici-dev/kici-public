@@ -4,7 +4,12 @@
  * (croner).
  */
 import { Cron } from 'croner';
-import { createLogger, toErrorMessage } from '@kici-dev/shared';
+import {
+  COMPILE_SCHEMA_VERSION,
+  createLogger,
+  lockCompileSchema,
+  toErrorMessage,
+} from '@kici-dev/shared';
 import type { Kysely } from 'kysely';
 import {
   SourceSubtype,
@@ -587,6 +592,8 @@ export class DashboardRegistrationsHandler {
           sourceFile: reg.sourceFile ?? undefined,
           source: buildRegistrationSource(reg.routing_key, sourceMetaMap),
           isGlobal: reg.isGlobal,
+          compileSchemaVersion: lockCompileSchema(reg.lock_entry),
+          agentCompileSchemaVersion: COMPILE_SCHEMA_VERSION,
         };
       });
 

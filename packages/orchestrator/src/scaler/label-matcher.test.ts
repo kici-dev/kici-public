@@ -4,6 +4,7 @@ import {
   labelSetsMatch,
   detectLabelSetOverlaps,
   findBackendForLabels,
+  findEligibleBackendsForLabels,
 } from './label-matcher.js';
 
 describe('normalizeLabelSet', () => {
@@ -394,5 +395,42 @@ describe('findBackendForLabels', () => {
     it('empty runsOn still matches nothing when every label set is gated', () => {
       expect(findBackendForLabels([], [mixed])).toBeNull();
     });
+  });
+});
+
+describe('findEligibleBackendsForLabels', () => {
+  const scalers = [
+    { name: 'small', labelSets: [{ labels: ['linux', 'docker'] }] },
+    { name: 'large', labelSets: [{ labels: ['linux', 'gpu', 'cuda'] }] },
+    {
+      name: 'gated',
+      labelSets: [{ labels: ['linux', 'secure'] }],
+      labelSetMandatoryLabels: [['secure']],
+    },
+  ];
+
+  // fails-when: only the best match is returned — an exclusion moves the real pick to
+  // another set, which the list would then leave out
+  it('includes the set an exclusion moves the pick to', () => {
+    expect(findBackendForLabels(['linux'], scalers)?.scalerName).toBe('small');
+    expect(findBackendForLabels(['linux'], scalers, ['docker'])?.scalerName).toBe('large');
+    expect(findEligibleBackendsForLabels(['linux'], scalers)).toEqual([
+      { scalerName: 'small', labelSetIndex: 0 },
+      { scalerName: 'large', labelSetIndex: 0 },
+    ]);
+  });
+
+  // breaks-if-wrong: a gated set stays out unless the job names its gate
+  it('honours the per-set gate', () => {
+    expect(findEligibleBackendsForLabels(['linux', 'secure'], scalers)).toEqual([
+      { scalerName: 'gated', labelSetIndex: 0 },
+    ]);
+  });
+
+  it('an empty target is every ungated set', () => {
+    expect(findEligibleBackendsForLabels([], scalers).map((m) => m.scalerName)).toEqual([
+      'small',
+      'large',
+    ]);
   });
 });

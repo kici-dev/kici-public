@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   buildUpgradeHooks,
+  COMPILE_SCHEMA_DIAGNOSE_HINT,
   readDatabaseUrlFromEnvFile,
+  reportCompileSchemaAfterStart,
   resolveDatabaseUrl,
 } from './upgrade-hooks.js';
 
@@ -120,5 +122,74 @@ describe('buildUpgradeHooks', () => {
     await expect(hooks.migrationStatus!()).rejects.toThrow(/no admin token is configured/);
     await expect(hooks.drain!(1)).rejects.toThrow(/no admin token is configured/);
     await expect(hooks.migrateDown!('132_c')).rejects.toThrow(/no admin token is configured/);
+  });
+});
+
+describe('reportCompileSchemaAfterStart', () => {
+  async function report(client: unknown, waitMs = 0) {
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      await reportCompileSchemaAfterStart(client as never, {
+        sleep: async () => undefined,
+        waitMs,
+      });
+      return {
+        out: log.mock.calls.map((c) => String(c[0])),
+        warned: warn.mock.calls.map((c) => String(c[0])),
+      };
+    } finally {
+      log.mockRestore();
+      warn.mockRestore();
+    }
+  }
+  const row = (lock: number) => ({
+    repo_identifier: 'acme/app',
+    workflow_name: 'ci',
+    compileSchemaVersion: lock,
+    agentCompileSchemaVersion: 7,
+  });
+
+  // fails-when: the upgrade is silent about a lock the new release's agents reject
+  it('prints each stale lock', async () => {
+    const client = { get: vi.fn(async () => ({ registrations: [row(5), row(7)] })) };
+    const { warned } = await report(client);
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toContain('acme/app workflow ci: its lock declares compile schema 5');
+  });
+
+  it('prints the all-clear line when nothing is stale', async () => {
+    const client = { get: vi.fn(async () => ({ registrations: [row(7)] })) };
+    expect((await report(client)).out).toEqual([
+      'All registered workflow locks match compile schema 7.',
+    ]);
+  });
+
+  it('prints the diagnose hint without an admin client', async () => {
+    expect((await report(null)).out).toEqual([COMPILE_SCHEMA_DIAGNOSE_HINT]);
+  });
+
+  // breaks-if-wrong: an unreachable admin API must never fail an upgrade that succeeded
+  it('prints the diagnose hint, and does not throw, when the API never answers', async () => {
+    const client = {
+      get: vi.fn(async () => {
+        throw new Error('ECONNREFUSED');
+      }),
+    };
+    expect((await report(client)).out).toEqual([COMPILE_SCHEMA_DIAGNOSE_HINT]);
+  });
+
+  it('waits for the restarted service to answer', async () => {
+    let calls = 0;
+    const client = {
+      get: vi.fn(async () => {
+        calls += 1;
+        if (calls < 3) throw new Error('ECONNREFUSED');
+        return { registrations: [row(7)] };
+      }),
+    };
+    expect((await report(client, 60_000)).out).toEqual([
+      'All registered workflow locks match compile schema 7.',
+    ]);
   });
 });

@@ -22,6 +22,11 @@ import {
 } from '@kici-dev/engine';
 import type { AdminApiClient } from '../api-client.js';
 import { cliAction } from './shared/cli-action.js';
+import {
+  foreignSourceOrgs,
+  ORG_LIST_PATH,
+  type OrgListResponse,
+} from '../../db/repos/org-ids-repo.js';
 
 /**
  * The policy fields are optional because a v0.5.0 independent orchestrator with
@@ -302,6 +307,38 @@ export function formatDirectory(
   return lines.join('\n');
 }
 
+/**
+ * The note `trust-policy show` adds when sources sit outside the attached org:
+ * their runs use their own org's policy, not the one the Platform manages.
+ * Best effort: an unreadable org listing adds no note.
+ */
+async function readOrgSplitPolicyNote(
+  client: AdminApiClient,
+  shownOrg: string,
+): Promise<string | null> {
+  let list: OrgListResponse;
+  try {
+    list = await client.get<OrgListResponse>(ORG_LIST_PATH);
+  } catch {
+    return null;
+  }
+  const foreign = foreignSourceOrgs(list);
+  if (foreign.length === 0) return null;
+  if (shownOrg === list.attachedOrgId) {
+    return (
+      `Note: sources in org(s) ${foreign.map((o) => `'${o}'`).join(', ')} do not use this ` +
+      "policy; their runs use their own org's policy (kici-admin source list)."
+    );
+  }
+  if (foreign.includes(shownOrg)) {
+    return (
+      `Note: this orchestrator is attached to org '${list.attachedOrgId}', whose policy the ` +
+      `Platform manages. Sources in org '${shownOrg}' use this policy instead.`
+    );
+  }
+  return null;
+}
+
 export function registerTrustPolicyCommands(
   program: Command,
   getClient: () => AdminApiClient,
@@ -323,6 +360,10 @@ export function registerTrustPolicyCommands(
           `/api/v1/admin/trust-policy?customerId=${encodeURIComponent(opts.org)}`,
         );
         console.log(formatPolicy(res.policy, opts.format));
+        if (opts.format === 'table') {
+          const note = await readOrgSplitPolicyNote(getClient(), opts.org);
+          if (note) console.error(note);
+        }
       }),
     );
 

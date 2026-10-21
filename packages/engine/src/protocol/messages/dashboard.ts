@@ -739,7 +739,17 @@ export const runRerunRequestSchema = z.object({
 const runRerunResponseSchema = z.object({
   type: z.literal('run.rerun.response'),
   requestId: z.string(),
+  /**
+   * The run the orchestrator accepted. It is sent before the run is
+   * dispatched; a dispatch that fails afterwards fails this run.
+   */
   newRunId: z.string().optional(),
+  /**
+   * True when this request id was already accepted by an earlier delivery of
+   * the same request; `newRunId` is that earlier run. Absent means not
+   * reported (an older orchestrator), not false.
+   */
+  alreadyAccepted: z.boolean().optional(),
   error: z.string().optional(),
   /**
    * Machine-readable error code for a specific failure shape (e.g.
@@ -764,7 +774,17 @@ export const manualScheduleRequestSchema = z.object({
 const manualScheduleResponseSchema = z.object({
   type: z.literal('run.manual_schedule.response'),
   requestId: z.string(),
+  /**
+   * The run the orchestrator accepted. It is sent before the run is
+   * dispatched; a dispatch that fails afterwards fails this run.
+   */
   newRunId: z.string().optional(),
+  /**
+   * True when this request id was already accepted by an earlier delivery of
+   * the same request; `newRunId` is that earlier run. Absent means not
+   * reported (an older orchestrator), not false.
+   */
+  alreadyAccepted: z.boolean().optional(),
   error: z.string().optional(),
 });
 
@@ -2251,6 +2271,18 @@ export const registrationItemSchema = z.object({
    * `is_global` column the dispatcher reads, so it cannot drift from dispatch.
    */
   isGlobal: z.boolean().optional(),
+  /**
+   * The compile schema the registered lock declares; `null` when it declares
+   * none. Absent from older orchestrators.
+   */
+  compileSchemaVersion: z.number().int().positive().nullable().optional(),
+  /**
+   * The compile schema the orchestrator release's agents implement. When both
+   * fields are present and differ, every run of the lock fails on the agent.
+   * Per item, not on the response: the Platform relays rows verbatim but
+   * rebuilds the wrapper.
+   */
+  agentCompileSchemaVersion: z.number().int().positive().optional(),
 });
 
 /** Response with workflow registrations. */

@@ -755,6 +755,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
         resolveSourceWebhookUrl: deps.resolveSourceWebhookUrl,
         resolveGithubWebhookUrl: deps.resolveGithubWebhookUrl,
         resolveSourceIngressUrl: deps.resolveSourceIngressUrl,
+        ...(deps.getPlatformOrgId && { getPlatformOrgId: deps.getPlatformOrgId }),
       }),
     );
   }

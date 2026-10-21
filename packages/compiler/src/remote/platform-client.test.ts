@@ -88,6 +88,32 @@ describe('PlatformRunClient', () => {
     expect(JSON.parse(init.body as string).fixtureId).toBe('f1');
   });
 
+  it('reports a trigger timeout as a run that may still have started', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ error: 'run_start_unconfirmed', message: 'It may still start.' }, 504),
+    );
+
+    // fails-when: a trigger timeout reads as a plain failure, so the user retries
+    await expect(
+      client.trigger(
+        'org_a',
+        {},
+        { fixtureId: 'f1', event: { type: 'push', targetBranch: 'main', payload: {} } },
+      ),
+    ).rejects.toThrow(/may still have started.*kici runs list --since 20/);
+  });
+
+  it('keeps the plain failure for a status read timeout', async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({ error: 'Orchestrator did not respond in time' }, 504),
+    );
+
+    // breaks-if-wrong: a status read mints no run
+    await expect(client.runStatus('org_a', 'run-1')).rejects.toThrow(
+      'Request failed with status 504: Orchestrator did not respond in time',
+    );
+  });
+
   it('runStatus GETs the run snapshot', async () => {
     fetchMock.mockResolvedValue(
       jsonResponse({ runId: 'run-1', status: 'running', jobs: [], done: false }),

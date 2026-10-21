@@ -53,6 +53,7 @@ import {
   artifactInvalidNameError,
 } from '../artifacts/failure-messages.js';
 import {
+  AgentApiRefusalError,
   AgentApiRegistry,
   ApiRoleDeniedError,
   UnknownApiMethodError,
@@ -272,7 +273,10 @@ describe('createAgentWsHandler', () => {
         ws as any,
       );
 
-      expect(onScalerAgentRegistered).toHaveBeenCalledWith('agent-1', ['linux', 'docker']);
+      expect(onScalerAgentRegistered).toHaveBeenCalledWith('agent-1', ['linux', 'docker'], {
+        compileSchemaVersion: undefined,
+        version: undefined,
+      });
     });
 
     it('a scaler-supplied gate reaches the entry folded and gates on a lowercase runsOn', async () => {
@@ -1532,11 +1536,21 @@ describe('createAgentWsHandler', () => {
 
       handler.onOpen!(new Event('open'), ws as any);
       await handler.onMessage!(
-        makeMessageEvent(registerMsg({ agentId: 'scaler-agent-1', labels: ['linux', 'docker'] })),
+        makeMessageEvent({
+          ...registerMsg({ agentId: 'scaler-agent-1', labels: ['linux', 'docker'] }),
+          version: '0.24.0',
+          compileSchemaVersion: 7,
+        }),
         ws as any,
       );
 
-      expect(onScalerAgentRegistered).toHaveBeenCalledWith('scaler-agent-1', ['linux', 'docker']);
+      // fails-when: the handler drops what the agent reported about its build — the
+      // scaler then never learns a label set's compile schema
+      expect(onScalerAgentRegistered).toHaveBeenCalledWith('scaler-agent-1', ['linux', 'docker'], {
+        compileSchemaVersion: 7,
+        version: '0.24.0',
+      });
+      expect(registry.get('scaler-agent-1')?.compileSchemaVersion).toBe(7);
     });
 
     it('calls onScalerAgentDisconnected on disconnect', async () => {
@@ -4212,6 +4226,19 @@ describe('createAgentWsHandler', () => {
       });
       const response = await apiRequest(registry, 'infra.list');
       expect(response).toMatchObject({ error: AgentWsInternalFailure.agentApiFailed });
+    });
+
+    it('forwards an AgentApiRefusalError verbatim', async () => {
+      // fails-when: the deliberate check omits the refusal class, so the job
+      // sees the fixed internal error instead of the refusal.
+      const registry = new AgentApiRegistry();
+      registry.register('git.credential', 'read', async () => {
+        throw new AgentApiRefusalError("Refusing a git credential for 'a/b': not declared");
+      });
+      const response = await apiRequest(registry, 'git.credential');
+      expect(response).toMatchObject({
+        error: "Refusing a git credential for 'a/b': not declared",
+      });
     });
 
     it('both registry rejection classes construct as Errors', () => {

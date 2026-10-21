@@ -146,6 +146,20 @@ export async function agentImageLabels(
 }
 
 /**
+ * The agent image's ID, or `null` when the image is absent or the inspect fails.
+ * Identifies the exact agent build a scaler label set starts, so knowledge learnt
+ * from one of its agents holds only while the ID is unchanged.
+ */
+export async function agentImageId(docker: Docker, agentImage: string): Promise<string | null> {
+  try {
+    const info = (await docker.getImage(agentImage).inspect()) as { Id?: unknown };
+    return typeof info.Id === 'string' && info.Id.length > 0 ? info.Id : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Command that starts the agent from the INJECTED runtime, under `init` (from
  * {@link runtimeInitCommand}) when the agent image ships one.
  *

@@ -306,6 +306,30 @@ Check the database: its health, free disk, and the orchestrator's connection poo
 
 Fix the database condition. No orchestrator restart is needed: a job that went back to the queue is offered to a free agent again within about 10 seconds. Re-run a job that failed with `dispatch never acknowledged`.
 
+## A rerun or "Run now" reports that the run start was not confirmed
+
+### Symptom
+
+`kici runs rerun` says `Could not confirm that the rerun of <run-id> started`, or the dashboard shows "Run not confirmed". The API answers HTTP 504 with `error: run_start_unconfirmed`. An MCP `rerun_run` or `trigger_run` call fails with a message that says the run may still start.
+
+### Cause
+
+The Platform relays the request to the orchestrator and waits ten seconds for its answer. The orchestrator answers once it has checked the request and accepted it, before it dispatches the run. This error means that answer did not arrive in time: the orchestrator was slow to accept, or the answer was lost. The orchestrator may have accepted the request, so the run may still start.
+
+### Diagnose
+
+Look for the run before you retry. A rerun records the trigger `rerun`:
+
+    kici runs list --trigger rerun --since <time of the request>
+
+If the run is there, follow it with `kici runs show <run-id>`. A run that could not start after the orchestrator accepted it fails with a reason such as `Re-run could not be dispatched: <error>`. The orchestrator log shows `Dispatch failed after the request was answered` for it:
+
+    kici-admin orchestrator logs --name <service-name> --no-follow
+
+### Fix
+
+If no run appeared, retry the request. A retry of a rerun or a "Run now" within 30 minutes sends the first request again, when the same user or API key sends it. So it cannot start a second run. It returns the run that the first request started, if there is one. A new `kici run --remote` is always a new run. If the error repeats, the orchestrator is slow to answer requests: check its database and its connection to the Platform, as in [Database errors while the orchestrator handles a message](#database-errors-while-the-orchestrator-handles-a-message).
+
 ## Lock-file drift at the orchestrator
 
 ### Symptom

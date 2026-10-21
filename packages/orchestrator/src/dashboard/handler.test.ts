@@ -1861,6 +1861,24 @@ describe('DashboardHandler', () => {
       expect(response.requestId).toBe('req-r1');
       expect(response.newRunId).toBe('new-run-abc');
       expect(response.error).toBeUndefined();
+      // An answer without the flag must not invent one.
+      expect(response).not.toHaveProperty('alreadyAccepted');
+    });
+
+    it('forwards alreadyAccepted when an earlier delivery started the run', async () => {
+      const onRerun = vi.fn().mockResolvedValue({ newRunId: 'run-a', alreadyAccepted: true });
+      const { handler, send } = makeHandler({ onRerun });
+
+      await handler.handleRerunRequest({
+        type: 'run.rerun.request',
+        routingKey: 'github:1',
+        requestId: 'req-r2',
+        actor: { type: 'user', sub: 'user@test.com' },
+        runId: 'original-run-123',
+      });
+
+      const response = send.mock.calls[0][0];
+      expect(response).toMatchObject({ newRunId: 'run-a', alreadyAccepted: true });
     });
 
     it('returns error message from onRerun failure', async () => {
@@ -2211,6 +2229,24 @@ describe('DashboardHandler', () => {
       expect(response.requestId).toBe('req-ms1');
       expect(response.newRunId).toBe('new-run-sched');
       expect(response.error).toBeUndefined();
+      expect(response).not.toHaveProperty('alreadyAccepted');
+    });
+
+    it('forwards alreadyAccepted when an earlier delivery started the run', async () => {
+      const onManualSchedule = vi
+        .fn()
+        .mockResolvedValue({ newRunId: 'run-s', alreadyAccepted: true });
+      const { handler, send } = makeHandler({ onManualSchedule });
+
+      await handler.handleManualScheduleRequest({
+        type: 'run.manual_schedule.request',
+        requestId: 'req-ms2',
+        actor: { type: 'user', sub: 'user@test.com' },
+        registrationId: 'reg-abc',
+      });
+
+      const response = send.mock.calls[0][0];
+      expect(response).toMatchObject({ newRunId: 'run-s', alreadyAccepted: true });
     });
 
     it('returns error message from onManualSchedule failure', async () => {

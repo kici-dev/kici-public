@@ -1852,6 +1852,7 @@ async function loadWorkflowModuleWithCapture(
       sourceFile,
       request.contentHash,
       request.resolvedHashFiles,
+      request.lockOrigin,
     );
     sendMessage({
       type: 'log.line',

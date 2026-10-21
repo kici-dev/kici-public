@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFile, execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createServer, type AddressInfo } from 'node:net';
 import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -344,6 +344,20 @@ describe('resolveHostNpm — the npm the lookup trusts', () => {
         distributionCliPaths: [debian],
       }),
     ).toBeNull();
+  });
+});
+
+describe('PINNED_PNPM_VERSION', () => {
+  it('names the pnpm every corepack step of the agent image bakes', () => {
+    const dockerfile = readFileSync(join(import.meta.dirname, '..', '..', 'Dockerfile'), 'utf8');
+    const prepared = [...dockerfile.matchAll(/corepack prepare pnpm@(\S+)/g)].map((m) => m[1]);
+    const checked = [...dockerfile.matchAll(/v1\/pnpm\/([^/\s]+)\/bin\/pnpm\.cjs/g)].map(
+      (m) => m[1],
+    );
+    // fails-when: a Dockerfile bump leaves the constant behind, so the image's agent finds no pnpm.
+    expect(prepared.length).toBeGreaterThanOrEqual(2);
+    expect(checked.length).toBeGreaterThanOrEqual(1);
+    expect(new Set([...prepared, ...checked])).toEqual(new Set([PINNED_PNPM_VERSION]));
   });
 });
 

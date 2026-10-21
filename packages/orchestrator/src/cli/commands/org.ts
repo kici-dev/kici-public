@@ -10,6 +10,7 @@ import type { Command } from 'commander';
 import { toErrorMessage } from '@kici-dev/shared';
 import type { AdminApiClient } from '../api-client.js';
 import {
+  foreignSourceOrgs,
   listHeldOrgIds,
   ORG_LIST_PATH,
   PlatformAttachment,
@@ -24,6 +25,7 @@ import {
 } from './shared/cli-action.js';
 import { renderTable } from './shared/table.js';
 import { withDb } from './shared/db.js';
+import { orgSplitNote } from './shared/org-split.js';
 
 const OFFLINE_NOTE =
   'Note: read from the database (--database-url or KICI_DATABASE_URL), so the live Platform ' +
@@ -32,7 +34,8 @@ const OFFLINE_NOTE =
 const PENDING_NOTE =
   'Note: the orchestrator has not authenticated with the Platform yet, so its Platform org is not listed.\n';
 
-/** Adds a note when the listing lacks the Platform attachment. */
+/** Adds a note when the listing lacks the Platform attachment, or when a source
+ *  belongs to an org other than the attached one. */
 function printOrgList(result: OrgListResponse): void {
   if (result.orgs.length === 0) {
     console.log('No org ids found.');
@@ -48,6 +51,8 @@ function printOrgList(result: OrgListResponse): void {
   else if (result.platformAttachment === PlatformAttachment.enum.pending) {
     process.stderr.write(PENDING_NOTE);
   }
+  const foreign = foreignSourceOrgs(result);
+  if (foreign.length > 0) process.stderr.write(`${orgSplitNote(result.attachedOrgId!, foreign)}\n`);
 }
 
 async function listOverHttp(client: AdminApiClient): Promise<OrgListResponse> {

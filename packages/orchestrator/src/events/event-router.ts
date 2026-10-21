@@ -1,7 +1,7 @@
 import type pg from 'pg';
 import { sql, type Kysely, type Transaction } from 'kysely';
 import type { Database } from '../db/types.js';
-import { createLogger, toErrorMessage } from '@kici-dev/shared';
+import { COMPILE_SCHEMA_VERSION, createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { LockFile, SimulatedEvent, WorkflowDecision } from '@kici-dev/engine';
 import {
   KICI_EVENT_NAME_PREFIX,
@@ -15,6 +15,7 @@ import type { EventStore } from './event-store.js';
 import type { EventCircuitBreaker } from './circuit-breaker.js';
 import type { TrustStore } from './trust-store.js';
 import type { RegisteredWorkflow, RegistrationIndex } from '../registration/registration-index.js';
+import { warnStaleCompileSchemas } from '../registration/compile-schema-staleness.js';
 import {
   EventMatchOutcome,
   type EventMatchResult,
@@ -216,6 +217,18 @@ export class EventRouter {
     logger.info('Registration index loaded on startup', {
       version: this.registrationIndex.getVersion(),
     });
+    // After an upgrade that changes the compile schema, every run of a stale lock
+    // fails on this release's agents: name each one at startup.
+    const stale = warnStaleCompileSchemas(
+      logger,
+      this.registrationIndex.getAll().filter((r) => !r.disabled),
+    );
+    if (stale.length > 0) {
+      logger.warn('Registered workflow locks with a stale compile schema found at startup', {
+        count: stale.length,
+        agentSchema: COMPILE_SCHEMA_VERSION,
+      });
+    }
 
     this.listener = new NotifyListener({
       pool: this.pool,

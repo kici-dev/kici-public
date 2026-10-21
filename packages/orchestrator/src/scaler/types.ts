@@ -241,6 +241,14 @@ export interface ScalerBackend {
    */
   readonly spawnsOnLocalHost: boolean;
 
+  /**
+   * Identity of the agent build a spawn of `labelSet` would start (an image ID,
+   * a binary's file identity), or `null` when unknown. The manager trusts the
+   * compile schema a spawned agent reported only while this value is unchanged.
+   * Absent on backends that cannot tell.
+   */
+  spawnSourceFingerprint?(labelSet: string[]): Promise<string | null>;
+
   /** Includes agents still spawning. */
   getActiveCount(): number;
 

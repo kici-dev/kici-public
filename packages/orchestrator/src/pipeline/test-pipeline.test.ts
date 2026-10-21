@@ -1093,7 +1093,10 @@ describe('processTestTrigger', () => {
     });
 
     /** matchContext mock keyed by name → allowLocalExecution (missing name => null). */
-    function multiEnvStore(byName: Record<string, boolean>) {
+    function multiEnvStore(
+      byName: Record<string, boolean>,
+      otherOrgsByName: Record<string, string[]> = {},
+    ) {
       return {
         matchContext: vi.fn(async (_org: string, n: string) =>
           n in byName
@@ -1121,6 +1124,7 @@ describe('processTestTrigger', () => {
               }
             : null,
         ),
+        orgsMatchingContext: vi.fn(async (n: string) => otherOrgsByName[n] ?? []),
       } as any;
     }
 

@@ -4,6 +4,7 @@ import { logger, toErrorMessage } from '@kici-dev/core';
 import { isRunId } from '@kici-dev/engine';
 import {
   ExecutionJobStatus,
+  ExecutionRunStatus,
   ExecutionStepStatus,
   toCanonicalStatus,
   type RunListItem,
@@ -66,6 +67,7 @@ export async function runsShowCommand(
     }
     printHeader(run);
     printInitFailure(detail.initFailure);
+    printRunFailure(run, detail.initFailure);
     printJobs(detail.jobs, runWorkflows(run).length > 1);
     printHolds(holds);
     return true;
@@ -140,6 +142,15 @@ function printInitFailure(initFailure: InitFailure | undefined): void {
   if (!initFailure) return;
   console.log(`\n  ${pc.yellow('Init failure')} ${pc.gray(`(${initFailure.category})`)}`);
   console.log(`    ${initFailure.message}`);
+}
+
+/**
+ * Why a failed run failed, when no init failure says it: a dispatch that failed
+ * as a whole records only a reason on the run.
+ */
+function printRunFailure(run: RunListItem, initFailure: InitFailure | undefined): void {
+  if (initFailure || run.status !== ExecutionRunStatus.enum.failed || !run.failureReason) return;
+  console.log(`\n  ${pc.red('Failure:')} ${run.failureReason}`);
 }
 
 function printJobs(jobs: DashboardJobDetail[], spansWorkflows: boolean): void {

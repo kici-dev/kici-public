@@ -323,6 +323,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
         'workflow_repo_identifier',
         'workflow_sha',
         'workflow_branch',
+        'customer_id',
       ])
       .where('run_id', '=', runId)
       .executeTakeFirst();
@@ -367,6 +368,8 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
           workflowRepoIdentifier: run.workflow_repo_identifier,
           workflowSha: run.workflow_sha,
           workflowBranch: run.workflow_branch,
+          // The org whose contexts, secrets and trust policy the run uses.
+          orgId: run.customer_id,
         },
       },
       200,
@@ -407,6 +410,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
         'routing_reason',
         'runs_on_labels',
         'created_at',
+        'env_warning',
       ])
       .where('run_id', '=', runId)
       .orderBy('created_at', 'asc')
@@ -486,6 +490,7 @@ export function createAdminRunRoutes(deps: AdminRunRoutesDeps): Hono<AdminEnv> {
             runsOnLabels: job.runs_on_labels ?? null,
             createdAt: job.created_at.toISOString(),
             needs: needsByJob.get(job.job_name) ?? null,
+            envWarning: job.env_warning ?? null,
           };
           if (includeSteps) {
             entry.steps = stepsByJob.get(job.job_id) ?? [];

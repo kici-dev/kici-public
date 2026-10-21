@@ -6,8 +6,9 @@
  * re-run, so the paths cannot disagree about how a run's inputs are read back.
  */
 import type { SimulatedEvent } from '@kici-dev/engine';
-import { createLogger } from '@kici-dev/shared';
+import { createLogger, toErrorMessage } from '@kici-dev/shared';
 import type { TrustResolution } from '../security/trust-resolver.js';
+import type { RerunLineage } from '../reporting/execution-tracker.js';
 import { evaluateSecurityPolicy, isPullRequestEvent } from './process-webhook.js';
 import type { ProcessingDeps } from './processor.js';
 import { claimRequestId } from './request-idempotency.js';
@@ -235,8 +236,9 @@ export async function rerunSecurityDecision(args: {
 }
 
 /**
- * Claim a re-run's Platform-minted request id. A failover re-send finds it
- * claimed by a sibling and answers with that sibling's run.
+ * Claim a re-run's Platform-minted request id. A failover re-send or a
+ * Platform retry finds it claimed by an earlier delivery and answers with that
+ * delivery's run.
  */
 export async function claimRerunRequest(
   deps: Pick<RerunDeps, 'db'>,
@@ -245,7 +247,7 @@ export async function claimRerunRequest(
 ): Promise<{ newRunId: string; claimed: boolean }> {
   const claim = await claimRequestId(deps.db, requestId);
   if (!claim.claimed) {
-    logger.info('Rerun requestId already claimed by a sibling; returning existing run', {
+    logger.info('Rerun requestId already accepted by an earlier delivery; returning existing run', {
       originalRunId,
       requestId,
       newRunId: claim.newRunId,
@@ -254,7 +256,11 @@ export async function claimRerunRequest(
   return claim;
 }
 
-/** Emit the `workflow.rerun` system event for a re-run that dispatched. */
+/**
+ * Emit the `workflow.rerun` system event for a re-run that dispatched. A
+ * failed emit is logged, never thrown: the re-run is already running, and a
+ * throw here would be recorded as a failed dispatch over a live run.
+ */
 export async function emitWorkflowRerun(
   deps: Pick<RerunDeps, 'eventRouter'>,
   args: {
@@ -265,17 +271,65 @@ export async function emitWorkflowRerun(
   },
 ): Promise<void> {
   const { originalRun } = args;
-  await deps.eventRouter?.emit({
-    eventName: 'workflow.rerun',
-    payload: {
-      parentRunId: originalRun.run_id,
+  try {
+    await deps.eventRouter?.emit({
+      eventName: 'workflow.rerun',
+      payload: {
+        parentRunId: originalRun.run_id,
+        newRunId: args.newRunId,
+        workflowName: args.workflowName,
+        repo: originalRun.repo_identifier,
+        sha: originalRun.sha,
+        triggeredBy: args.triggeredBy,
+      },
+      sourceRepo: originalRun.repo_identifier,
+      sourceRoutingKey: originalRun.routing_key ?? undefined,
+    });
+  } catch (err) {
+    logger.error('Could not emit workflow.rerun for a dispatched re-run', {
+      originalRunId: originalRun.run_id,
       newRunId: args.newRunId,
-      workflowName: args.workflowName,
-      repo: originalRun.repo_identifier,
-      sha: originalRun.sha,
-      triggeredBy: args.triggeredBy,
-    },
-    sourceRepo: originalRun.repo_identifier,
-    sourceRoutingKey: originalRun.routing_key ?? undefined,
+      error: toErrorMessage(err),
+    });
+  }
+}
+
+/**
+ * Fail an accepted re-run whose dispatch threw after the requester got its run
+ * id. The row carries the original run's identity, so the run list shows the
+ * failed re-run where the requester looks for it.
+ */
+export async function recordRerunDispatchFailure(
+  deps: Pick<RerunDeps, 'executionTracker' | 'providerRegistry'>,
+  args: {
+    originalRun: OriginalRunRow;
+    newRunId: string;
+    reason: string;
+    /** The repository that defines the workflow the re-run dispatched. */
+    workflowRepoIdentifier: string;
+    triggeredBy: string | null;
+    triggeredByAgentLabel: string | null;
+    rerunLineage: RerunLineage;
+  },
+): Promise<void> {
+  const { originalRun } = args;
+  const binding = resolveRerunProviderBinding(originalRun, deps);
+  await deps.executionTracker.recordAcceptedDispatchFailure({
+    runId: args.newRunId,
+    workflowName: originalRun.workflow_name,
+    provider: originalRun.provider,
+    repoIdentifier: originalRun.repo_identifier,
+    workflowRepoIdentifier: args.workflowRepoIdentifier,
+    ref: originalRun.ref,
+    sha: originalRun.sha,
+    deliveryId: `rerun:${args.newRunId}`,
+    providerContext: binding.providerContext,
+    routingKey: binding.routingKey,
+    failureReason: args.reason,
+    triggerEvent: 'rerun',
+    triggeredBy: args.triggeredBy,
+    triggeredByAgentLabel: args.triggeredByAgentLabel,
+    rerunLineage: args.rerunLineage,
+    chainDepth: originalRun.chain_depth,
   });
 }

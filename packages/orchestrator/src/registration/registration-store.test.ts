@@ -49,6 +49,7 @@ function makeRegistrationRow(
     lock_entry: JSON.stringify(makeLockWorkflow('on-deploy')),
     trigger_types: ['kici_event'],
     routing_key: 'github:42',
+    customer_id: 'cust-1',
     provider_context: JSON.stringify({}),
     disabled: false,
     commit_sha: null,
@@ -571,7 +572,7 @@ describe('RegistrationStore', () => {
       const healContext = healLogs[0][1] as Record<string, unknown>;
       expect(healContext.routingKey).toBe('github:42');
       expect(healContext.repoIdentifier).toBe('owner/repo');
-      expect(healContext.oldCustomerId).toBe('__default__');
+      expect(healContext.oldCustomerIds).toEqual(['__default__']);
       expect(healContext.newCustomerId).toBe('acmeOrg00001');
       expect(healContext.rowsHealed).toBe(2);
 
@@ -586,7 +587,7 @@ describe('RegistrationStore', () => {
       expect(healSetCalls.length).toBe(1);
 
       // The heal where clauses narrow to (routing_key, repo_identifier,
-      // customer_id='__default__'). Check each filter was applied.
+      // customer_id <> the incoming org). Check each filter was applied.
       const whereCalls = mocks.trxUpdateWhere.mock.calls as unknown[][];
       const routingKeyHeal = whereCalls.filter(
         (c) => c[0] === 'routing_key' && c[2] === 'github:42',
@@ -595,7 +596,7 @@ describe('RegistrationStore', () => {
         (c) => c[0] === 'repo_identifier' && c[2] === 'owner/repo',
       );
       const defaultHeal = whereCalls.filter(
-        (c) => c[0] === 'customer_id' && c[2] === '__default__',
+        (c) => c[0] === 'customer_id' && c[1] === '<>' && c[2] === 'acmeOrg00001',
       );
       expect(routingKeyHeal.length).toBeGreaterThanOrEqual(1);
       expect(repoHeal.length).toBeGreaterThanOrEqual(1);
@@ -645,6 +646,63 @@ describe('RegistrationStore', () => {
 
       // Normal upsert proceeds (wf-1 already exists → UPDATE, not INSERT).
       expect(mocks.trxUpdateTable).toHaveBeenCalledWith('workflow_registrations');
+    });
+
+    it('re-homes a row from another real org to the incoming org', async () => {
+      // fails-when: the heal filter only matches __default__ rows.
+      const moved = makeRegistrationRow({
+        id: 'uuid-other-1',
+        workflow_name: 'wf-1',
+        routing_key: 'github:42',
+        repo_identifier: 'owner/repo',
+        customer_id: 'org_old',
+      });
+      const { db, mocks } = createMockDb({ trxSelectResult: [moved] });
+      const store = new RegistrationStore(db);
+
+      await store.replaceAll(
+        'owner/repo',
+        [makeLockWorkflow('wf-1')],
+        'github:42',
+        {},
+        { customerId: 'org_new' },
+      );
+
+      const setCalls = mocks.trxUpdateSet.mock.calls as unknown[][];
+      expect(
+        setCalls.filter((c) => (c[0] as Record<string, unknown>).customer_id === 'org_new'),
+      ).toHaveLength(1);
+      const healLog = mockLogger.info.mock.calls.find(
+        (c: unknown[]) => c[0] === 'Registration self-heal: rewrote stale customer_id',
+      );
+      expect((healLog?.[1] as Record<string, unknown>).oldCustomerIds).toEqual(['org_old']);
+    });
+
+    it('does not re-home toward __default__', async () => {
+      // breaks-if-wrong: resolveOrgId falls back to __default__ on a lookup
+      // failure; real rows must stay in their org.
+      const real = makeRegistrationRow({
+        id: 'uuid-real-1',
+        workflow_name: 'wf-1',
+        routing_key: 'github:42',
+        repo_identifier: 'owner/repo',
+        customer_id: 'org_A',
+      });
+      const { db, mocks } = createMockDb({ trxSelectResult: [real] });
+      const store = new RegistrationStore(db);
+
+      await store.replaceAll(
+        'owner/repo',
+        [makeLockWorkflow('wf-1')],
+        'github:42',
+        {},
+        { customerId: '__default__' },
+      );
+
+      const setCalls = mocks.trxUpdateSet.mock.calls as unknown[][];
+      expect(
+        setCalls.filter((c) => (c[0] as Record<string, unknown>).customer_id !== undefined),
+      ).toHaveLength(0);
     });
 
     it('Test 4: concurrent replaceAll() under serializable — no double-heal, second call sees already-healed rows and does not re-heal or re-log', async () => {

@@ -160,6 +160,8 @@ job({
 
 `ensureInitRunner` is a **no-op** when the target already has a live agent — re-running a bootstrap workflow against an initialized box does nothing. When the target is fresh, it mints a **single-use, short-TTL bootstrap token** (≈10 min, labels `kici:init` + `kici:privileged:root` + `kici:host:<id>`), drops + starts the agent binary on the target over SSH (ephemeral SSH agent, key never written to disk), and the existing auto-register flow enrolls it as a temporary `kici:init`-labeled ephemeral host. The init-runner dies on reboot and the reaper GCs its ephemeral roster row.
 
+The bring-up makes up to three attempts for each SSH connection that times out before the session starts (in the TCP connect or the SSH banner exchange). A busy target, for example a small board that unpacks the agent payload, can miss the deadline on one connection and answer the next. A remote command that ran and failed is never run again.
+
 Every bring-up writes an [access-log](../../operator/security/audit-log.md) row (actor = the ops agent, target = the fresh host), and a bring-up attempt by an agent lacking the capability is logged as `denied`.
 
 ### Payload delivery

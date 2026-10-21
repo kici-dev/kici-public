@@ -6,7 +6,7 @@
 import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import path from 'node:path';
-import { sql } from 'kysely';
+import { moveSourceToOrg } from '../../sources/source-org.js';
 import { Option, type Command } from 'commander';
 import { DEFAULT_ADMIN_URL } from '../api-client.js';
 import type { AdminApiClient, GenericSourceResponse } from '../api-client.js';
@@ -25,6 +25,8 @@ import { renderPostReceiveHook, installPostReceiveHook } from './local-hook.js';
 import { webhookNoteReason, webhookNoteHint } from '../webhook-url-notes.js';
 import { runGithubManifestSetup } from './source-manifest.js';
 import { confirmPrompt } from './shared/confirm.js';
+import { orgSplitNote } from './shared/org-split.js';
+import type { PlatformAttachment } from '../../db/repos/org-ids-repo.js';
 import {
   cliAction,
   resolveDirectDbUrl,
@@ -82,8 +84,9 @@ async function listGithubSourcesDirect(dbUrl: string): Promise<GithubSourceRow[]
   }
 }
 
-/** Direct customer_id update on the GitHub `sources` table. The column is
- *  secret-free, so this skips PgSecretStore and the master key the offline CLI lacks. */
+/** Direct customer_id update on the GitHub `sources` table, moving the source's
+ *  registrations with it. Both are secret-free, so this skips PgSecretStore and the
+ *  master key the offline CLI lacks. */
 async function updateGithubCustomerIdDirect(
   dbUrl: string,
   routingKey: string,
@@ -91,13 +94,7 @@ async function updateGithubCustomerIdDirect(
 ): Promise<void> {
   const pool = createPool(dbUrl);
   try {
-    const db = createDb(pool);
-    const res = await db
-      .updateTable('sources')
-      .set({ customer_id: customerId, updated_at: sql`now()` })
-      .where('routing_key', '=', routingKey)
-      .executeTakeFirst();
-    if (Number(res.numUpdatedRows ?? 0n) === 0) {
+    if (!(await moveSourceToOrg(createDb(pool), routingKey, customerId))) {
       throw new Error(`No GitHub source with routing key ${routingKey}`);
     }
   } finally {
@@ -115,22 +112,26 @@ interface ListableGenericRow {
 }
 
 /** Render `source list` text for both transports. Generic sources list only with
- *  `--org` (`hasOrg`); a direct DB read (`opts.directDb`) has no ingress URLs. */
+ *  `--org` (`hasOrg`); a direct DB read (`opts.directDb`) has no ingress URLs and no
+ *  Platform attachment. With an attached org, a GitHub source in another org gets a
+ *  note on stderr. */
 export function renderSourceListText(
   githubSources: Array<{
     routingKey: string;
     name: string;
     provider: string;
     ingressUrl?: string | null;
+    customerId?: string | null;
   }>,
   genericSources: ListableGenericRow[],
   hasOrg: boolean,
-  opts: { directDb: boolean },
+  opts: { directDb: boolean; attachedOrgId?: string | null },
 ): void {
   if (githubSources.length > 0) {
     console.log('GitHub sources:');
     for (const s of githubSources) {
-      console.log(`  ${s.routingKey.padEnd(20)} ${s.name.padEnd(30)} (${s.provider})`);
+      const org = s.customerId ? `  org: ${s.customerId}` : '';
+      console.log(`  ${s.routingKey.padEnd(20)} ${s.name.padEnd(30)} (${s.provider})${org}`);
       if (s.ingressUrl) console.log(`    ingress: ${s.ingressUrl}`);
     }
     if (opts.directDb) {
@@ -138,6 +139,17 @@ export function renderSourceListText(
         '  (ingress URLs need the running orchestrator: run without --database-url to see them)',
       );
     }
+    const attached = opts.attachedOrgId;
+    const foreign = attached
+      ? [
+          ...new Set(
+            githubSources.flatMap((s) =>
+              s.customerId && s.customerId !== attached ? [s.customerId] : [],
+            ),
+          ),
+        ].sort()
+      : [];
+    if (attached && foreign.length > 0) console.error(orgSplitNote(attached, foreign));
   }
 
   if (hasOrg) {
@@ -551,6 +563,11 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
         'URL the orchestrator resolves for its mode. KiCI adds no ingress at this URL — your own ' +
         'infra owns delivery.',
     )
+    .option(
+      '--org <orgId>',
+      'Org the source belongs to (default: the org this orchestrator is attached to; ' +
+        'kici-admin org list prints the org ids)',
+    )
     .option('--json', 'Emit raw JSON (the API response) instead of formatted text')
     .action(async (opts) => {
       // Manifest setup creates the App; the manual path only stores existing credentials.
@@ -562,6 +579,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
               noBrowser: !opts.browser,
               githubOrg: opts.githubOrg,
               webhookUrl: opts.webhookUrl,
+              ...(opts.org && { customerId: opts.org }),
             },
             getClient(),
           );
@@ -600,12 +618,14 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           name: string;
           webhookUrl: string | null;
           webhookNote?: string;
+          customerId?: string;
         }>('/api/v1/admin/sources', {
           provider: 'github',
           name: opts.name,
           appId: opts.appId,
           privateKey,
           webhookSecret,
+          ...(opts.org && { customerId: opts.org }),
         });
         if (opts.json) {
           console.log(JSON.stringify(result, null, 2));
@@ -618,6 +638,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
             console.log(`Webhook URL:  (unavailable — ${webhookNoteReason(result.webhookNote)})`);
             console.log(`  ↳ ${webhookNoteHint(result.webhookNote)}`);
           }
+          if (result.customerId) console.log(`Org:          ${result.customerId}`);
         }
       } catch (err) {
         console.error(`Error: ${toErrorMessage(err)}`);
@@ -880,7 +901,13 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           return;
         }
 
-        const { sources: githubSources } = await getClient().get<{
+        const {
+          sources: githubSources,
+          platformAttachment,
+          attachedOrgId,
+        } = await getClient().get<{
+          platformAttachment?: PlatformAttachment;
+          attachedOrgId?: string | null;
           sources: Array<{
             id: string;
             routingKey: string;
@@ -906,6 +933,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
               {
                 github: githubSources,
                 generic: genericSources,
+                ...(platformAttachment && { platformAttachment, attachedOrgId }),
               },
               null,
               2,
@@ -916,6 +944,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
 
         renderSourceListText(githubSources, genericSources, Boolean(opts.org), {
           directDb: false,
+          attachedOrgId,
         });
       }),
     );
@@ -966,7 +995,11 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     .option('--webhook-secret <secret>', 'New webhook secret')
     .option('--from-env <varName>', 'Read new private key from environment variable')
     .option('--stdin', 'Read new private key from stdin')
-    .option('--org <orgId>', 'Update the org ID used for secret and environment scoping')
+    .option(
+      '--org <orgId>',
+      "Move the source and its workflow registrations to this org (its runs use that org's " +
+        'contexts, secrets and trust policy)',
+    )
     .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .action(
       cliAction(async (routingKey: string, opts) => {
@@ -1001,11 +1034,12 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
         if (opts.webhookSecret) body.webhookSecret = opts.webhookSecret;
         if (opts.org) body.customerId = opts.org;
 
-        const result = await getClient().patch<{ routingKey: string }>(
+        const result = await getClient().patch<{ routingKey: string; warning?: string }>(
           `/api/v1/admin/sources/${encodeURIComponent(routingKey)}`,
           body,
         );
         console.log(`Source updated: ${result.routingKey}`);
+        if (result.warning) console.error(`Warning: ${result.warning}`);
       }),
     );
 

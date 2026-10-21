@@ -29,6 +29,7 @@ import { ORCHESTRATOR_DEFAULT_PORT } from '@kici-dev/shared/env';
 import { DB_POOL_ACQUIRE_TIMEOUT_DEFAULT_MS } from '../../../config.js';
 import type { OrchestratorLivenessInfo } from '../../../routes/health.js';
 import {
+  foreignSourceOrgs,
   ORG_LIST_PATH,
   PlatformAttachment,
   type OrgListResponse,
@@ -117,7 +118,12 @@ function formatAgentBinaryLine(agent: AgentBinary): string {
 }
 
 type StatusOrg =
-  | { platformAttachment: PlatformAttachment; attachedOrgId: string | null }
+  | {
+      platformAttachment: PlatformAttachment;
+      attachedOrgId: string | null;
+      /** Orgs other than the attached one that hold a source; see {@link foreignSourceOrgs}. */
+      foreignSourceOrgs: string[];
+    }
   | { platformAttachment: 'unknown'; reason: string };
 
 /** Needs an admin token: the org is never read from the unauthenticated `/health`. */
@@ -150,7 +156,23 @@ async function readStatusOrg(
   if (!platformAttachment) {
     return { platformAttachment: 'unknown', reason: 'the admin API did not report an attachment' };
   }
-  return { platformAttachment, attachedOrgId: attachedOrgId ?? null };
+  return {
+    platformAttachment,
+    attachedOrgId: attachedOrgId ?? null,
+    foreignSourceOrgs: foreignSourceOrgs(result.body),
+  };
+}
+
+/** The `Other orgs` row, printed only when a source sits outside the attached org. */
+function formatSourceOrgsRow(org: StatusOrg): StatusRow | null {
+  if (!('foreignSourceOrgs' in org) || org.foreignSourceOrgs.length === 0) return null;
+  const one = org.foreignSourceOrgs.length === 1;
+  return [
+    'Other orgs',
+    `${org.foreignSourceOrgs.join(', ')} also ${one ? 'holds' : 'hold'} sources; their runs ` +
+      `use ${one ? "that org's" : "those orgs'"} contexts, secrets and trust policy ` +
+      '(kici-admin source list)',
+  ];
 }
 
 function formatOrgRow(org: StatusOrg): StatusRow {
@@ -203,7 +225,11 @@ function formatStatus(
       'Ready',
       readiness ? formatReadiness(readiness) : 'unknown (/ready did not answer)',
     ]);
-    if (org) rows.push(formatOrgRow(org));
+    if (org) {
+      rows.push(formatOrgRow(org));
+      const sourceOrgs = formatSourceOrgsRow(org);
+      if (sourceOrgs) rows.push(sourceOrgs);
+    }
     rows.push(...buildInfoRows(health));
     lines.push(...formatHealthSection('--- KiCI orchestrator ---', rows, VALUE_COLUMN));
   } else if (serviceStatus.state === 'running') {

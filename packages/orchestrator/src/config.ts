@@ -1232,6 +1232,8 @@ const TEST_ONLY_ENV_VARS = [
   'KICI_TEST_MINT_DEFER_AUDIENCE',
   'KICI_TEST_MINT_REJECT_AUDIENCE',
   'KICI_TEST_RERUN_DELAY_MS',
+  'KICI_TEST_RERUN_DELAY_ONCE_MS',
+  'KICI_TEST_ACCEPTED_DISPATCH_DELAY_MS',
   'KICI_TEST_ADMIN_DATABASE_URL', // admin DB URL that gates real-Postgres repo tests (vitest harness)
   'KICI_SKIP_S3_SENTINEL_VALIDATION', // split-brain sentinel fault-injection (test double only)
   'KICI_SKIP_DB_TESTS', // opt-out that stops the vitest harness starting a throwaway Postgres

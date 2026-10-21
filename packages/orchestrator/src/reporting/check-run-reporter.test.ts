@@ -2513,3 +2513,85 @@ describe('completing the check runs of a workflow that never dispatched', () => 
     );
   });
 });
+
+describe('a re-run on the same commit', () => {
+  const OWNER = 'acme';
+  const REPO = 'app';
+  const SHA = 'cafebabe';
+  const WORKFLOW = 'CI';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    checkRunIdCounter = 3000;
+  });
+
+  const base = {
+    provider: 'github',
+    owner: OWNER,
+    repo: REPO,
+    sha: SHA,
+    workflowName: WORKFLOW,
+    installationId: 42,
+    routingKey: ROUTING_KEY,
+  };
+
+  async function seed(reporter: CheckRunReporter, runId: string): Promise<void> {
+    await reporter.setPendingAwait({ ...base, jobNames: ['build'], runId });
+  }
+
+  async function completeUndispatched(reporter: CheckRunReporter, runId: string): Promise<void> {
+    await reporter.completeUndispatchedCheckRuns({
+      ...base,
+      jobNames: ['build'],
+      runId,
+      conclusion: CheckRunConclusion.enum.failure,
+      summary: 'The workflow build did not complete, so no job started.',
+    });
+  }
+
+  // fails-when: the original run's terminal latch survives the re-run's new check runs, so
+  // the re-run's checks are skipped and stay `queued` forever
+  it("completes the re-run's own checks after the original completed", async () => {
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
+    await seed(reporter, 'run-a');
+    await completeUndispatched(reporter, 'run-a');
+    expect(mockChecksUpdate).toHaveBeenCalledTimes(2);
+
+    await seed(reporter, 'run-b');
+    const rerunIds = [3002, 3003];
+    expect(mockChecksCreate.mock.results.slice(2).length).toBe(2);
+    await completeUndispatched(reporter, 'run-b');
+
+    const completedIds = mockChecksUpdate.mock.calls
+      .map((c) => c[0] as { check_run_id: number; status: string })
+      .filter((u) => u.status === 'completed')
+      .map((u) => u.check_run_id);
+    expect(completedIds).toEqual(expect.arrayContaining(rerunIds));
+  });
+
+  it("a late prune of the original leaves the re-run's state", async () => {
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
+    await seed(reporter, 'run-a');
+    await completeUndispatched(reporter, 'run-a');
+    await seed(reporter, 'run-b');
+
+    reporter.cleanupRun('run-a');
+    await completeUndispatched(reporter, 'run-b');
+
+    // Without a tracking store the ids live only in L1: a prune of run-a that evicted the
+    // shared keys would leave run-b's checks unresolvable, and nothing would complete.
+    const completed = mockChecksUpdate.mock.calls
+      .map((c) => c[0] as { check_run_id: number })
+      .filter((u) => u.check_run_id >= 3002);
+    expect(completed.map((u) => u.check_run_id).sort()).toEqual([3002, 3003]);
+  });
+
+  // breaks-if-wrong: a second terminal for the SAME check run is still suppressed
+  it('still sends one terminal per check run', async () => {
+    const reporter = new CheckRunReporter({ providerRegistry: githubRegistry() });
+    await seed(reporter, 'run-b');
+    await completeUndispatched(reporter, 'run-b');
+    await completeUndispatched(reporter, 'run-b');
+    expect(mockChecksUpdate).toHaveBeenCalledTimes(2);
+  });
+});

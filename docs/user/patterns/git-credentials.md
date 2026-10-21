@@ -234,10 +234,16 @@ one:
 2. **The named context admits the run.** A `prod:` reference runs the `prod`
    context's own protection rules first: its branch restrictions, its
    `minimumTrust`, its approval requirement. A credential named from a branch
-   the context does not allow is refused, and the git operation fails. The rule
-   that refused it is named in your orchestrator's log, not in the run — the
-   orchestrator returns a fixed error to the job rather than describing its own
-   configuration to code it does not trust.
+   the context does not allow is refused, and the git operation fails. The job
+   sees `Refusing a git credential for '<repo>': context 'prod' did not provide
+it for this run in org '<org>'`, followed by the three possible causes: the
+   context does not exist in that org, its protection rules do not admit the
+   run, or no secret bound to it carries the key. The orchestrator log line
+   `Git credential refused` names which cause applied, and the rule. The job
+   does not get the rule, because the orchestrator does not describe its own
+   configuration to code it does not trust. The org is the org of the run's
+   source: a context in a different org on the same orchestrator does not
+   provide a credential to the run.
 3. **The contributor is trusted.** A run from an untrusted ref — a fork pull
    request — gets no declared credential at all. It still clones with the
    source credential, so the build runs; only the declared credentials are

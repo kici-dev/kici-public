@@ -8,10 +8,10 @@ ARG DHI_PREFIX=dhi.io
 # Stage 1: Build (on the -dev variant — keeps apt + shell + corepack so we
 # can install/compile/rebuild oxc-transform in the usual pnpm flow). DHI
 # ships ca-certificates by default, so no apt-get for certs is needed.
-FROM ${DHI_PREFIX}/node:24.21.0-1-debian13-dev AS builder
+FROM ${DHI_PREFIX}/node:24.22.0-0-debian13-dev AS builder
 WORKDIR /app
 
-# Enable pnpm. Pin 11.3.0 to match the runtime stage (see below): the same
+# Enable pnpm. Pin 11.28.6 to match the runtime stage (see below): the same
 # pnpm builds our bundle and installs customer .kici/ deps.
 # The DHI node:24.16.0-0-debian13-dev base ships a bundled corepack whose
 # extracted shims under /usr/lib/nodejs/corepack/dist/*.js land without the
@@ -22,7 +22,7 @@ WORKDIR /app
 # COREPACK_HOME matches the runtime stage, where the cache location matters.
 ENV COREPACK_HOME=/opt/corepack
 RUN corepack enable \
-  && { n=0; until corepack prepare pnpm@11.3.0 --activate; do \
+  && { n=0; until corepack prepare pnpm@11.28.6 --activate; do \
          n=$((n+1)); [ "$n" -ge 5 ] && { echo "corepack prepare pnpm failed after $n attempts" >&2; exit 1; }; \
          echo "corepack prepare pnpm failed (attempt $n), retrying in 5s..." >&2; sleep 5; \
        done; } \
@@ -151,7 +151,7 @@ RUN rm -f .npmrc \
 # Runtime base is the -dev variant: the agent needs apt-installed host tools
 # (git/bash/iptables), and a job installs more Debian packages with apt.
 # ca-certificates ships with the DHI base, so it isn't installed here.
-FROM ${DHI_PREFIX}/node:24.21.0-1-debian13-dev
+FROM ${DHI_PREFIX}/node:24.22.0-0-debian13-dev
 
 # Install the CI userland: what the agent needs (listed above), then the
 # baseline a CI job expects on a Debian host — ps, hostname, ip, ping, unzip,
@@ -238,7 +238,7 @@ RUN apt-get update \
 #
 # The baked versions live in /opt/corepack, owned by root, so the agent (uid
 # 1000 `node`) finds them without a download and can never modify them. The
-# agent's host install runs /opt/corepack/v1/pnpm/11.3.0 directly and checks no
+# agent's host install runs /opt/corepack/v1/pnpm/11.28.6 directly and checks no
 # hash, so the `node` user must not be able to write those files. The three
 # directories that hold versions are sticky and world-writable (1777) on
 # purpose: a repository that pins another version (yarn berry, another pnpm)
@@ -249,7 +249,7 @@ RUN apt-get update \
 # lastKnownGood.json after it adds a newer version of the same major.
 ENV COREPACK_HOME=/opt/corepack
 RUN corepack enable \
-  && { n=0; until corepack prepare pnpm@11.3.0 --activate; do \
+  && { n=0; until corepack prepare pnpm@11.28.6 --activate; do \
          n=$((n+1)); [ "$n" -ge 5 ] && { echo "corepack prepare pnpm failed after $n attempts" >&2; exit 1; }; \
          echo "corepack prepare pnpm failed (attempt $n), retrying in 5s..." >&2; sleep 5; \
        done; } \
@@ -261,7 +261,7 @@ RUN corepack enable \
   && chown -R root:root "$COREPACK_HOME" \
   && chmod -R u=rwX,go=rX "$COREPACK_HOME" \
   && chmod 1777 "$COREPACK_HOME/v1" "$COREPACK_HOME/v1/pnpm" "$COREPACK_HOME/v1/yarn" \
-  && test -f "$COREPACK_HOME/v1/pnpm/11.3.0/bin/pnpm.cjs"
+  && test -f "$COREPACK_HOME/v1/pnpm/11.28.6/bin/pnpm.cjs"
 ENV COREPACK_DEFAULT_TO_LATEST=0
 
 # KiCI-provisioned portable Node runtime, mounted read-only into a job's own
@@ -275,14 +275,15 @@ ENV COREPACK_DEFAULT_TO_LATEST=0
 # it avoids the `GLIBC_2.28 not found` failure that is the most-reported bug of
 # the equivalent GitHub Actions mechanism.
 #
-# Version matches the base image's node so the image carries one Node version.
+# Version matches the base image's node so the image carries one Node version
+# (`pnpm node-version:check` enforces it).
 # Both digests are the upstream SHASUMS256.txt values, verified at build time —
 # an unverified tarball here would execute in every customer job container.
 # The download retries on any error, like the corepack steps above: a single
 # dropped TLS handshake must not fail the whole image build.
-ARG KICI_RUNTIME_NODE_VERSION=24.21.0
-ARG KICI_RUNTIME_NODE_SHA256_X64=fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6
-ARG KICI_RUNTIME_NODE_SHA256_ARM64=6ad1325edbdb5649c379b75a237147a666c95d4f9ae8d340fef2d1575d289ad2
+ARG KICI_RUNTIME_NODE_VERSION=24.22.0
+ARG KICI_RUNTIME_NODE_SHA256_X64=cc2f601cee82d9a5a233302fe307abc600727035fd7d2c3a3571755989e95008
+ARG KICI_RUNTIME_NODE_SHA256_ARM64=fef00bb4d36e1c50104a9775a10359beee98f162b4104dd12472c75065c6a143
 RUN set -eu; \
   arch="$(dpkg --print-architecture)"; \
   case "$arch" in \

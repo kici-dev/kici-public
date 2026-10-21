@@ -5,6 +5,8 @@ import { DashboardClient, DashboardClientError } from '../../remote/dashboard-cl
 import { loadGlobalConfig, type GlobalConfig } from '../../remote/config.js';
 import { cancelRunDirect, DirectCancelError } from '../../remote/direct-cancel.js';
 import { resolveRunTarget } from '../../remote/target.js';
+import { parseRunIdRef } from '@kici-dev/engine';
+import { resolveRunRef } from './run-ref.js';
 
 export interface RunsCancelOptions {
   force?: boolean;
@@ -31,6 +33,15 @@ export async function runsCancelCommand(
       ? undefined
       : directCancelTarget(await loadGlobalConfig(), process.env, options.orchestratorUrl);
     if (direct && runId) {
+      // The orchestrator has no run list to look a prefix up in.
+      if (parseRunIdRef(runId).kind !== 'uuid') {
+        logger.error(
+          pc.red(
+            `'${runId}' is not a full run id: to cancel on an orchestrator directly, pass the full run id.`,
+          ),
+        );
+        return false;
+      }
       logger.info(
         `${options.force ? 'Force-cancelling' : 'Cancelling'} run ${pc.cyan(runId)} on ${direct.url}...`,
       );
@@ -57,12 +68,15 @@ export async function runsCancelCommand(
       logger.error(pc.red('Please provide a run ID or use --branch to cancel by branch.'));
       return false;
     }
-    logger.info(`${options.force ? 'Force-cancelling' : 'Cancelling'} run ${pc.cyan(runId)}...`);
+    const fullRunId = await resolveRunRef(client, runId);
+    logger.info(
+      `${options.force ? 'Force-cancelling' : 'Cancelling'} run ${pc.cyan(fullRunId)}...`,
+    );
     const { cancelledJobs = 0, alreadyTerminal } = await client.cancelRun(
-      runId,
+      fullRunId,
       options.force ?? false,
     );
-    console.log(cancelOutcomeLine(runId, alreadyTerminal, cancelledJobs));
+    console.log(cancelOutcomeLine(fullRunId, alreadyTerminal, cancelledJobs));
     return true;
   } catch (err) {
     logger.error(

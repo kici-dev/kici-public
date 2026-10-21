@@ -338,4 +338,28 @@ export class ContextStore {
     );
     return matches[0];
   }
+
+  /**
+   * The orgs other than `excludeOrgId` holding a context that would match
+   * `name` (a context of that name, or a glob whose pattern matches it): the
+   * `matchContext` semantics, across orgs. Distinct and sorted.
+   */
+  async orgsMatchingContext(name: string, excludeOrgId: string): Promise<string[]> {
+    const rows = await this.db
+      .selectFrom('contexts')
+      .select(['org_id', 'name', 'type', 'glob_pattern'])
+      .where('org_id', '<>', excludeOrgId)
+      .where((eb) => eb.or([eb('name', '=', name), eb('type', '=', ContextType.enum.glob)]))
+      .execute();
+    const orgs = rows
+      .filter(
+        (r) =>
+          r.name === name ||
+          (r.type === ContextType.enum.glob &&
+            !!r.glob_pattern &&
+            picomatch.isMatch(name, r.glob_pattern)),
+      )
+      .map((r) => r.org_id);
+    return [...new Set(orgs)].sort();
+  }
 }

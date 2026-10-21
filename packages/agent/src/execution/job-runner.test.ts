@@ -358,6 +358,22 @@ function resetSandboxMocks(resultOverride?: Partial<JobExecutionResult>) {
   mockSandboxInstance.teardown.mockReset().mockResolvedValue(undefined);
 }
 
+/**
+ * The workflow source was loaded with the lock's content hash and hash files,
+ * naming the repository whose lock a compile-schema mismatch would blame.
+ */
+async function expectSourceLoaded(workDir: unknown, lockRepo: string): Promise<void> {
+  const { loadWorkflowSource } = await import('./workflow-loader.js');
+  // fails-when: the eval drops the lock repository a schema mismatch names
+  expect(loadWorkflowSource).toHaveBeenCalledWith(
+    workDir,
+    '.kici/workflows/ci.ts',
+    'abc123hash',
+    ['asset.txt'],
+    { repo: lockRepo },
+  );
+}
+
 describe('JobRunner', () => {
   beforeEach(() => {
     // Default: run the real evaluation in-process, minus the fork.
@@ -1886,19 +1902,12 @@ describe('JobRunner', () => {
   }
 
   it('init job: passes contentHash and resolvedHashFiles to loadWorkflowSource', async () => {
-    const { loadWorkflowSource } = await import('./workflow-loader.js');
-
     const deps = makeDeps();
     const runner = new JobRunner(deps);
 
     await runner.execute(makeInitDispatch());
 
-    expect(loadWorkflowSource).toHaveBeenCalledWith(
-      expect.any(String),
-      '.kici/workflows/ci.ts',
-      'abc123hash',
-      ['asset.txt'],
-    );
+    await expectSourceLoaded(expect.any(String), 'org/repo');
 
     // Init job ends in success when the drift gate is happy
     const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
@@ -1907,19 +1916,12 @@ describe('JobRunner', () => {
   });
 
   it('dynamic eval job: passes contentHash and resolvedHashFiles to loadWorkflowSource', async () => {
-    const { loadWorkflowSource } = await import('./workflow-loader.js');
-
     const deps = makeDeps();
     const runner = new JobRunner(deps);
 
     await runner.execute(makeDynamicDispatch());
 
-    expect(loadWorkflowSource).toHaveBeenCalledWith(
-      expect.any(String),
-      '.kici/workflows/ci.ts',
-      'abc123hash',
-      ['asset.txt'],
-    );
+    await expectSourceLoaded(expect.any(String), 'org/repo');
 
     const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
     const states = jobStatuses.map((m) => (m as { state: string }).state);
@@ -2294,7 +2296,6 @@ describe('JobRunner', () => {
     }
 
     it("init job with no source pack: loads A's workflow module, B checked out as the source", async () => {
-      const { loadWorkflowSource } = await import('./workflow-loader.js');
       const { restoreDeps } = await import('./dep-restore.js');
       const { restoreSource } = await import('./source-restore.js');
       const { installDeps } = await import('./dep-installer.js');
@@ -2304,12 +2305,7 @@ describe('JobRunner', () => {
 
       expectDualClone();
       // fails-when: the workflow module is loaded from a clone of the source repository
-      expect(loadWorkflowSource).toHaveBeenCalledWith(
-        WORKFLOW_DIR,
-        '.kici/workflows/ci.ts',
-        'abc123hash',
-        ['asset.txt'],
-      );
+      await expectSourceLoaded(WORKFLOW_DIR, 'org/ci');
       // fails-when: the workflow repository's dependency tarball lands in the source tree
       expect(restoreDeps).toHaveBeenCalledWith(
         WORKFLOW_DIR,
@@ -2341,7 +2337,6 @@ describe('JobRunner', () => {
     it("init job with A's source pack restores it and the deps over A's checkout", async () => {
       // breaks-if-wrong: a global init job carrying the workflow repository's pack keeps
       //   evaluating that pack
-      const { loadWorkflowSource } = await import('./workflow-loader.js');
       const { restoreDeps } = await import('./dep-restore.js');
       const { restoreSource } = await import('./source-restore.js');
       const deps = makeDeps();
@@ -2360,19 +2355,13 @@ describe('JobRunner', () => {
         PACK.sourceTarUrl,
         PACK.sourceTarDigest,
       );
-      expect(loadWorkflowSource).toHaveBeenCalledWith(
-        WORKFLOW_DIR,
-        '.kici/workflows/ci.ts',
-        'abc123hash',
-        ['asset.txt'],
-      );
+      await expectSourceLoaded(WORKFLOW_DIR, 'org/ci');
       expect(finalState(deps)).toBe('success');
     });
 
     it('init job of a same-repo workflow keeps its single checkout', async () => {
       // breaks-if-wrong: a per-repository init job still clones its own repository into
       //   the work dir and loads the workflow module from there
-      const { loadWorkflowSource } = await import('./workflow-loader.js');
       const { restoreDeps } = await import('./dep-restore.js');
 
       await new JobRunner(makeDeps()).execute({ ...makeInitDispatch(), ...DEPS });
@@ -2387,12 +2376,7 @@ describe('JobRunner', () => {
         DEPS.depsHash,
         expect.objectContaining({ onProgress: expect.any(Function) }),
       );
-      expect(loadWorkflowSource).toHaveBeenCalledWith(
-        WORK_DIR,
-        '.kici/workflows/ci.ts',
-        'abc123hash',
-        ['asset.txt'],
-      );
+      await expectSourceLoaded(WORK_DIR, 'org/repo');
     });
 
     it("init job evaluates its dynamic fields with the global workflow's KICI_* environment", async () => {
@@ -2429,7 +2413,7 @@ describe('JobRunner', () => {
     });
 
     it("generator evaluation with no source pack: loads A's module and hands the generator the repo pair", async () => {
-      const { loadWorkflowSource, extractDynamicJobFn } = await import('./workflow-loader.js');
+      const { extractDynamicJobFn } = await import('./workflow-loader.js');
       let context: { sourceRepo?: { path: string }; workflowRepo?: { path: string } } = {};
       (extractDynamicJobFn as Mock).mockReturnValueOnce(async (c: typeof context) => {
         context = c;
@@ -2440,12 +2424,7 @@ describe('JobRunner', () => {
       await new JobRunner(deps).execute(globalDispatch(makeDynamicDispatch(), DEPS));
 
       expectDualClone();
-      expect(loadWorkflowSource).toHaveBeenCalledWith(
-        WORKFLOW_DIR,
-        '.kici/workflows/ci.ts',
-        'abc123hash',
-        ['asset.txt'],
-      );
+      await expectSourceLoaded(WORKFLOW_DIR, 'org/ci');
       // fails-when: the generator's two evaluations disagree about the source repository —
       //   the sandbox re-evaluation hands it the pair, this one would not
       expect(context.sourceRepo?.path).toBe(SOURCE_DIR);

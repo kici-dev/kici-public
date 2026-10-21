@@ -19,6 +19,10 @@ import {
   DIRECT_DB_URL_HELP,
 } from './shared/cli-action.js';
 import { renderTable } from './shared/table.js';
+import {
+  formatStaleLockWarning,
+  staleCompileSchemaEntries,
+} from '../../registration/compile-schema-staleness.js';
 
 function parseJsonOption(raw: string | undefined, label: string): Record<string, unknown> {
   if (raw === undefined || raw === '') return {};
@@ -49,6 +53,54 @@ interface RegistrationRowDTO {
   };
   provider_context?: Record<string, unknown>;
   disabled: boolean;
+  /** The schema the lock declares; absent from servers before the field, null when none. */
+  compileSchemaVersion?: number | null;
+  /** The schema the server release's agents implement; absent from older servers. */
+  agentCompileSchemaVersion?: number;
+}
+
+/** A lock the server's agents reject: both schemas known and different. */
+function isStaleRow(r: RegistrationRowDTO): boolean {
+  return (
+    typeof r.compileSchemaVersion === 'number' &&
+    typeof r.agentCompileSchemaVersion === 'number' &&
+    r.compileSchemaVersion !== r.agentCompileSchemaVersion
+  );
+}
+
+/** The `schema` column: the lock's schema, marked when this release's agents reject it. */
+function schemaCell(r: RegistrationRowDTO): string {
+  if (typeof r.compileSchemaVersion !== 'number') return '-';
+  return isStaleRow(r) ? `${r.compileSchemaVersion} (stale)` : String(r.compileSchemaVersion);
+}
+
+/** The direct-DB result, with `warnings` only when there is one (the output stays additive). */
+function withDirectWarnings(
+  result: RegisterWorkflowManualResult,
+  warnings: string[],
+): RegisterWorkflowManualResult {
+  return warnings.length > 0 ? { ...result, warnings } : result;
+}
+
+/**
+ * Warnings for a lock file registered straight into the database: there is no
+ * server to compute them, so this CLI release's own compile schema decides.
+ */
+function directRegisterWarnings(lockFileContents: string, repoIdentifier: string): string[] {
+  let workflows: unknown;
+  try {
+    workflows = (JSON.parse(lockFileContents) as { workflows?: unknown }).workflows;
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(workflows)) return [];
+  return staleCompileSchemaEntries(
+    workflows.map((w: { name?: unknown }) => ({
+      repoIdentifier,
+      workflowName: typeof w?.name === 'string' ? w.name : '(unnamed)',
+      lockEntry: w,
+    })),
+  ).map((e) => formatStaleLockWarning(e));
 }
 
 interface ListResponse {
@@ -132,6 +184,7 @@ export function registerWorkflowCommands(program: Command, getClient: () => Admi
           'workflow_name',
           'trigger_types',
           'events',
+          'schema',
           'disabled',
         ];
         const rows = response.registrations.map((r) => {
@@ -143,6 +196,7 @@ export function registerWorkflowCommands(program: Command, getClient: () => Admi
             r.workflow_name,
             (r.trigger_types ?? []).join(','),
             events,
+            schemaCell(r),
             String(r.disabled),
           ];
         });
@@ -150,6 +204,15 @@ export function registerWorkflowCommands(program: Command, getClient: () => Admi
         console.log(renderTable(headers, rows));
         console.log('');
         console.log(`Total: ${response.total}`);
+        const stale = response.registrations.filter(isStaleRow);
+        if (stale.length > 0) {
+          console.log(
+            `Warning: ${stale.length} registered workflow lock(s) declare a compile schema that ` +
+              `this orchestrator's agents do not implement (schema ${stale[0]!.agentCompileSchemaVersion}). ` +
+              `Their runs fail. Recompile each lock with the matching @kici-dev/compiler release ` +
+              `and commit .kici/kici.lock.json.`,
+          );
+        }
       }),
     );
 
@@ -181,11 +244,17 @@ export function registerWorkflowCommands(program: Command, getClient: () => Admi
         };
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         const result: RegisterWorkflowManualResult = dbUrl
-          ? await registerWorkflowManualDirect(dbUrl, payload)
+          ? withDirectWarnings(
+              await registerWorkflowManualDirect(dbUrl, payload),
+              directRegisterWarnings(lockFileContents, opts.repo),
+            )
           : await getClient().post<RegisterWorkflowManualResult>(
               '/api/v1/admin/registrations/register-manual',
               payload,
             );
+        for (const warning of result.warnings ?? []) {
+          if (!opts.json) console.error(`Warning: ${warning}`);
+        }
         if (opts.json) {
           console.log(JSON.stringify(result));
         } else {

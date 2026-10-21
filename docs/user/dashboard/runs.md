@@ -111,7 +111,7 @@ A summary bar above the two panels shows:
 - **Commit SHA** -- linked to the provider's commit page
 - **Duration** -- total run time
 - **Timestamp** -- relative time since the run started (hover for absolute time)
-- **Re-run button** -- available for terminal-state runs (success, failed, cancelled, error, timed out) that carry a trigger event or are themselves a re-run. Opens a confirmation dialog before re-running on the same commit. After confirmation, navigates to the new run.
+- **Re-run button** -- available for terminal-state runs (success, failed, cancelled, error, timed out) that carry a trigger event or are themselves a re-run. Opens a confirmation dialog before re-running on the same commit. After confirmation, navigates to the new run. If the orchestrator does not confirm the start in time, the dialog says so. The run can still start, so check the run list before you re-run again. If you re-run again within 30 minutes, the dashboard opens the run that your first request started and shows "This re-run was already started". No second run starts.
 - **Cancel button** -- available for pending, running, cancelling, queued, or held runs. For running runs, sends a graceful cancel; for already-cancelling runs, a "Force cancel" button appears to immediately kill without cleanup.
 - **Lineage badge** -- if the run is a re-run, a badge shows the parent/child relationship with a link to the original run.
 

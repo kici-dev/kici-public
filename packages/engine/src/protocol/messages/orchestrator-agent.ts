@@ -280,6 +280,12 @@ export const agentRegisterSchema = z.object({
   arch: z.string().optional(),
   /** Agent version (e.g. "0.0.1"). Absent when the agent cannot read its own package version. */
   version: z.string().optional(),
+  /**
+   * The compile schema this agent's workflow loader implements; absent from agents
+   * before this field. The orchestrator compares it with a lock entry's
+   * `compileSchemaVersion` before it dispatches work the agent would reject.
+   */
+  compileSchemaVersion: z.number().int().positive().optional(),
   /** Maximum concurrent jobs this agent can handle. Defaults to 1 if not specified. */
   maxConcurrency: z.number().int().positive().optional(),
   /** Jobs still running on this agent (sent on reconnection to enable job recovery). */

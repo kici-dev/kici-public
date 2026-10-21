@@ -2,9 +2,7 @@
 
 pnpm applies each patch in this directory to one exact dependency version, as listed under `patchedDependencies` in `pnpm-workspace.yaml`. Each patch carries an upstream fix that no release contains yet.
 
-| Patch                | What it fixes                                                                                                                                                                                                               | Upstream                                                                                                                                      | Remove when                       |
-| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
-| `vitest@5.0.1.patch` | `Vitest.close()` removes the root temporary directory (`Vitest._tmpDir`). Without the patch, every run leaves a directory with a 21-character name and an `ssr/` folder of module copies in the system temporary directory. | [vitest-dev/vitest#11248](https://github.com/vitest-dev/vitest/pull/11248), issue [#11224](https://github.com/vitest-dev/vitest/issues/11224) | A vitest release contains #11248. |
+No patch is applied at present. A new patch adds a table with a `Patch`, `What it fixes`, `Upstream` and `Remove when` column.
 
 ## After a version bump
 

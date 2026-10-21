@@ -563,3 +563,67 @@ describe('registerTrustPolicyCommands', () => {
     void program;
   });
 });
+
+describe('trust-policy show org split notes', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const ORGS = {
+    platformAttachment: 'attached',
+    attachedOrgId: 'org_A',
+    orgs: [
+      { orgId: '__default__', sources: ['source'] },
+      { orgId: 'org_A', sources: ['platform', 'source'] },
+    ],
+  };
+
+  async function show(org: string, format: string, orgList: () => Promise<unknown>) {
+    const get = vi.fn(async (path: string) =>
+      path === '/api/v1/admin/org-ids' ? orgList() : { policy: VIEW },
+    );
+    const program = new Command();
+    program.exitOverride();
+    registerTrustPolicyCommands(program, () => ({ get }) as unknown as AdminApiClient);
+    const out: string[] = [];
+    const err: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((...a) => void out.push(a.join(' ')));
+    vi.spyOn(console, 'error').mockImplementation((...a) => void err.push(a.join(' ')));
+    await program.parseAsync([
+      'node',
+      'kici-admin',
+      'trust-policy',
+      'show',
+      '--org',
+      org,
+      '--format',
+      format,
+    ]);
+    return { stdout: out.join('\n'), stderr: err.join('\n'), get };
+  }
+
+  it('says the attached org policy does not reach sources in another org', async () => {
+    // fails-when: the attached org's policy reads as the one every source uses.
+    const { stderr } = await show('org_A', 'table', async () => ORGS);
+    expect(stderr).toContain("sources in org(s) '__default__' do not use this policy");
+  });
+
+  it('says a foreign source org uses its own policy, not the Platform-managed one', async () => {
+    const { stderr } = await show('__default__', 'table', async () => ORGS);
+    expect(stderr).toContain("attached to org 'org_A', whose policy the Platform manages");
+    expect(stderr).toContain("Sources in org '__default__' use this policy instead.");
+  });
+
+  it('prints no note when the org listing cannot be read', async () => {
+    const { stderr } = await show('org_A', 'table', async () => {
+      throw new Error('HTTP 404');
+    });
+    expect(stderr).toBe('');
+  });
+
+  it('keeps --format json output unchanged and reads no org listing', async () => {
+    // breaks-if-wrong: scripts parsing the JSON see exactly the policy.
+    const { stdout, stderr, get } = await show('org_A', 'json', async () => ORGS);
+    expect(stdout).toBe(formatPolicy(VIEW, 'json'));
+    expect(stderr).toBe('');
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+});

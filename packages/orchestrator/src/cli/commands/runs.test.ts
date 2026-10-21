@@ -394,6 +394,33 @@ describe('kici-admin runs CLI commands', () => {
       expect(stdout).toContain('No jobs.');
     });
 
+    it('names the run org and prints each job env warning', async () => {
+      // fails-when: the header or the warnings ignore the new fields
+      mockGetRun.mockResolvedValue({ run: { ...sampleRunDetail, orgId: 'org_A' } });
+      mockGetRunJobs.mockResolvedValue({
+        jobs: [{ ...sampleJob, envWarning: "Context 'pages' is not configured in org 'org_A'." }],
+      });
+      const { stdout } = await runCommand(
+        ['runs', 'show', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
+      const lines = stdout.split('\n');
+      expect(lines[lines.findIndex((l) => l.startsWith('  Provider:')) + 1]).toBe(
+        '  Org:         org_A',
+      );
+      expect(stdout).toContain("  ! test: Context 'pages' is not configured in org 'org_A'.");
+    });
+
+    it('prints no Org or warning line for an older orchestrator response', async () => {
+      // breaks-if-wrong: a response without the fields renders as before
+      const { stdout } = await runCommand(
+        ['runs', 'show', '0a1b2c3d-0000-4000-8000-000000000123'],
+        client,
+      );
+      expect(stdout).not.toContain('Org:');
+      expect(stdout).not.toContain('  ! ');
+    });
+
     it('R-15: an organization-wide run shows where its workflow is defined', async () => {
       mockGetRun.mockResolvedValue({
         run: {

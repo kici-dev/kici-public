@@ -77,7 +77,7 @@ async function runScenario(s: Scenario) {
     executionTracker: tracker,
     heldRunStore,
     db: makeHoldDb(),
-    contextStore: { matchContext },
+    contextStore: { matchContext, orgsMatchingContext: async () => [] },
     ...(s.staticBindsContext && { jobContext: CONTEXT_NAME }),
     pendingDynamics: {
       track: vi.fn(async () => s.generatedJobs ?? [generatedJob(s.genContexts)]),

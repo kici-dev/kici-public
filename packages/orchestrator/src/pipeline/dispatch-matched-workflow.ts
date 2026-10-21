@@ -120,6 +120,7 @@ import { resolveInstallSecrets, type NpmRegistrySpec } from './install-secrets-r
 import type { InstallGateRecord } from './install-gate.js';
 import { storePendingWorkflowContext, toSerializableInputs } from './pending-workflow-context.js';
 import { generateRunKeyPair, encryptPrivateKey } from '../secrets/ephemeral-keys.js';
+import { OTHER_ORG_HAS_CONTEXT } from '../secrets/job-secret-gate.js';
 import {
   insertEdgesForRun,
   resolveGroupEdges,
@@ -148,6 +149,12 @@ import {
 } from './processor.js';
 import { buildReducedPrivilegeNote } from '../security/reduced-privilege-note.js';
 import { runDetached } from '../helpers/run-detached.js';
+import {
+  evaluateCompileSchemaGate,
+  lockRerunField,
+  rerunLockOf,
+  withRerunLockNote,
+} from './compile-schema-gate.js';
 
 const logger = createLogger({ prefix: 'pipeline' });
 
@@ -675,6 +682,11 @@ interface DispatchSetup {
 }
 
 interface BuildPrepResult {
+  /**
+   * Set with `abort` when the abort already recorded the failed run and completed
+   * its checks (`recordInitFailureFromSkip`), so the caller must not complete them again.
+   */
+  initFailureRecorded?: boolean;
   sourceTarUrl: string | undefined;
   /** SHA-256 of the source tarball's own bytes; the agent verifies against it. */
   sourceTarDigest: string | undefined;
@@ -708,6 +720,53 @@ interface BuildPrepResult {
    * job rejected). Caller MUST return `dispatchedJobCount: 0`.
    */
   abort: boolean;
+}
+
+/**
+ * What an evaluation job's lock check reads: the content hash (none for a test
+ * run), the hashed extra files, and a re-run's recorded lock.
+ */
+function lockCheckFields(
+  ctx: Pick<
+    WorkflowDispatchContext,
+    'workflow' | 'testRun' | 'rerunLineage' | 'global' | 'repoIdentifier' | 'ref'
+  >,
+): Record<string, unknown> {
+  const { workflow } = ctx;
+  const contentHash = ctx.testRun ? undefined : workflow.contentHash;
+  return {
+    ...(contentHash && { contentHash }),
+    ...lockRerunField(ctx, contentHash),
+    ...(workflow.resolvedHashFiles?.length && { resolvedHashFiles: workflow.resolvedHashFiles }),
+  };
+}
+
+/** The fields of a {@link BuildPrepResult} for a run that dispatches no job. */
+function emptyBuildPrep(args: {
+  contentHash: string | undefined;
+  lockfileHash: string | undefined;
+  staticJobs: readonly LockJob[];
+  dynamicEntries: BuildPrepResult['dynamicEntries'];
+}): Omit<BuildPrepResult, 'targetPlatform' | 'targetArch' | 'abort'> {
+  return {
+    sourceTarUrl: undefined,
+    sourceTarDigest: undefined,
+    depsUrl: undefined,
+    depsHash: undefined,
+    contentHash: args.contentHash,
+    lockfileHash: args.lockfileHash,
+    hasDynamicEntries: args.dynamicEntries.length > 0,
+    dynamicEntries: args.dynamicEntries,
+    staticJobs: args.staticJobs,
+    materializedJobs: [],
+    expansionMap: new Map(),
+    matrixFailures: [],
+    buildJobId: undefined,
+    buildJobName: undefined,
+    buildJobLabels: undefined,
+    buildJobTrackedEarly: false,
+    buildFailed: false,
+  };
 }
 
 interface SecretBundle {
@@ -1045,6 +1104,11 @@ export function buildIsNeeded(args: {
   return sourceMissing || depsMissing;
 }
 
+/** The labels a `__build__` job routes by. */
+function buildJobRunsOnLabels(targetPlatform: string, targetArch: string): string[] {
+  return [`kici:role:builder`, `kici:os:${targetPlatform}`, `kici:arch:${targetArch}`];
+}
+
 /** The QueuedJobInput for a __build__ job. */
 function buildBuildJobInput(args: {
   ctx: WorkflowDispatchContext;
@@ -1063,13 +1127,14 @@ function buildBuildJobInput(args: {
     runId: ctx.runId,
     workflowName: workflow.name,
     jobName: buildJobName,
-    runsOnLabels: [
-      `kici:role:builder`,
-      `kici:os:${args.targetPlatform}`,
-      `kici:arch:${args.targetArch}`,
-    ],
+    runsOnLabels: buildJobRunsOnLabels(args.targetPlatform, args.targetArch),
     jobConfig: {
       buildOnly: true,
+      // The repository whose lock the agent verifies; a compile-schema mismatch names it.
+      lockRepoIdentifier: ctx.global?.workflowRepoIdentifier ?? ctx.repoIdentifier,
+      // No `lockRerun`: every run with this content hash coalesces onto this
+      // build and gets its error, so each run's own re-run note is added by
+      // `recordBuildFailure`, never by the agent.
       targetPlatform: args.targetPlatform,
       targetArch: args.targetArch,
       source: { file: workflow.source?.file ?? fullLockFile.source.file },
@@ -1243,6 +1308,7 @@ async function runBuildJob(args: {
       repo,
       sha: ref,
       workflowName: workflow.name,
+      ...(ctx.global && { workflowRepoIdentifier: ctx.global.workflowRepoIdentifier }),
       installationId: (credentials as { installationId?: number }).installationId,
       routingKey: setup.info.routingKey,
       runId,
@@ -1337,6 +1403,7 @@ async function recordBuildFailure(args: {
 }): Promise<void> {
   const { ctx, setup, buildJobTrackedEarly, err, buildJobId } = args;
   const { deps, workflow, repoIdentifier, credentials, event, ref, runId } = ctx;
+  const buildFailureReason = withRerunLockNote(ctx, toErrorMessage(err));
   if (deps.checkRunReporter) {
     const [owner, repo] = repoIdentifier.split('/');
     deps.checkRunReporter.setBuildComplete({
@@ -1345,17 +1412,17 @@ async function recordBuildFailure(args: {
       repo,
       sha: ref,
       workflowName: workflow.name,
+      ...(ctx.global && { workflowRepoIdentifier: ctx.global.workflowRepoIdentifier }),
       status: ExecutionJobStatus.enum.failed,
       installationId: (credentials as { installationId?: number }).installationId,
       routingKey: setup.info.routingKey,
-      description: `Build failed: ${toErrorMessage(err)}`,
+      description: `Build failed: ${buildFailureReason}`,
       runId,
       requestId: getRequestContext().requestId,
     });
   }
   if (deps.executionTracker) {
     try {
-      const buildFailureReason = toErrorMessage(err);
       const buildInitFailure: InitFailure = {
         scope: 'run',
         category: InitFailureCategory.enum.build_coordination,
@@ -1378,7 +1445,16 @@ async function recordBuildFailure(args: {
           extractCommitMessage(setup.info.event, setup.info.payload),
           buildFailureReason,
           buildInitFailure,
-          preDispatchRunProvenance(ctx),
+          {
+            ...preDispatchRunProvenance(ctx),
+            // A build this run coalesced onto (another source repo of the same global
+            // workflow started it) fails here untracked: keep the run a global one.
+            workflowRepo: {
+              identifier: ctx.workflowRepoIdentifier,
+              sha: ctx.global?.workflowSha ?? null,
+              branch: ctx.global?.workflowBranch ?? null,
+            },
+          },
         );
       }
     } catch (cleanupErr) {
@@ -1447,6 +1523,7 @@ async function readPostBuildCacheUrls(args: {
       repo,
       sha: ref,
       workflowName: workflow.name,
+      ...(ctx.global && { workflowRepoIdentifier: ctx.global.workflowRepoIdentifier }),
       status: ExecutionJobStatus.enum.success,
       installationId: (credentials as { installationId?: number }).installationId,
       routingKey: setup.info.routingKey,
@@ -1843,6 +1920,29 @@ async function prepareCacheAndBuild(
     lockfileHash,
   });
 
+  const gate = await evaluateCompileSchemaGate(ctx, {
+    buildNeeded,
+    sourceHit,
+    buildLabels: buildJobRunsOnLabels(targetPlatform, targetArch),
+    staticJobs,
+    contentHash,
+  });
+  if (gate.doomed) {
+    await recordInitFailureFromSkip({
+      ctx,
+      setup,
+      category: InitFailureCategory.enum.lock_resolution,
+      reason: gate.reason,
+    });
+    return {
+      ...emptyBuildPrep({ contentHash, lockfileHash, staticJobs, dynamicEntries }),
+      targetPlatform,
+      targetArch,
+      abort: true,
+      initFailureRecorded: true,
+    };
+  }
+
   if (buildNeeded) {
     const buildStart = process.hrtime.bigint();
     const result = await runBuildJob({
@@ -1862,18 +1962,7 @@ async function prepareCacheAndBuild(
     buildJobTrackedEarly = result.buildJobTrackedEarly;
     if (result.rejected) {
       return {
-        sourceTarUrl,
-        sourceTarDigest,
-        depsUrl,
-        depsHash,
-        contentHash,
-        lockfileHash,
-        hasDynamicEntries,
-        dynamicEntries,
-        staticJobs,
-        materializedJobs: [],
-        expansionMap: new Map(),
-        matrixFailures: [],
+        ...emptyBuildPrep({ contentHash, lockfileHash, staticJobs, dynamicEntries }),
         targetPlatform,
         targetArch,
         buildJobId,
@@ -1910,18 +1999,7 @@ async function prepareCacheAndBuild(
         );
       } else {
         return {
-          sourceTarUrl,
-          sourceTarDigest,
-          depsUrl,
-          depsHash,
-          contentHash,
-          lockfileHash,
-          hasDynamicEntries,
-          dynamicEntries,
-          staticJobs,
-          materializedJobs: [],
-          expansionMap: new Map(),
-          matrixFailures: [],
+          ...emptyBuildPrep({ contentHash, lockfileHash, staticJobs, dynamicEntries }),
           targetPlatform,
           targetArch,
           buildJobId,
@@ -2247,10 +2325,7 @@ function buildDeferredInitJob(args: {
     dynamicMatrix: mat.pendingDynamicMatrix === true,
     event,
     timeoutMs: 60_000,
-    ...(workflow.contentHash && !ctx.testRun && { contentHash: workflow.contentHash }),
-    ...(workflow.resolvedHashFiles?.length && {
-      resolvedHashFiles: workflow.resolvedHashFiles,
-    }),
+    ...lockCheckFields(ctx),
     // A global init job checks out both repositories, like its other jobs.
     ...globalJobConfigFor(ctx),
   };
@@ -2469,6 +2544,56 @@ async function applyStaticApprovalHolds(args: {
 }
 
 /**
+ * The warning for bound contexts missing in the run's org while another org on
+ * this orchestrator has them: the run's source most likely routes to an org
+ * other than the one the operator configured. Names only the run's org.
+ */
+export function formatCrossOrgContextWarning(names: readonly string[], runOrgId: string): string {
+  const list = names.map((n) => `'${n}'`).join(', ');
+  const one = names.length === 1;
+  return (
+    `${one ? 'Context' : 'Contexts'} ${list} ${one ? 'is' : 'are'} not configured in org ` +
+    `'${runOrgId}', the org this run belongs to, so the job gets none of ` +
+    `${one ? 'its' : 'their'} variables or secrets. ${OTHER_ORG_HAS_CONTEXT}`
+  );
+}
+
+/**
+ * The cross-org warning for the bound names missing in the run's org, or
+ * undefined when no other org has any of them. The other org ids go to the log
+ * only.
+ */
+async function crossOrgContextWarning(
+  ctx: WorkflowDispatchContext,
+  lockJob: LockJob,
+  missing: readonly string[],
+): Promise<string | undefined> {
+  const { deps, runId, workflow, resolvedOrgId } = ctx;
+  if (missing.length === 0 || !deps.contextStore) return undefined;
+  const otherOrgIds: Record<string, string[]> = {};
+  for (const name of missing) {
+    const others = await deps.contextStore.orgsMatchingContext(name, resolvedOrgId);
+    if (others.length > 0) otherOrgIds[name] = others;
+  }
+  const names = Object.keys(otherOrgIds);
+  if (names.length === 0) return undefined;
+  logger.warn('bound context(s) missing in the run org exist in another org', {
+    runId,
+    workflow: workflow.name,
+    job: lockJob.name,
+    orgId: resolvedOrgId,
+    otherOrgIds,
+  });
+  return formatCrossOrgContextWarning(names, resolvedOrgId);
+}
+
+/** Append `warning` to the job's env warning, after any warning already set. */
+function appendEnvWarning(jobEnvData: JobEnvData, warning: string | undefined): void {
+  if (!warning) return;
+  jobEnvData.envWarning = jobEnvData.envWarning ? `${jobEnvData.envWarning}. ${warning}` : warning;
+}
+
+/**
  * The bound contexts that participate in this dispatch; records the run's
  * context identity on `jobEnvData`. Null when none does (all unconfigured or
  * test-skipped): the job dispatches with its own env, since a bound `context:`
@@ -2509,6 +2634,7 @@ async function resolveParticipatingContexts(args: {
     });
     matched = matched.filter((m) => m.env);
   }
+  const crossOrgWarning = await crossOrgContextWarning(ctx, lockJob, missing);
 
   // A test/local run never rejects on a bound context: non-test
   // (`allowLocalExecution === false`) or unconfigured ones are dropped (vars,
@@ -2533,8 +2659,12 @@ async function resolveParticipatingContexts(args: {
         unavailable,
       });
     }
-    if (matched.length === 0) return null; // dispatch with no env vars — never reject
+    if (matched.length === 0) {
+      appendEnvWarning(jobEnvData, crossOrgWarning);
+      return null; // dispatch with no env vars — never reject
+    }
   }
+  appendEnvWarning(jobEnvData, crossOrgWarning);
 
   if (matched.length === 0) return null;
 
@@ -3090,6 +3220,8 @@ function makeBuildJobConfig(args: {
   runWideFlatSecrets: Record<string, string> | undefined;
   /** See `WorkflowDispatchContext.dispatchInputs`. */
   dispatchInputs: Record<string, unknown> | undefined;
+  /** A re-run's recorded lock, which the agent's compile-schema mismatch names. */
+  lockRerun: { repo: string; sha: string } | undefined;
   /**
    * Allow-listed sandbox grants by lock-job name (a denied request already
    * failed the run). Absent ⇒ default hardened posture.
@@ -3111,6 +3243,7 @@ function makeBuildJobConfig(args: {
     omitContentHash,
     runWideFlatSecrets,
     dispatchInputs,
+    lockRerun,
     resolvedSandboxGrants,
   } = args;
   return (mat: MaterializedJob): Record<string, unknown> => {
@@ -3155,6 +3288,7 @@ function makeBuildJobConfig(args: {
         sandboxGrant: resolvedSandboxGrants.get(lockJob.name),
       }),
       ...(workflow.contentHash && !omitContentHash && { contentHash: workflow.contentHash }),
+      ...(workflow.contentHash && !omitContentHash && lockRerun && { lockRerun }),
       ...(workflow.resolvedHashFiles?.length && {
         resolvedHashFiles: workflow.resolvedHashFiles,
       }),
@@ -5461,10 +5595,7 @@ async function dispatchEvalJob(args: {
     ...(workflow.hasFilter === true && { hasFilter: true }),
     // Deferred paths gate it the same way, ahead of the filter.
     ...(deferredPathsOf(ctx) && { deferredPaths: deferredPathsOf(ctx) }),
-    ...(workflow.contentHash && !ctx.testRun && { contentHash: workflow.contentHash }),
-    ...(workflow.resolvedHashFiles?.length && {
-      resolvedHashFiles: workflow.resolvedHashFiles,
-    }),
+    ...lockCheckFields(ctx),
     // For the agent to build ctx.needs at eval time.
     ...(upstreamSnapshot && {
       resultAware: true,
@@ -5659,6 +5790,7 @@ async function buildGeneratedJobConfig(args: {
       matrixValues: envelope.matrixValues,
     }),
     ...(workflow.contentHash && !ctx.testRun && { contentHash: workflow.contentHash }),
+    ...lockRerunField(ctx, ctx.testRun ? undefined : workflow.contentHash),
     ...(hasSecrets && { secrets: genSecrets }),
     ...(hasNamespaced && { namespacedSecrets: genNamespacedSecrets }),
     ...(runPublicKeyBase64 && { runPublicKey: runPublicKeyBase64 }),
@@ -6959,6 +7091,11 @@ async function recordInitFailureFromSkip(args: {
     provider: setup.info.provider,
     repoIdentifier,
     workflowRepoIdentifier,
+    // A re-run of this failed run resolves the workflow at the recorded commit.
+    ...(ctx.global && {
+      workflowSha: ctx.global.workflowSha,
+      workflowBranch: ctx.global.workflowBranch,
+    }),
     // The branch the run PRESENTS (as `onExecutionStarted` writes, and the
     // context branch gate evaluates), not `sourceBranch`: a fork names its PR
     // head freely, and internal-event branch inheritance reads this row as a
@@ -7312,6 +7449,11 @@ async function rejectRunForSecurityPolicy(args: {
     provider: setup.info.provider,
     repoIdentifier,
     workflowRepoIdentifier,
+    // A re-run of this failed run resolves the workflow at the recorded commit.
+    ...(ctx.global && {
+      workflowSha: ctx.global.workflowSha,
+      workflowBranch: ctx.global.workflowBranch,
+    }),
     // The branch the run PRESENTS (as `onExecutionStarted` writes, and the
     // context branch gate evaluates), not `sourceBranch`: a fork names its PR
     // head freely, and internal-event branch inheritance reads this row as a
@@ -7548,13 +7690,16 @@ async function dispatchMatchedWorkflowInner(
   const buildPrep = await prepareCacheAndBuild(ctx, setup);
   if (buildPrep.abort) {
     // No job will run. `onBuildFailed` reaches no check run, and the build's
-    // `kici/<workflow>/setup` check is a different one.
-    await completeChecksForUndispatchedRun({
-      ctx,
-      setup,
-      conclusion: CheckRunConclusion.enum.failure,
-      summary: 'The workflow build did not complete, so no job started.',
-    });
+    // `kici/<workflow>/setup` check is a different one. An abort that recorded
+    // its init failure has completed the checks already.
+    if (!buildPrep.initFailureRecorded) {
+      await completeChecksForUndispatchedRun({
+        ctx,
+        setup,
+        conclusion: CheckRunConclusion.enum.failure,
+        summary: 'The workflow build did not complete, so no job started.',
+      });
+    }
     return { dispatchedJobCount: 0, dispatchedJobIds: [] };
   }
   const secretsResult = await resolveWorkflowSecretsAndKey(ctx);
@@ -7644,6 +7789,7 @@ async function dispatchMatchedWorkflowInner(
     cacheRepoId: cacheRepoIdFor(ctx),
     cacheRefScope: deriveCacheRefScope(ctx.trustResolution),
     omitContentHash: !!ctx.testRun,
+    lockRerun: rerunLockOf(ctx),
     runWideFlatSecrets: ctx.runWideFlatSecrets,
     dispatchInputs: ctx.dispatchInputs,
     resolvedSandboxGrants: sandboxResolution.grants,

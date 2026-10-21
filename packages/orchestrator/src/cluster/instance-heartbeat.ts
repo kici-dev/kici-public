@@ -175,6 +175,26 @@ export class InstanceHeartbeat {
 }
 
 /**
+ * Whether any cluster instance other than `selfInstanceId` has a heartbeat
+ * inside `graceMs`: true means this instance does not see the whole fleet.
+ */
+export async function hasOtherLiveInstance(
+  db: Kysely<Database>,
+  selfInstanceId: string,
+  graceMs: number,
+): Promise<boolean> {
+  const cutoff = new Date(Date.now() - Math.max(0, graceMs));
+  const row = await db
+    .selectFrom('cluster_instances')
+    .select(['instance_id'])
+    .where('instance_id', '!=', selfInstanceId)
+    .where('last_heartbeat_at', '>', cutoff)
+    .limit(1)
+    .executeTakeFirst();
+  return row !== undefined;
+}
+
+/**
  * Which of the given coordinator ids are alive now. Reads `cluster_instances`, not
  * the peer registry (empty at boot, blind under a partition — see the class above):
  * a wrong "dead" verdict means acting on a row a working coordinator owns.

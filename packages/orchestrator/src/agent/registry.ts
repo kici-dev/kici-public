@@ -144,6 +144,11 @@ export interface AgentEntry {
   /** Self-reported; null if not reported. */
   version: string | null;
   /**
+   * The compile schema the agent's workflow loader implements (self-reported in
+   * `agent.register`); null when the agent predates the field.
+   */
+  compileSchemaVersion: number | null;
+  /**
    * The `agent_tokens.id` that authenticated this connection, `null` when auth mode is
    * `none`. Indexed by `tokenIdIndex` so a synchronous revocation kick can enumerate
    * every WS authenticated by a token.
@@ -173,6 +178,8 @@ export interface AgentEntry {
 
 /** Optional static metadata from the agent.register message. */
 interface AgentMetadata {
+  /** The agent's self-reported compile schema. */
+  compileSchemaVersion?: number;
   hostname?: string;
   osRelease?: string;
   osVersion?: string;
@@ -382,6 +389,7 @@ export class AgentRegistry {
       arch,
       registeredAt: Date.now(),
       version: version ?? null,
+      compileSchemaVersion: metadata?.compileSchemaVersion ?? null,
       tokenId,
       hostname: metadata?.hostname ?? null,
       osRelease: metadata?.osRelease ?? null,

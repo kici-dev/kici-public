@@ -39,6 +39,7 @@ import type {
 import {
   normalizeLabelSet,
   findBackendForLabels,
+  findEligibleBackendsForLabels,
   detectLabelSetOverlaps,
 } from './label-matcher.js';
 import { AgentLogForwarder } from './log-forwarder.js';
@@ -137,6 +138,39 @@ function spawnFailureFields(err: unknown): Record<string, unknown> {
  * record cannot be read at all. See `ScalerManager.generateAgentId`.
  */
 const SCALER_AGENT_ID_PREFIX = 'scaler-';
+
+/** A slow fingerprint read reads as unknown rather than delaying a spawn. */
+const SPAWN_SOURCE_FINGERPRINT_TIMEOUT_MS = 5_000;
+
+/** The key a label set's learnt compile schema is stored under. */
+function spawnSourceKey(backendName: string, labelSet: string[]): string {
+  return `${backendName}:${normalizeLabelSet(labelSet)}`;
+}
+
+/**
+ * A backend's spawn-source fingerprint for `labelSet`, or `null` when the
+ * backend cannot tell, the read fails, or it takes longer than the timeout.
+ */
+async function readSpawnSourceFingerprint(
+  backend: ScalerBackend,
+  labelSet: string[],
+): Promise<string | null> {
+  if (!backend.spawnSourceFingerprint) return null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      backend.spawnSourceFingerprint(labelSet).catch(() => null),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), SPAWN_SOURCE_FINGERPRINT_TIMEOUT_MS);
+        timer.unref?.();
+      }),
+    ]);
+  } catch {
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 /**
  * Raised when a registering agent presents a scaler-minted id with no spawn
@@ -511,6 +545,12 @@ interface SpawningEntry {
    * that knows it, and this entry is what registration reads.
    */
   jobImage?: boolean;
+  /**
+   * The backend's {@link ScalerBackend.spawnSourceFingerprint} taken just before
+   * `spawn()`. In memory only, never on the durable row: knowledge learnt from
+   * this agent is trusted only while a fresh fingerprint still equals it.
+   */
+  spawnSourceFingerprint?: string | null;
 }
 
 /**
@@ -816,6 +856,15 @@ export class ScalerManager {
 
   /** Agents spawned but not yet registered via WS, keyed by pre-generated agentId. */
   private readonly spawningAgents = new Map<string, SpawningEntry>();
+  /**
+   * The compile schema (and release) the agents of each local label set reported,
+   * keyed by {@link spawnSourceKey}, with the spawn-source fingerprint they were
+   * started from. In-process only: a restart starts it empty.
+   */
+  private readonly spawnSourceSchemas = new Map<
+    string,
+    { schema: number; release: string | null; fingerprint: string }
+  >();
 
   /** Registered agentId → backendName, for lifecycle events. */
   private readonly managedAgentIndex = new Map<string, string>();
@@ -1135,9 +1184,11 @@ export class ScalerManager {
       const onEvent = this.createEventEmitter(agentId);
       // Same per-backend throttle as on-demand spawns: a cold pool fill must
       // not storm the backend socket either.
-      await this.spawnSemaphoreFor(backendName).run(() => {
+      await this.spawnSemaphoreFor(backendName).run(async () => {
         const entry = this.spawningAgents.get(agentId);
         if (entry) entry.spawnStartedAt = Date.now();
+        const fingerprinting = this.captureSpawnSourceFingerprint(agentId, backend, labelSet);
+        if (fingerprinting) await fingerprinting;
         // No bound job/org, so the cluster default spawn deadline applies.
         return this.runSpawnWithTimeout(undefined, (signal) =>
           backend.spawn(
@@ -1867,11 +1918,17 @@ export class ScalerManager {
     const ids = { agentId, scaler: backendName, runId, jobId };
     requestContext.run(logContext, () => {
       this.spawnSemaphoreFor(backendName)
-        .run(() => {
+        .run(async () => {
           // Admitted past the throttle: start the "never registered" staleness
           // clock now, not at enqueue time.
           const entry = this.spawningAgents.get(agentId);
           if (entry) entry.spawnStartedAt = Date.now();
+          const fingerprinting = this.captureSpawnSourceFingerprint(
+            agentId,
+            backend,
+            spawnLabelSet,
+          );
+          if (fingerprinting) await fingerprinting;
           return this.runSpawnWithTimeout(orgId, (signal) =>
             backend.spawn(
               spawnLabelSet,
@@ -2313,9 +2370,10 @@ export class ScalerManager {
   async onAgentRegistered(
     agentId: string,
     labels: string[],
+    reported?: { compileSchemaVersion?: number; version?: string },
   ): Promise<{ boundJobId?: string; mandatoryLabels: string[] } | null> {
     const spawning = this.spawningAgents.get(agentId);
-    if (spawning) return this.completeLocalRegistration(agentId, labels, spawning);
+    if (spawning) return this.completeLocalRegistration(agentId, labels, spawning, reported);
 
     if (!this.stateStore) {
       // A store-less manager (worker mode) loses its spawn records on restart,
@@ -2483,12 +2541,81 @@ export class ScalerManager {
     }
   }
 
+  /**
+   * Take the backend's spawn-source fingerprint onto the spawning entry. Never
+   * fails a spawn: an error or a slow answer reads as unknown. `undefined` (no
+   * wait at all) for a backend that cannot tell.
+   */
+  private captureSpawnSourceFingerprint(
+    agentId: string,
+    backend: ScalerBackend,
+    labelSet: string[],
+  ): Promise<void> | undefined {
+    if (!backend.spawnSourceFingerprint) return undefined;
+    return readSpawnSourceFingerprint(backend, labelSet).then((fingerprint) => {
+      const entry = this.spawningAgents.get(agentId);
+      if (entry) entry.spawnSourceFingerprint = fingerprint;
+    });
+  }
+
+  /**
+   * Record the compile schema a locally spawned agent reported for its label
+   * set. Only a positive schema from an agent with a known fingerprint teaches
+   * anything: without the fingerprint a later image or binary change could not
+   * be told apart.
+   */
+  private learnSpawnSourceSchema(
+    spawning: SpawningEntry,
+    reported: { compileSchemaVersion?: number; version?: string } | undefined,
+  ): void {
+    const schema = reported?.compileSchemaVersion;
+    const fingerprint = spawning.spawnSourceFingerprint;
+    if (typeof schema !== 'number' || !Number.isInteger(schema) || schema <= 0) return;
+    if (!fingerprint) return;
+    this.spawnSourceSchemas.set(spawnSourceKey(spawning.backendName, spawning.labelSet), {
+      schema,
+      release: reported?.version ?? null,
+      fingerprint,
+    });
+  }
+
+  /**
+   * What this instance knows about the compile schema of the agents a scaler
+   * could start for `labels`: one entry per label set that could take the job
+   * (empty when none can), each with a schema known only while its fingerprint
+   * is unchanged since an agent of it reported one. Every eligible set, not
+   * only the one `requestScale` would pick: the job's exclusions and runtime
+   * labels can move that pick, and the gate must not judge the wrong source.
+   */
+  async compileSchemaForLabels(
+    labels: string[],
+  ): Promise<Array<{ source: string; schema: number | null; release: string | null }>> {
+    const out: Array<{ source: string; schema: number | null; release: string | null }> = [];
+    for (const match of findEligibleBackendsForLabels(labels, this.getEnrichedScalerEntries())) {
+      const backend = this.backends.get(match.scalerName);
+      if (!backend) continue;
+      const labelSet = backend.labelSets[match.labelSetIndex]?.labels ?? [];
+      const key = spawnSourceKey(match.scalerName, labelSet);
+      const source = `scaler:${key}`;
+      const learnt = this.spawnSourceSchemas.get(key);
+      const fingerprint = learnt ? await readSpawnSourceFingerprint(backend, labelSet) : null;
+      out.push(
+        learnt && fingerprint !== null && fingerprint === learnt.fingerprint
+          ? { source, schema: learnt.schema, release: learnt.release }
+          : { source, schema: null, release: null },
+      );
+    }
+    return out;
+  }
+
   /** Finish registration for an agent this instance spawned, from its spawning entry. */
   private completeLocalRegistration(
     agentId: string,
     labels: string[],
     spawning: SpawningEntry,
+    reported?: { compileSchemaVersion?: number; version?: string },
   ): { boundJobId?: string; mandatoryLabels: string[] } {
+    this.learnSpawnSourceSchema(spawning, reported);
     // Capture warm-vs-bound now: the spawning entry, the only carrier of that
     // fact, is deleted below.
     if (spawning.boundJobId == null) {

@@ -2,6 +2,32 @@
 
 Release notes for the public KiCI packages.
 
+## v0.25.0 — 2026-10-21
+
+### Fixes
+
+- On an orchestrator attached to the Platform, kici-admin source add github files the source under the attached org, so its runs read that org's contexts, secrets and trust policy. Existing sources keep their org; kici-admin source list, org list, orchestrator status and trust-policy show report a source outside the attached org. kici-admin runs show names the run's org. A refused git credential now reaches the job as a refusal instead of an internal error.
+- kici runs rerun, the dashboard re-run and Run now buttons, and the MCP rerun_run and trigger_run tools return the new run id once the orchestrator accepts the request; a dispatch failure fails that run, and a timeout is reported as unconfirmed, not failed
+- kici runs rerun and kici runs cancel accept the first characters of a run id, as kici runs show does, and kici runs show prints why a failed run failed when no init failure explains it
+- A global workflow run that fails before any job starts now records its workflow commit, so you can re-run it.
+- The orchestrator now flags a workflow lock compiled for a compile schema its agents do not implement. The workflows page, `kici-admin workflow list`, `kici-admin diagnose`, the startup log and `kici-admin orchestrator upgrade` show it. A single orchestrator fails such a run before any agent starts. The error names the repository that holds the lock, tells you which compiler to recompile with, and says that a re-run keeps the old lock. A global workflow's setup check now carries the workflow repository in its name, and a re-run that fails before its jobs start completes all of its checks.
+- A re-run the Platform could not confirm in time now starts the short re-run cooldown, so retrying right away is refused instead of starting a second run
+- A re-run or Run now retried after an unconfirmed start returns the run the first request started instead of starting a second one.
+- The MCP rerun_run tool enforces the 5-second per-run re-run cooldown, as the dashboard and kici runs rerun do.
+- Fleet bring-up retries an SSH connection that times out before the session starts, so a slow target (for example a small board that is unpacking the agent package) no longer fails the bring-up on one late connection.
+
+### Other
+
+- The quickstart examples now run SeaweedFS 4.48, which fixes GHSA-2v4p-qf9q-27wj.
+- The orchestrator and agent container images now run Node.js 24.22.0.
+- The agent image bakes pnpm 11.28.6, which the agent's isolated dependency install now runs.
+- The orchestrator and agent now resolve @grpc/grpc-js 1.14.6 and axios 1.20.0, which clear GHSA-m9gg-hp2v-232j and seven axios advisories.
+- The published packages resolve moment 2.31.0 for daily log rotation, which clears GHSA-4p3w-j4w9-5jqw.
+- Runtime dependency update in the published packages: oxc-transform 0.154.0, the TypeScript transform under the kici CLI's workflow loader and the agent.
+- Trigger JSONPath matching (match/not, content requirements, changed-files paths) now runs on jsonpath-plus 11.2.1, which fixes a nested-filter bypass that let a filter expression write to Object.prototype. An explicit zero slice end such as [0:0] now selects nothing instead of the whole array, and a bare @ filter such as [?(@)] is accepted.
+- Runtime dependency updates in the published packages: zod 4.6.7 (all), hono 4.13.13 and @hono/node-server 2.1.5 (agent, orchestrator, shared), ws 8.22.0 (kici CLI, agent, orchestrator), kysely 0.29.7 and pg 8.23.1 (orchestrator, shared), @aws-sdk/* 3.1152.0 (orchestrator and shared storage client), @inquirer/prompts 8.7.3, lru-cache 11.5.3, nanoid 6.0.2 and wsl-utils 1.0.1. kici-admin downloads rolldown 1.2.14 for its lazy-dep @rolldown/binding-* entries.
+- The Node.js runtime that the agent mounts into job containers is now 24.22.0, the same release the agent runs.
+
 ## v0.24.0 — 2026-10-19
 
 ### Fixes

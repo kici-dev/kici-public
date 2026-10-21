@@ -1,5 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
-import { GitCredentialBroker, type BrokerGateContext } from './credential-broker.js';
+import {
+  GitCredentialBroker,
+  GitCredentialRefusedError,
+  type BrokerGateContext,
+} from './credential-broker.js';
 
 /**
  * A resolver whose every matched context resolves to `values` through its
@@ -268,9 +272,50 @@ describe('GitCredentialBroker', () => {
       sourceAuth: noSource,
       mint: vi.fn(),
     });
-    await expect(broker.resolve({ orgId: 'org-1', gate, repositories: ['a/b'] })).rejects.toThrow(
-      /No source credential is configured for 'a\/b'/,
-    );
+    const err = await broker
+      .resolve({ orgId: 'org-1', gate, repositories: ['a/b'] })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GitCredentialRefusedError);
+    expect((err as Error).message).toMatch(/No source credential is configured for 'a\/b'/);
+  });
+
+  it('refuses a malformed or incomplete reference as a typed refusal', async () => {
+    // fails-when: a request-derived refusal is a plain Error, which the relay
+    // turns into the fixed internal error.
+    const broker = new GitCredentialBroker({
+      secretResolver: secretResolver({}),
+      contextStore: permissiveContexts(),
+      sourceAuth: noSource,
+      mint: vi.fn(),
+    });
+    for (const ref of [
+      { kind: 'token' as const, tokenSecret: 'no-colon' },
+      { kind: 'token' as const },
+    ]) {
+      const err = await broker
+        .resolve({ orgId: 'org-1', gate, repositories: ['a/b'], ref: ref as never })
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(GitCredentialRefusedError);
+    }
+  });
+
+  it('keeps a mint failure a plain error', async () => {
+    // breaks-if-wrong: an infrastructure failure must never read as a refusal.
+    const broker = new GitCredentialBroker({
+      secretResolver: secretResolver({}),
+      contextStore: permissiveContexts(),
+      sourceAuth: noSource,
+      mint: vi.fn().mockRejectedValue(new Error('GitHub 502')),
+    });
+    const err = await broker
+      .resolve({
+        orgId: 'org-1',
+        gate,
+        repositories: ['a/b'],
+        ref: { kind: 'app', appIdValue: '1', installationIdValue: '2', privateKeyValue: 'k' },
+      })
+      .catch((e: unknown) => e);
+    expect(err).not.toBeInstanceOf(GitCredentialRefusedError);
   });
 
   it("refuses a reference into the orchestrator's own reserved namespace", async () => {
@@ -343,16 +388,18 @@ describe('GitCredentialBroker', () => {
         mint: vi.fn(),
         secretOutputs: async () => null,
       });
-      await expect(
-        broker.resolve({
+      const err = await broker
+        .resolve({
           orgId: 'org-1',
           gate,
           repositories: ['a/b'],
           ref: { kind: 'token', tokenSecret: 'needs:ABSENT' },
           runId: 'run-1',
           jobId: 'job-2',
-        }),
-      ).rejects.toThrow(/setSecretOutput\('ABSENT'/);
+        })
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(GitCredentialRefusedError);
+      expect((err as Error).message).toMatch(/setSecretOutput\('ABSENT'/);
     });
 
     it('does not reach the ordinary secret store for a needs: reference', async () => {

@@ -38,6 +38,7 @@ import type { LockFileCache } from './lockfile-cache.js';
 import type { ContentRequirementsCache } from './content-requirements-cache.js';
 import type { PlatformClient } from './ws/platform-client.js';
 import type { ScalerManager } from './scaler/manager.js';
+import type { CompileSchemaView } from './pipeline/compile-schema-gate.js';
 import type { ProviderRegistry } from './provider-registry.js';
 import type { SourceCache } from './cache/index.js';
 import type { BuildCoordinator } from './cache/index.js';
@@ -240,6 +241,8 @@ export interface AppDependencies {
     includeRejected?: boolean;
   }) => Promise<{ minted: number; stillPending: number; rejected: number }>;
   scalerManager?: ScalerManager;
+  /** The dispatch-time compile-schema gate's view of agents and scalers. */
+  compileSchemaView?: CompileSchemaView;
   /** Bundle cache for compiled workflow bundles. Optional — requires S3 storage. */
   sourceCache?: SourceCache;
   /** Build coordinator for deduplicating concurrent builds. Optional — requires bundle cache. */
@@ -1024,8 +1027,9 @@ export function createApp(deps: AppDependencies) {
               );
             }
           : undefined,
-        onScalerAgentRegistered: async (agentId, labels) => {
-          const result = (await deps.scalerManager?.onAgentRegistered(agentId, labels)) ?? null;
+        onScalerAgentRegistered: async (agentId, labels, reported) => {
+          const result =
+            (await deps.scalerManager?.onAgentRegistered(agentId, labels, reported)) ?? null;
           deps.onAgentInventoryChanged?.(); // broadcast heartbeat to peers
           return result;
         },

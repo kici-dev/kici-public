@@ -15,10 +15,12 @@ Lists every org id this orchestrator holds data for. The commands that take an o
 
 - `platform` — the org the Platform attached this orchestrator to. Only the admin API reports it.
 - `remote-source` — the anchor for `kici run remote`, created when the orchestrator authenticates with the Platform.
-- `source`, `generic-source` — webhook sources. A source added without an org is filed under `__default__`.
+- `source`, `generic-source` — webhook sources. On an orchestrator attached to the Platform, a GitHub source added without an org belongs to the attached org. On an independent orchestrator, it belongs to `__default__`.
 - `context`, `secret`, `org-settings`, `trust-policy`, `registration` — the data of those commands.
 
 The command reads the orchestrator admin API (`GET /api/v1/admin/org-ids`). It needs an unscoped admin token with the `secret.read` permission (owner or admin). `--database-url` (or `KICI_DATABASE_URL`) reads the orchestrator database instead. That mode cannot see the Platform connection, so it does not list the `platform` source, and the table output says so. With `--json`, the output is `{ "platformAttachment": "attached" | "pending" | "none", "attachedOrgId": …, "orgs": [{ "orgId": …, "sources": […] }] }`. The database mode leaves out the first two fields. `pending` means that the orchestrator has not authenticated with the Platform yet.
+
+When the orchestrator is attached to the Platform and another org holds a source, the table output adds a note on stderr. The runs of that source use the other org's contexts, secrets and trust policy. See [which org a source belongs to](./sources.md#which-org-a-source-belongs-to).
 
 `kici-admin orchestrator status` also shows the Platform org. See [cluster and infrastructure](./cluster-and-infra.md).
 
@@ -299,6 +301,8 @@ The org-wide switch deciding what happens to a pull request from a fork. `--fork
 `--approval-expiry` sets how long a security hold waits for an approval before it expires. It takes a duration made of hours, minutes, and seconds, in that order and with no spaces: `72h`, `30m`, `90s`, or `1h30m`. The window is from 1 second to 1 year. A value outside that range, or one that is not a duration, stops the command with an error.
 
 `show` prints the window as a duration, for example `72h` or `1h30m`.
+
+A run uses the trust policy of its source's org. On an orchestrator attached to the Platform, the dashboard manages the policy of the attached org. A source in another org, such as `__default__`, uses the policy of that org. When this split exists, the table output of `show` adds a note on stderr. For the attached org, the note names the orgs whose sources do not use this policy. For the other org, it says that its sources use this policy. `--format json` output does not change. See [which org a source belongs to](./sources.md#which-org-a-source-belongs-to).
 
 `directory` prints the stored approval directory — the identity links, member CI trust levels, and teams that `/kici approve` is resolved against. Use it to tell a stale directory from an absent one when an approval comment is refused.
 

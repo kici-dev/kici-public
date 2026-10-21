@@ -21,7 +21,11 @@ async function write(root: string, rel: string, content: string): Promise<void> 
   await writeFile(path.join(root, rel), content);
 }
 
-/** Drain a pack stream; resolves `'timeout'` when it has not ended after `ms`. */
+/**
+ * Drain a pack stream; resolves `'timeout'` when it has not ended after `ms`.
+ * A test that passes a budget above vitest's 5s default sets its own larger
+ * timeout, so a slow run reaches this budget instead of being killed first.
+ */
 async function drain(stream: AsyncIterable<unknown>, ms: number): Promise<Buffer | 'timeout'> {
   const chunks: Buffer[] = [];
   const done = (async () => {
@@ -93,7 +97,7 @@ describe('singleLinkTarCaches', () => {
     expect(await readFile(path.join(out, 'b-link'), 'utf-8')).toBe('shared content\n');
     expect(await readFile(path.join(out, 'e-twin'), 'utf-8')).toBe('shared content\n');
     expect(await readFile(path.join(out, 'd'), 'utf-8')).toBe('d\n');
-  });
+  }, 15_000);
 
   it('keys both caches exactly as node-tar does for a directory walk', async () => {
     // No hard links here, so node-tar packs on its own and fills the maps it
@@ -117,7 +121,7 @@ describe('singleLinkTarCaches', () => {
     expect(ours.statCache.get(path.join(root, 'pkg-link'))?.isSymbolicLink()).toBe(true);
     expect(ours.readdirCache.has(path.join(root, 'pkg-link'))).toBe(false);
     expect(ours.readdirCache.has(path.join(root, 'skip/huge'))).toBe(false);
-  });
+  }, 15_000);
 
   it('packs a pnpm-like node_modules directory and restores identical content', async () => {
     const root = await tempDir();
@@ -155,5 +159,5 @@ describe('singleLinkTarCaches', () => {
       '.pnpm/p3@1.0.0/node_modules/p3',
     );
     expect(await readFile(path.join(out, 'node_modules/p3/f2.js'), 'utf-8')).toBe('module 3.2\n');
-  });
+  }, 30_000);
 });

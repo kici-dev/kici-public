@@ -34,6 +34,8 @@
  */
 
 import { type Context as EngineContext, type TrustTier } from '@kici-dev/engine';
+import { createLogger } from '@kici-dev/shared';
+import { z } from 'zod';
 import type { ContextStore } from '../contexts/context-store.js';
 import { toContext } from '../contexts/context-store.js';
 import {
@@ -42,6 +44,8 @@ import {
 } from '../contexts/protection/pipeline.js';
 import { isUntrustedTier } from '../security/trust-tier.js';
 import type { SecretResolverApi, SecretResolutionAttribution } from './secret-resolver.js';
+
+const logger = createLogger({ prefix: 'job-secret-gate' });
 
 /**
  * The org id the orchestrator stores its OWN credentials under — GitHub App
@@ -58,18 +62,42 @@ export const RESERVED_ORG_ID = '__system__';
  */
 const RESERVED_SCOPE_PREFIX = /^__/;
 
+/** Which check refused a job's qualified secret reference. */
+export const JobSecretRefusalKind = z.enum([
+  'reserved-namespace',
+  'untrusted',
+  'missing-context',
+  'context-rejected',
+  'missing-secret',
+]);
+export type JobSecretRefusalKind = z.infer<typeof JobSecretRefusalKind>;
+
 /**
  * A refusal this module decides — a reserved namespace, an untrusted tier, a
  * context that does not exist or does not admit the run, a secret that is not
  * there. Distinct from a store or resolver failure, which propagates as-is, so
  * a caller can tell "this job may not have it" from "we could not look".
+ * `kind` names the check; `context` is the context half of the reference.
  */
 export class JobSecretRefusedError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly kind: JobSecretRefusalKind,
+    readonly context: string,
+  ) {
     super(message);
     this.name = 'JobSecretRefusedError';
   }
 }
+
+/**
+ * The sentence added to a run-visible message when a context the run names is
+ * missing in its org but another org on this orchestrator has one. It never
+ * names the other org: run-visible text names only the run's own org.
+ */
+export const OTHER_ORG_HAS_CONTEXT =
+  'Another org on this orchestrator has a context with that name: check which org the ' +
+  "run's source routes to (kici-admin source list).";
 
 /**
  * Refuse a reference into the orchestrator's own reserved namespace.
@@ -88,12 +116,16 @@ export function assertResolvableJobScope(orgId: string, context: string): void {
   if (orgId === RESERVED_ORG_ID) {
     throw new JobSecretRefusedError(
       `Refusing a secret lookup under the reserved '${RESERVED_ORG_ID}' organisation.`,
+      JobSecretRefusalKind.enum['reserved-namespace'],
+      context,
     );
   }
   if (RESERVED_SCOPE_PREFIX.test(context)) {
     throw new JobSecretRefusedError(
       `Refusing a secret lookup in the reserved '${context}' namespace: ` +
         `contexts beginning with '__' belong to the orchestrator, not to a workflow.`,
+      JobSecretRefusalKind.enum['reserved-namespace'],
+      context,
     );
   }
 }
@@ -119,6 +151,35 @@ export interface ResolveJobQualifiedSecretArgs {
 }
 
 /**
+ * The refusal for a context missing in the run's org. When another org on
+ * this orchestrator has a context of that name, the message says so without
+ * naming it, and the log names it for the operator.
+ */
+async function missingContextRefusal(
+  contextStore: ContextStore,
+  orgId: string,
+  context: string,
+  args: Pick<ResolveJobQualifiedSecretArgs, 'runId' | 'jobId'>,
+): Promise<JobSecretRefusedError> {
+  const others = await contextStore.orgsMatchingContext(context, orgId);
+  if (others.length > 0) {
+    logger.warn('Secret reference names a context missing in the run org', {
+      orgId,
+      context,
+      otherOrgIds: others,
+      runId: args.runId,
+      jobId: args.jobId,
+    });
+  }
+  return new JobSecretRefusedError(
+    `Secret reference names context '${context}', which does not exist in org '${orgId}'.` +
+      (others.length > 0 ? ` ${OTHER_ORG_HAS_CONTEXT}` : ''),
+    JobSecretRefusalKind.enum['missing-context'],
+    context,
+  );
+}
+
+/**
  * Resolve one `<context>:<key>` reference on behalf of a running job.
  *
  * Throws — with a reason naming the check that refused — rather than returning
@@ -136,15 +197,13 @@ export async function resolveJobQualifiedSecret(
     throw new JobSecretRefusedError(
       `Refusing to resolve '${context}:' secrets for a run whose contributor tier is ` +
         `'${trustTier}'. Only a trusted ref may read workflow secrets.`,
+      JobSecretRefusalKind.enum.untrusted,
+      context,
     );
   }
 
   const row = await contextStore.matchContext(orgId, context);
-  if (!row) {
-    throw new JobSecretRefusedError(
-      `Secret reference names context '${context}', which does not exist.`,
-    );
-  }
+  if (!row) throw await missingContextRefusal(contextStore, orgId, context, args);
   const env: EngineContext = toContext(row);
 
   // The job scope is the concurrency group, matching how the workflow-install
@@ -165,6 +224,8 @@ export async function resolveJobQualifiedSecret(
     throw new JobSecretRefusedError(
       `Context '${context}' does not admit this run (${verdict.action}): ` +
         `${verdict.reason ?? 'rejected by a protection rule'}`,
+      JobSecretRefusalKind.enum['context-rejected'],
+      context,
     );
   }
 
@@ -186,6 +247,8 @@ export async function resolveJobQualifiedSecret(
   if (value === undefined) {
     throw new JobSecretRefusedError(
       `Secret not found: context=${context} key=${key} (no secret bound to that context carries the key)`,
+      JobSecretRefusalKind.enum['missing-secret'],
+      context,
     );
   }
   return value;

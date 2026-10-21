@@ -1,5 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { buildGitCredentialHandler, type JobCredentialContext } from './git-credential-relay.js';
+import { AgentApiRefusalError } from './agent-api-registry.js';
+import { GitCredentialRefusedError } from '../git/credential-broker.js';
+import { JobSecretRefusalKind, JobSecretRefusedError } from '../secrets/job-secret-gate.js';
 
 const ownedDispatcher = {
   resolveOwnedJob: vi.fn((_agentId: string, jobId: string) =>
@@ -413,5 +416,117 @@ describe('git credential relay handler', () => {
       });
       expect(broker.resolve).toHaveBeenCalled();
     });
+  });
+});
+
+describe('git credential refusals reach the job typed', () => {
+  const REQUEST = { jobId: 'job-1', repositories: ['acme/main'], ref: { ...DECLARED_APP_REF } };
+  const K = JobSecretRefusalKind.enum;
+  const RULE = "branch 'no-such-branch' is not allowed";
+
+  async function errorFrom(p: Promise<unknown>): Promise<Error> {
+    return p.then(
+      () => {
+        throw new Error('expected a refusal');
+      },
+      (e: Error) => e,
+    );
+  }
+
+  const brokerThrowing = (err: Error) => ({ resolve: vi.fn().mockRejectedValue(err) });
+
+  it('throws each relay refusal as an AgentApiRefusalError with its wording', async () => {
+    const broker = { resolve: vi.fn() };
+    const cases: Array<[Promise<unknown>, RegExp]> = [
+      [handlerWith(broker)('agent-1', { ...REQUEST, jobId: 'job-x' }), /not owned by agent/],
+      [
+        buildGitCredentialHandler({
+          broker: broker as never,
+          dispatcher: ownedDispatcher,
+          jobContext: async () => null,
+        })('agent-1', REQUEST),
+        /Unknown job/,
+      ],
+      [
+        handlerWith(broker)('agent-1', {
+          jobId: 'job-1',
+          repositories: ['other/x'],
+          permissions: { contents: 'write' },
+        }),
+        /outside the organisation/,
+      ],
+      [
+        handlerWith(broker, jobFacts({ trustTier: 'unknown' }))('agent-1', REQUEST),
+        /contributor tier/,
+      ],
+      [
+        handlerWith(broker)('agent-1', { ...REQUEST, ref: { kind: 'token', tokenSecret: 'x:Y' } }),
+        /not declared by this job's lock/,
+      ],
+    ];
+    for (const [p, wording] of cases) {
+      const err = await errorFrom(p);
+      // fails-when: the relay throws a plain Error, which the job sees as an internal error.
+      expect(err).toBeInstanceOf(AgentApiRefusalError);
+      expect(err.message).toMatch(wording);
+    }
+  });
+
+  it('names the context and the run org for a rule refusal, and does not leak the rule', async () => {
+    const err = await errorFrom(
+      handlerWith(
+        brokerThrowing(
+          new JobSecretRefusedError(
+            `Context 'ci' does not admit this run (reject): ${RULE}`,
+            K['context-rejected'],
+            'ci',
+          ),
+        ),
+      )('agent-1', REQUEST),
+    );
+    expect(err).toBeInstanceOf(AgentApiRefusalError);
+    expect(err.message).toContain("Refusing a git credential for 'acme/main'");
+    expect(err.message).toContain("context 'ci'");
+    expect(err.message).toContain("org 'org-1'");
+    // fails-when: the protection rule text is interpolated into the job message.
+    expect(err.message).not.toContain('no-such-branch');
+  });
+
+  it('gives the three context kinds one merged message', async () => {
+    // fails-when: the relay forwards JobSecretRefusedError.message, which tells
+    // a missing context from a rejecting one.
+    const messages = new Set<string>();
+    for (const kind of [K['missing-context'], K['context-rejected'], K['missing-secret']]) {
+      const err = await errorFrom(
+        handlerWith(brokerThrowing(new JobSecretRefusedError(`detail ${kind}`, kind, 'ci')))(
+          'agent-1',
+          REQUEST,
+        ),
+      );
+      messages.add(err.message);
+    }
+    expect(messages.size).toBe(1);
+  });
+
+  it('forwards a broker refusal with its message', async () => {
+    const err = await errorFrom(
+      handlerWith(
+        brokerThrowing(
+          new GitCredentialRefusedError("No source credential is configured for 'acme/main'."),
+        ),
+      )('agent-1', { jobId: 'job-1', repositories: ['acme/main'] }),
+    );
+    expect(err).toBeInstanceOf(AgentApiRefusalError);
+    expect(err.message).toBe(
+      "Refusing a git credential for 'acme/main': No source credential is configured for 'acme/main'.",
+    );
+  });
+
+  it('keeps a plain broker error untyped', async () => {
+    // breaks-if-wrong: an infrastructure failure keeps the fixed internal error.
+    const err = await errorFrom(
+      handlerWith(brokerThrowing(new Error('GitHub 502')))('agent-1', REQUEST),
+    );
+    expect(err).not.toBeInstanceOf(AgentApiRefusalError);
   });
 });

@@ -1,4 +1,4 @@
-import { monitorEventLoopDelay, type IntervalHistogram } from 'node:perf_hooks';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 
 /**
  * Event-loop delay source for the ingest admission controller's adaptive gate.
@@ -24,7 +24,7 @@ const nsToMs = (ns: number): number => (Number.isFinite(ns) ? ns / 1e6 : 0);
 
 /** Real source backed by `perf_hooks.monitorEventLoopDelay`. */
 export class RealLoopLagSource implements LoopLagSource {
-  private readonly h: IntervalHistogram;
+  private readonly h: ReturnType<typeof monitorEventLoopDelay>;
   constructor(resolutionMs = 10) {
     this.h = monitorEventLoopDelay({ resolution: resolutionMs });
     this.h.enable();

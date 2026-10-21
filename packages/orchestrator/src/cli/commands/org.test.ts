@@ -93,9 +93,26 @@ describe('kici-admin org list', () => {
     expect(r.exitCode).toBeNull();
   });
 
+  it('notes a source in an org other than the attached one on stderr', async () => {
+    // fails-when: the __default__ source in HTTP_BODY lists with no sign of the split.
+    const r = await run(['org', 'list']);
+    expect(r.stderr).toContain("sources in org(s) '__default__'");
+    expect(r.stderr).toContain("not under 'org_a'");
+  });
+
+  it('prints no split note when every source is in the attached org', async () => {
+    const body = { ...HTTP_BODY, orgs: [HTTP_BODY.orgs[1]] };
+    const r = await run(
+      ['org', 'list'],
+      vi.fn(async () => body),
+    );
+    expect(r.stderr).not.toContain('Note: sources');
+  });
+
   it('prints the admin API body verbatim with --json', async () => {
     const r = await run(['org', 'list', '--json']);
     expect(JSON.parse(r.stdout)).toEqual(HTTP_BODY);
+    expect(r.stderr).toBe('');
   });
 
   // fails-when: --database-url is ignored and the command still calls the admin API

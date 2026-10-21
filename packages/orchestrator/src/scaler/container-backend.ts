@@ -10,7 +10,7 @@ import { createInterface } from 'node:readline';
 import Docker from 'dockerode';
 import { createLogger, toErrorMessage, type ToolRequirement } from '@kici-dev/shared';
 import { KICI_AGENT_ENV_PREFIX, scalerAgentLabels, ScalerBackendType } from '@kici-dev/engine';
-import { normalizeLabelSet } from './label-matcher.js';
+import { labelSetsMatch, normalizeLabelSet } from './label-matcher.js';
 import { AGENT_SUDO_GROUP_GID, buildAgentContainerHostConfig } from './container-hostconfig.js';
 import { containerRuntimeForSocketPath } from './container-runtime.js';
 import {
@@ -30,6 +30,7 @@ import {
   ensureRuntimeVolume,
   runtimeInjectBind,
   injectedAgentCommand,
+  agentImageId,
   agentImageLabels,
   runtimeInitCommand,
 } from '@kici-dev/shared/container-runtime';
@@ -446,6 +447,17 @@ export class ContainerScalerBackend implements ScalerBackend {
 
   get labelSets(): LabelSetConfig[] {
     return this._labelSets;
+  }
+
+  /**
+   * The label set's agent image ID: the agent build a spawn would start.
+   * `null` under `imagePullPolicy: Always` (each spawn may pull a newer image)
+   * or when the image is absent.
+   */
+  async spawnSourceFingerprint(labelSet: string[]): Promise<string | null> {
+    const ls = this._labelSets.find((l) => labelSetsMatch(l.labels, labelSet));
+    if (!ls?.image || ls.imagePullPolicy === ImagePullPolicy.enum.Always) return null;
+    return agentImageId(this.docker, ls.image);
   }
 
   getActiveCount(): number {

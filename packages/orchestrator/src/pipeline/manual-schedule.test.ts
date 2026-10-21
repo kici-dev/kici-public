@@ -1,3 +1,4 @@
+import { settleAcceptedDispatches } from './accepted-dispatch.js';
 import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import { handleManualSchedule, mergeScheduleInputs } from './manual-schedule.js';
 import type { LockScheduleTrigger } from '@kici-dev/engine';
@@ -88,14 +89,17 @@ function makeDeps(registration: ReturnType<typeof makeRegistration> | null) {
   const providerBundle = { normalizer: { provider: 'github' } };
   const eventRouter = { emit: vi.fn().mockResolvedValue(undefined) };
   const processingDeps = { orchestratorMode: 'platform' };
+  const executionTracker = { recordAcceptedDispatchFailure: vi.fn().mockResolvedValue(undefined) };
   return {
     deps: {
       providerRegistry: { getByRoutingKey: vi.fn().mockReturnValue(providerBundle) },
       registrationIndex: { getById: vi.fn().mockReturnValue(registration) },
       eventRouter,
+      executionTracker,
       processingDeps: () => processingDeps,
     } as never,
     eventRouter,
+    executionTracker,
     providerBundle,
     processingDeps,
   };
@@ -124,6 +128,7 @@ describe('handleManualSchedule', () => {
       harness.deps,
       'req-test',
     );
+    await settleAcceptedDispatches();
 
     // fails-when: the fire hand-builds its own job config, which drops needs
     // ordering, contexts, containers and the cache identity every artifact
@@ -171,6 +176,7 @@ describe('handleManualSchedule', () => {
     );
 
     await handleManualSchedule('reg-abc', null, null, harness.deps, 'req-test');
+    await settleAcceptedDispatches();
 
     expect('dispatchInputs' in (dispatched.mock.calls[0][4] as object)).toBe(false);
   });
@@ -179,9 +185,92 @@ describe('handleManualSchedule', () => {
     const requestId = 'req-schedule-dedupe';
     const first = await handleManualSchedule('reg-abc', 'u', null, harness.deps, requestId);
     const second = await handleManualSchedule('reg-abc', 'u', null, harness.deps, requestId);
+    await settleAcceptedDispatches();
 
     expect(second.newRunId).toBe(first.newRunId);
+    // fails-when: the lost claim answers without the flag, so the client cannot tell
+    expect(second.alreadyAccepted).toBe(true);
+    // breaks-if-wrong: the winning claim must not claim an earlier delivery
+    expect(first).not.toHaveProperty('alreadyAccepted');
+    // fails-when: a lost claim starts a second dispatch
     expect(dispatched).toHaveBeenCalledOnce();
+  });
+
+  describe('answered once accepted', () => {
+    function holdDispatch(): { release: () => void } {
+      let release: () => void = () => {};
+      dispatched.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release = () => resolve({});
+          }),
+      );
+      return { release: () => release() };
+    }
+
+    it('answers before its dispatch settles, and emits only after the dispatch', async () => {
+      const held = holdDispatch();
+      // fails-when: the handler awaits the dispatch, so it never answers while
+      // the dispatch is held
+      const answer = await Promise.race([
+        handleManualSchedule('reg-abc', 'u', null, harness.deps, 'req-early'),
+        new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), 1_000)),
+      ]);
+      expect(answer).toEqual({ newRunId: 'mock-schedule-run-1' });
+      await vi.waitFor(() => expect(dispatched).toHaveBeenCalledOnce());
+      expect(harness.eventRouter.emit).not.toHaveBeenCalled();
+
+      held.release();
+      await settleAcceptedDispatches();
+      expect(harness.eventRouter.emit).toHaveBeenCalledWith(
+        expect.objectContaining({ eventName: 'workflow.manual_schedule' }),
+      );
+      expect(harness.executionTracker.recordAcceptedDispatchFailure).not.toHaveBeenCalled();
+    });
+
+    it('fails the accepted run when its dispatch throws', async () => {
+      dispatched.mockRejectedValue(new Error('source cache unreachable'));
+
+      const { newRunId } = await handleManualSchedule(
+        'reg-abc',
+        'user@test.com',
+        'ci-bot',
+        harness.deps,
+        'req-throws',
+      );
+      await settleAcceptedDispatches();
+
+      expect(harness.executionTracker.recordAcceptedDispatchFailure).toHaveBeenCalledOnce();
+      expect(harness.executionTracker.recordAcceptedDispatchFailure).toHaveBeenCalledWith(
+        expect.objectContaining({
+          runId: newRunId,
+          failureReason: 'Schedule fired by hand could not be dispatched: source cache unreachable',
+          workflowName: 'heartbeat',
+          provider: 'github',
+          repoIdentifier: 'owner/repo',
+          ref: 'main',
+          sha: 'abc123def',
+          routingKey: 'github:42',
+          providerContext: { installationId: 42 },
+          deliveryId: `manual_schedule:${newRunId}`,
+          triggerEvent: 'manual_schedule',
+          triggeredBy: 'user@test.com',
+          triggeredByAgentLabel: 'ci-bot',
+        }),
+      );
+      expect(harness.eventRouter.emit).not.toHaveBeenCalled();
+    });
+
+    it('keeps a dispatched run when the event emit fails', async () => {
+      harness.eventRouter.emit.mockRejectedValue(new Error('event store down'));
+
+      await handleManualSchedule('reg-abc', null, null, harness.deps, 'req-emit-fails');
+      await settleAcceptedDispatches();
+
+      // breaks-if-wrong: a failed emit after a good dispatch must not fail the live run
+      expect(dispatched).toHaveBeenCalledOnce();
+      expect(harness.executionTracker.recordAcceptedDispatchFailure).not.toHaveBeenCalled();
+    });
   });
 
   it('throws if registration has no commit SHA', async () => {

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { COMPILE_SCHEMA_VERSION } from '@kici-dev/shared';
 import {
   createAdminRegistrationRoutes,
   type AdminRegistrationRoutesDeps,
@@ -128,6 +129,17 @@ describe('admin registration routes', () => {
       expect(body.registrations).toHaveLength(1);
       expect(body.total).toBe(1);
       expect(body.registrations[0].workflow_name).toBe('ci');
+    });
+
+    // fails-when: the rows carry no schema fields, so `kici-admin workflow list` cannot flag a
+    // lock this release's agents reject
+    it("carries each lock's compile schema and the agents' schema", async () => {
+      const stale = { ...sampleRegistration, lock_entry: { name: 'ci', compileSchemaVersion: 2 } };
+      (deps.registrationStore.getAll as any).mockResolvedValue([stale]);
+      const res = await request(app, 'GET', '/registrations', { token: validToken });
+      const body = await res.json();
+      expect(body.registrations[0].compileSchemaVersion).toBe(2);
+      expect(body.registrations[0].agentCompileSchemaVersion).toBe(COMPILE_SCHEMA_VERSION);
     });
 
     it('filters by routingKey', async () => {
@@ -511,18 +523,47 @@ describe('admin registration routes', () => {
       expect(deps.registrationStore.replaceAll).not.toHaveBeenCalled();
     });
 
-    it('accepts a satisfiable multi-env binding', async () => {
-      const matchContext = vi.fn(async (_org: string, name: string) => envRecord(name, ['main']));
+    /** An owner-authenticated app whose store accepts every upsert. */
+    function ownerApp(over: Record<string, unknown> = {}): void {
       deps = createMockDeps({
         registrationStore: {
           ...(createMockDeps().registrationStore as any),
           replaceAll: vi.fn(),
           bumpVersion: vi.fn().mockResolvedValue(7),
         },
-        contextStore: { matchContext } as any,
+        ...over,
       });
       app = createAdminRegistrationRoutes(deps);
       (deps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'owner', label: 't' });
+    }
+
+    it('returns a warning for each workflow whose lock has a stale compile schema', async () => {
+      ownerApp();
+      const body = lockBody([]);
+      const lock = JSON.parse(body.lockFileContents) as {
+        workflows: Array<Record<string, unknown>>;
+      };
+      lock.workflows[0]!.compileSchemaVersion = 2;
+      lock.workflows.push({
+        name: 'fresh',
+        compileSchemaVersion: COMPILE_SCHEMA_VERSION,
+        jobs: [],
+      });
+
+      const res = await request(app, 'POST', '/registrations/register-manual', {
+        token: validToken,
+        body: { ...body, lockFileContents: JSON.stringify(lock) },
+      });
+      const json = await res.json();
+      expect(res.status).toBe(200);
+      expect(json.warnings).toHaveLength(1);
+      expect(json.warnings[0]).toContain('owner/repo workflow ci');
+      expect(json.warnings[0]).toContain('compile schema 2');
+    });
+
+    it('accepts a satisfiable multi-env binding', async () => {
+      const matchContext = vi.fn(async (_org: string, name: string) => envRecord(name, ['main']));
+      ownerApp({ contextStore: { matchContext } });
 
       const res = await request(app, 'POST', '/registrations/register-manual', {
         token: validToken,

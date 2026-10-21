@@ -127,6 +127,7 @@ import { readDeploymentIdentity, readConfigPaths } from './deployment/deployment
 import { dispatchTestRelay } from './ws/test-relay-handlers.js';
 import { buildExecutionStatusFrame } from './ws/execution-status-frame.js';
 import { buildJobStatusForwardFrame } from './ws/job-status-forward-frame.js';
+import { resolveDashboardOrgContext } from './ws/dashboard-org-context.js';
 import type { ReleaseSignal } from './contexts/held-runs.js';
 import type { OrchestratorHooks } from './orchestrator-core.js';
 // Type-only: the test-only fault-injection policy. `import type` erases at
@@ -538,6 +539,33 @@ export async function runServer(
 
           const eventLogWriter = sub.eventLogWriter;
 
+          // What a re-run and a schedule fired by hand dispatch with. The
+          // webhook path's bag (`processingDeps`) lets a fire by hand take the
+          // internal-event pipeline a cron fire takes, and a failed evaluation
+          // round's re-run re-drive the org-wide pass with the original deps.
+          const rerunDeps = () => ({
+            db: sub.db,
+            logStorage: sub.logStorage,
+            providerRegistry: sub.providerRegistry,
+            executionTracker: sub.executionTracker,
+            dispatcher: sub.dispatcher,
+            jobQueue: sub.queue,
+            platformClient,
+            checkRunReporter: sub.checkRunReporter,
+            coordinator: sub.coordinator,
+            secretResolver: sub.secretResolver,
+            eventRouter: sub.eventRouter,
+            agentRegistry: sub.agentRegistry,
+            sourceCache: sub.sourceCache ?? null,
+            depCache: sub.depCache ?? null,
+            buildCoordinator: sub.buildCoordinator ?? null,
+            pendingBuilds: sub.pendingBuilds ?? null,
+            coldStore: sub.coldStore,
+            processingDeps: buildProcessingDeps,
+            // Test-only; undefined in the shipped orchestrator.
+            beforeAcceptedDispatch: faultInjection?.beforeAcceptedDispatch,
+          });
+
           let dashboardSendFn: ((msg: unknown) => void) | null = null;
           const dashboardHandler = new DashboardHandler({
             db: sub.db,
@@ -563,28 +591,7 @@ export async function runServer(
                 runId,
                 triggeredBy,
                 triggeredByAgentLabel,
-                {
-                  db: sub.db,
-                  logStorage: sub.logStorage,
-                  providerRegistry: sub.providerRegistry,
-                  executionTracker: sub.executionTracker,
-                  dispatcher: sub.dispatcher,
-                  jobQueue: sub.queue,
-                  platformClient,
-                  checkRunReporter: sub.checkRunReporter,
-                  coordinator: sub.coordinator,
-                  secretResolver: sub.secretResolver,
-                  eventRouter: sub.eventRouter,
-                  agentRegistry: sub.agentRegistry,
-                  sourceCache: sub.sourceCache ?? null,
-                  depCache: sub.depCache ?? null,
-                  buildCoordinator: sub.buildCoordinator ?? null,
-                  pendingBuilds: sub.pendingBuilds ?? null,
-                  coldStore: sub.coldStore,
-                  // The webhook path's bag, so a re-run of a failed evaluation
-                  // round re-drives the org-wide pass with the original deps.
-                  processingDeps: buildProcessingDeps,
-                },
+                rerunDeps(),
                 requestId,
                 routingKey,
               );
@@ -599,29 +606,7 @@ export async function runServer(
                 registrationId,
                 triggeredBy,
                 triggeredByAgentLabel,
-                {
-                  db: sub.db,
-                  logStorage: sub.logStorage,
-                  providerRegistry: sub.providerRegistry,
-                  executionTracker: sub.executionTracker,
-                  dispatcher: sub.dispatcher,
-                  jobQueue: sub.queue,
-                  platformClient,
-                  checkRunReporter: sub.checkRunReporter,
-                  coordinator: sub.coordinator,
-                  secretResolver: sub.secretResolver,
-                  eventRouter: sub.eventRouter,
-                  agentRegistry: sub.agentRegistry,
-                  sourceCache: sub.sourceCache ?? null,
-                  depCache: sub.depCache ?? null,
-                  buildCoordinator: sub.buildCoordinator ?? null,
-                  pendingBuilds: sub.pendingBuilds ?? null,
-                  registrationIndex: sub.registrationIndex,
-                  coldStore: sub.coldStore,
-                  // The webhook path's bag: a fire by hand dispatches through the
-                  // same internal-event pipeline a cron fire does.
-                  processingDeps: buildProcessingDeps,
-                },
+                { ...rerunDeps(), registrationIndex: sub.registrationIndex },
                 requestId,
               );
             },
@@ -701,6 +686,7 @@ export async function runServer(
             globalEvalCandidateTimeoutMs: config.globalEvalCandidateTimeoutMs,
             globalEvalWaitTimeoutMs: config.globalEvalWaitTimeoutMs,
             clusterSettings: sub.clusterSettings,
+            compileSchemaView: sub.compileSchemaView,
           });
           let dashboardEnvSendFn: ((msg: unknown) => void) | null = null;
           // The degraded store (no secrets, writes refuse) only when there is no
@@ -1456,81 +1442,27 @@ export async function runServer(
               // Platform asks the orchestrator to verify each inbound webhook on
               // demand via the chunked relay protocol instead.
 
-              // Resolve orgId + routing key for dashboard handlers. Prefer the
-              // `sources` table (GitHub App orchestrators); fall back to
-              // `generic_webhook_sources` so orchestrators that run only with
-              // generic / internal webhooks still scope their dashboard queries
-              // to the real tenant org instead of '__default__'. Both tables hold
-              // the same (customer_id, routing_key) shape for a single tenant.
+              // Scope the dashboard handlers to the org the Platform
+              // authenticated this orchestrator as (resolveDashboardOrgContext).
               try {
-                let resolved: { customer_id: string; routing_key: string } | undefined;
-                const ghSource = await sub.db
-                  .selectFrom('sources')
-                  .select(['customer_id', 'routing_key'])
-                  .where('customer_id', '!=', '__default__')
-                  .limit(1)
-                  .executeTakeFirst();
-                if (ghSource?.customer_id) {
-                  resolved = {
-                    customer_id: ghSource.customer_id,
-                    routing_key: ghSource.routing_key,
-                  };
-                } else {
-                  const genericSource = await sub.db
-                    .selectFrom('generic_webhook_sources')
-                    .select(['customer_id', 'routing_key'])
-                    .where('deleted_at', 'is', null)
-                    .limit(1)
-                    .executeTakeFirst();
-                  if (genericSource?.customer_id) {
-                    resolved = {
-                      customer_id: genericSource.customer_id,
-                      routing_key: genericSource.routing_key,
-                    };
-                  } else {
-                    // Sourceless Platform-first org: no webhook source exists, only
-                    // the auto-provisioned `remote_sources` anchor maps the
-                    // `remote:<orgId>` routing key to the canonical org. Scope the
-                    // dashboard handlers (environments, secrets, registrations, …)
-                    // to that real tenant so reads like `kici secrets list` /
-                    // `kici types` see the org's data instead of '__default__'.
-                    const remoteSource = await sub.db
-                      .selectFrom('remote_sources')
-                      .select(['customer_id', 'routing_key'])
-                      .where('customer_id', '!=', '__default__')
-                      .limit(1)
-                      .executeTakeFirst();
-                    if (remoteSource?.customer_id) {
-                      resolved = {
-                        customer_id: remoteSource.customer_id,
-                        routing_key: remoteSource.routing_key,
-                      };
-                    }
-                  }
-                }
+                const resolved = await resolveDashboardOrgContext(
+                  sub.db,
+                  platformClient.getOrgId(),
+                );
                 if (resolved) {
-                  dashboardEnvHandler.setOrgId(resolved.customer_id);
-                  dashboardEnvHandler.setRoutingKey(resolved.routing_key);
-                  dashboardRegistrationsHandler.setOrgId(resolved.customer_id);
-                  dashboardRegistrationsHandler.setRoutingKey(resolved.routing_key);
+                  dashboardEnvHandler.setOrgId(resolved.orgId);
+                  dashboardEnvHandler.setRoutingKey(resolved.routingKey);
+                  dashboardRegistrationsHandler.setOrgId(resolved.orgId);
+                  dashboardRegistrationsHandler.setRoutingKey(resolved.routingKey);
                   // Global-workflows is org-scoped: only customer_id matters.
-                  dashboardGlobalWorkflowsHandler.setOrgId(resolved.customer_id);
-                  dashboardBackendsHandler.setOrgContext(
-                    resolved.customer_id,
-                    resolved.routing_key,
-                  );
-                  dashboardFleetWriteHandler.setOrgContext(
-                    resolved.customer_id,
-                    resolved.routing_key,
-                  );
-                  dashboardHandler.setOrgContext(resolved.customer_id, resolved.routing_key);
-                  resolvedOrgContext = {
-                    orgId: resolved.customer_id,
-                    routingKey: resolved.routing_key,
-                  };
+                  dashboardGlobalWorkflowsHandler.setOrgId(resolved.orgId);
+                  dashboardBackendsHandler.setOrgContext(resolved.orgId, resolved.routingKey);
+                  dashboardFleetWriteHandler.setOrgContext(resolved.orgId, resolved.routingKey);
+                  dashboardHandler.setOrgContext(resolved.orgId, resolved.routingKey);
+                  resolvedOrgContext = resolved;
                   logger.info('Dashboard handler orgId resolved', {
-                    orgId: resolved.customer_id,
-                    routingKey: resolved.routing_key,
+                    orgId: resolved.orgId,
+                    routingKey: resolved.routingKey,
                   });
                 }
               } catch (err) {

@@ -94,6 +94,7 @@ import type { EventStore } from '../events/event-store.js';
 import { redactEventPayload } from '../events/types.js';
 import { loadEventLogByDeliveryId } from '../cold-store/load-event-log-range.js';
 import { webhookPayloadPath } from '../pipeline/webhook-payload-store.js';
+import type { RunStartAnswer } from '../pipeline/request-idempotency.js';
 import type { DashboardWriteOperation } from '@kici-dev/engine/protocol/dashboard-write-operations';
 import {
   assertDashboardWriteAllowed,
@@ -165,7 +166,7 @@ interface DashboardHandlerDeps {
      */
     requestId: string,
     routingKey?: string,
-  ) => Promise<{ newRunId: string }>;
+  ) => Promise<RunStartAnswer>;
   /** Throws on failure. `force` force-cancels (SIGKILL, skip hooks). */
   onCancel: (
     runId: string,
@@ -186,7 +187,7 @@ interface DashboardHandlerDeps {
      * coordinator's run instead of minting a second one.
      */
     requestId: string,
-  ) => Promise<{ newRunId: string }>;
+  ) => Promise<RunStartAnswer>;
   /**
    * Backs the per-org DLQ surface (wired by `bootstrapOrchestrator`). Absent ⇒
    * `handleEventDlq*` replies with a structured `error`, which the dashboard
@@ -2243,6 +2244,7 @@ export class DashboardHandler {
         type: 'run.rerun.response',
         requestId: msg.requestId,
         newRunId: result.newRunId,
+        ...(result.alreadyAccepted && { alreadyAccepted: true }),
       });
     } catch (err) {
       logger.error('Error handling run.rerun.request', {
@@ -3170,6 +3172,7 @@ export class DashboardHandler {
         type: 'run.manual_schedule.response',
         requestId: msg.requestId,
         newRunId: result.newRunId,
+        ...(result.alreadyAccepted && { alreadyAccepted: true }),
       });
     } catch (err) {
       logger.error('Error handling run.manual_schedule.request', {

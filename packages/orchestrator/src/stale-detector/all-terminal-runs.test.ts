@@ -5,6 +5,7 @@ import { createMigrationProvider } from '../db/migration-provider.js';
 import type { Database } from '../db/types.js';
 import { selectAllTerminalRunCandidates } from './all-terminal-runs.js';
 import { describeWithTestDb } from '@kici-dev/test-support/test-db';
+import { insertClusterHeartbeat } from '../__test-helpers__/cluster-heartbeat.js';
 
 const MINUTE = 60_000;
 const GRACE_MS = 2 * MINUTE;
@@ -67,14 +68,8 @@ describeWithTestDb<Database>(
     `.execute(db);
     };
 
-    const heartbeat = async (instanceId: string, minutesAgo: number): Promise<void> => {
-      const at = new Date(Date.now() - minutesAgo * MINUTE);
-      await sql`
-      INSERT INTO public.cluster_instances (instance_id, last_heartbeat_at)
-      VALUES (${instanceId}, ${at})
-      ON CONFLICT (instance_id) DO UPDATE SET last_heartbeat_at = EXCLUDED.last_heartbeat_at
-    `.execute(db);
-    };
+    const heartbeat = (instanceId: string, minutesAgo: number): Promise<void> =>
+      insertClusterHeartbeat(db, instanceId, minutesAgo);
 
     beforeAll(() => {
       ({ db } = getDb());

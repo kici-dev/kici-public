@@ -124,6 +124,9 @@ function createMockBackend(
       }),
     ...(overrides.ensureHostReady ? { ensureHostReady: overrides.ensureHostReady } : {}),
     ...(overrides.reapUnowned ? { reapUnowned: overrides.reapUnowned } : {}),
+    ...(overrides.spawnSourceFingerprint
+      ? { spawnSourceFingerprint: overrides.spawnSourceFingerprint }
+      : {}),
   };
 }
 
@@ -8164,5 +8167,120 @@ describe('live Firecracker VMs', () => {
     expect(result!.outcome).toBe(ScalerVmStopOutcome.enum['not-live']);
     expect(a.stopUntrackedVm).toHaveBeenCalledTimes(1);
     expect(b.stopUntrackedVm).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('compile schema of a label set', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const LABELS = ['linux', 'docker'];
+
+  /** A container backend whose spawn-source fingerprint the test controls. */
+  function fingerprintedManager(stateStore = fakeStateStore()) {
+    const source = { fingerprint: 'sha256:image-a' as string | null };
+    const backend = createMockBackend({
+      type: 'container',
+      labelSets: [{ labels: LABELS, image: 'ghcr.io/org/agent:latest' }],
+      maxAgents: 5,
+      spawnSourceFingerprint: vi.fn(async () => source.fingerprint),
+    });
+    const manager = makeManager({
+      stateStore,
+      config: {
+        version: 1 as const,
+        globalMaxAgents: 10,
+        scalers: [
+          {
+            name: 'container-prod',
+            type: 'container' as const,
+            maxAgents: 5,
+            maxConcurrentSpawns: 2,
+            labelSets: [{ labels: LABELS, image: 'ghcr.io/org/agent:latest' }],
+          },
+        ],
+      },
+      backends: [{ name: 'container-prod', backend }],
+    });
+    return { manager, backend, source };
+  }
+
+  async function spawnAndRegister(
+    manager: ScalerManager,
+    backend: ScalerBackend,
+    reported?: { compileSchemaVersion?: number; version?: string },
+  ): Promise<void> {
+    await manager.requestScale(LABELS, 'job-1', 'run-1');
+    await vi.advanceTimersByTimeAsync(0);
+    const agentId = (backend.spawn as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    await manager.onAgentRegistered(agentId, LABELS, reported);
+  }
+
+  it('learns the schema a spawned agent reports', async () => {
+    const { manager, backend } = fingerprintedManager();
+    await spawnAndRegister(manager, backend, { compileSchemaVersion: 7, version: '0.24.0' });
+    expect(await manager.compileSchemaForLabels(LABELS)).toMatchObject([
+      { schema: 7, release: '0.24.0' },
+    ]);
+  });
+
+  // fails-when: the memory is keyed without the fingerprint — a replaced agent image would
+  // keep its predecessor's schema and the dispatch gate would refuse runs it can serve
+  it('a changed fingerprint makes the label set unknown', async () => {
+    const { manager, backend, source } = fingerprintedManager();
+    await spawnAndRegister(manager, backend, { compileSchemaVersion: 7, version: '0.24.0' });
+    source.fingerprint = 'sha256:image-b';
+    expect(await manager.compileSchemaForLabels(LABELS)).toMatchObject([{ schema: null }]);
+  });
+
+  it('a null fingerprint never learns', async () => {
+    const { manager, backend, source } = fingerprintedManager();
+    source.fingerprint = null;
+    await spawnAndRegister(manager, backend, { compileSchemaVersion: 7 });
+    source.fingerprint = 'sha256:image-a';
+    expect(await manager.compileSchemaForLabels(LABELS)).toMatchObject([{ schema: null }]);
+  });
+
+  it('an agent that reports no schema teaches nothing', async () => {
+    const { manager, backend } = fingerprintedManager();
+    await spawnAndRegister(manager, backend, { version: '0.23.0' });
+    expect(await manager.compileSchemaForLabels(LABELS)).toMatchObject([{ schema: null }]);
+  });
+
+  it('an adopted agent teaches nothing', async () => {
+    const stateStore = fakeStateStore({
+      adoptSpawningAgent: vi.fn().mockResolvedValue({
+        agentId: 'scaler-peer-1',
+        scalerName: 'container-prod',
+        labelSet: LABELS,
+        provisioningTargets: [],
+        backendType: ScalerBackendType.enum.container,
+        spawnedAt: new Date(),
+        ownerInstanceId: 'orch-a',
+      }),
+    });
+    const { manager } = fingerprintedManager(stateStore);
+    await manager.onAgentRegistered('scaler-peer-1', LABELS, { compileSchemaVersion: 7 });
+    expect(await manager.compileSchemaForLabels(LABELS)).toMatchObject([{ schema: null }]);
+  });
+
+  // breaks-if-wrong: a fingerprint read that throws must not fail the spawn
+  it('a failing fingerprint read still spawns', async () => {
+    const { manager, backend } = fingerprintedManager();
+    (backend.spawnSourceFingerprint as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error('socket hung up'),
+    );
+    await manager.requestScale(LABELS, 'job-1', 'run-1');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(backend.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it('no backend matches → null', async () => {
+    const { manager } = fingerprintedManager();
+    expect(await manager.compileSchemaForLabels(['windows'])).toEqual([]);
   });
 });

@@ -16,6 +16,7 @@
  * through `processWebhook`, which also exercises the default-branch gate.
  */
 import { describe, it, expect, vi } from 'vitest';
+import { COMPILE_SCHEMA_VERSION } from '@kici-dev/shared';
 import { processWebhook } from './process-webhook.js';
 import type { WebhookInfo } from '../webhook/handler.js';
 
@@ -38,11 +39,15 @@ function makeInfo(): WebhookInfo {
 }
 
 /** A push-triggered workflow. `repos` is what makes it global. */
-function workflow(name: string, repos?: Array<{ type: 'glob'; pattern: string }>) {
+function workflow(
+  name: string,
+  repos?: Array<{ type: 'glob'; pattern: string }>,
+  compileSchemaVersion = 1,
+) {
   return {
     name,
     contentHash: `${name}-hash`,
-    compileSchemaVersion: 1,
+    compileSchemaVersion,
     triggers: [
       {
         _type: 'push',
@@ -126,6 +131,8 @@ function makeDeps(over: {
   reason?: string;
   /** Dependency-cache fields the registering lock file records. */
   lockKey?: { lockfileHash?: string; siblingsDigest?: string };
+  /** The compile schema every workflow of the registering lock declares. */
+  compileSchemaVersion?: number;
 }): Harness {
   const orgId = over.orgId ?? DEFAULT_ORG;
   const isWorkflowRepoAllowed = vi.fn(async () => ({
@@ -186,8 +193,8 @@ function makeDeps(over: {
         contentHash: 'srchash',
         ...over.lockKey,
         workflows: [
-          workflow(GLOBAL_WORKFLOW, [{ type: 'glob', pattern: '**' }]),
-          workflow(PER_REPO_WORKFLOW),
+          workflow(GLOBAL_WORKFLOW, [{ type: 'glob', pattern: '**' }], over.compileSchemaVersion),
+          workflow(PER_REPO_WORKFLOW, undefined, over.compileSchemaVersion),
         ],
       })),
     },
@@ -377,5 +384,47 @@ describe('a default-branch push records the lock file dependency-cache key', () 
     await processWebhook(makeInfo(), h.deps);
 
     expect(h.depCacheKey()).toEqual({ lockfileHash: null, siblingsDigest: null });
+  });
+});
+
+describe('a default-branch push warns about a lock with a stale compile schema', () => {
+  const STALE = 'Registered workflow lock has a stale compile schema';
+
+  async function staleLines(compileSchemaVersion: number): Promise<Array<Record<string, unknown>>> {
+    const stream =
+      (console as unknown as { _stdout?: NodeJS.WriteStream })._stdout ?? process.stdout;
+    const lines: string[] = [];
+    const write = vi.spyOn(stream, 'write').mockImplementation((chunk: unknown): boolean => {
+      lines.push(String(chunk));
+      return true;
+    });
+    try {
+      const h = makeDeps({ allowed: true, orgId: REAL_ORG, compileSchemaVersion });
+      await processWebhook(makeInfo(), h.deps);
+    } finally {
+      write.mockRestore();
+    }
+    return lines
+      .filter((l) => l.includes(STALE))
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+  }
+
+  // fails-when: the registration path never compares the lock's schema with this release's
+  it('logs one warning per stale workflow', async () => {
+    const lines = await staleLines(COMPILE_SCHEMA_VERSION - 2);
+    expect(lines.map((l) => l.workflow).sort()).toEqual(
+      [GLOBAL_WORKFLOW, PER_REPO_WORKFLOW].sort(),
+    );
+    expect(lines.find((l) => l.workflow === GLOBAL_WORKFLOW)).toMatchObject({
+      repo: WORKFLOW_REPO,
+      lockSchema: COMPILE_SCHEMA_VERSION - 2,
+      agentSchema: COMPILE_SCHEMA_VERSION,
+      isGlobal: true,
+    });
+  });
+
+  // breaks-if-wrong: a lock compiled for this release's schema logs nothing
+  it('logs nothing for a current lock', async () => {
+    expect(await staleLines(COMPILE_SCHEMA_VERSION)).toEqual([]);
   });
 });

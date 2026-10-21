@@ -435,7 +435,11 @@ describe('orchestrator status — health section', () => {
     dbHealthy: boolean;
     basePath?: string;
     readyDelayMs?: number | 'never';
-    org?: { getPlatformOrgId?: () => string | undefined; missing?: boolean };
+    org?: {
+      getPlatformOrgId?: () => string | undefined;
+      missing?: boolean;
+      extraOrgs?: Array<{ orgId: string; sources: OrgIdSource[] }>;
+    };
   }): void {
     const routes = createHealthRoutes({ db: fakeDb(opts.dbHealthy), isWarm: () => true });
     const app = opts.basePath ? new Hono().basePath(opts.basePath).route('/', routes) : routes;
@@ -455,6 +459,7 @@ describe('orchestrator status — health section', () => {
         createAdminOrgRoutes({
           listOrgs: async () => [
             { orgId: 'org_status', sources: [OrgIdSource.enum['remote-source']] },
+            ...(opts.org?.extraOrgs ?? []),
           ],
           rbac: new RbacEnforcer(),
           ...(opts.org?.getPlatformOrgId && { getPlatformOrgId: opts.org.getPlatformOrgId }),
@@ -727,7 +732,43 @@ describe('orchestrator status — health section', () => {
   it('returns the org in --json', async () => {
     serveRealHealthRoutes({ dbHealthy: true, org: { getPlatformOrgId: () => 'org_status' } });
     const json = JSON.parse(await runStatus(['--json'], ['-t', ADMIN_TOKEN])) as { org: unknown };
-    expect(json.org).toEqual({ platformAttachment: 'attached', attachedOrgId: 'org_status' });
+    expect(json.org).toEqual({
+      platformAttachment: 'attached',
+      attachedOrgId: 'org_status',
+      foreignSourceOrgs: [],
+    });
+  });
+
+  const SOURCE_ORGS_ROW = (value: string) => `${'Other orgs:'.padEnd(12)}${value}`;
+
+  // fails-when: a source outside the attached org gives the status no sign of it
+  it('names the orgs outside the attached org that hold sources, after the Org row', async () => {
+    serveRealHealthRoutes({
+      dbHealthy: true,
+      org: {
+        getPlatformOrgId: () => 'org_status',
+        extraOrgs: [{ orgId: '__default__', sources: [OrgIdSource.enum.source] }],
+      },
+    });
+    const lines = (await runStatus([], ['-t', ADMIN_TOKEN])).split('\n');
+    const orgAt = lines.indexOf(ORG_ROW('org_status (attached to the Platform)'));
+    expect(lines[orgAt + 1]).toBe(
+      SOURCE_ORGS_ROW(
+        "__default__ also holds sources; their runs use that org's contexts, secrets and " +
+          'trust policy (kici-admin source list)',
+      ),
+    );
+    consoleLogSpy.mockClear();
+    const json = JSON.parse(await runStatus(['--json'], ['-t', ADMIN_TOKEN])) as {
+      org: { foreignSourceOrgs: string[] };
+    };
+    expect(json.org.foreignSourceOrgs).toEqual(['__default__']);
+  });
+
+  // breaks-if-wrong: an orchestrator with every source in its org prints no extra row
+  it('prints no Other orgs row when every source is in the attached org', async () => {
+    serveRealHealthRoutes({ dbHealthy: true, org: { getPlatformOrgId: () => 'org_status' } });
+    expect(await runStatus([], ['-t', ADMIN_TOKEN])).not.toContain('Other orgs');
   });
 });
 
