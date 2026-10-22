@@ -16,6 +16,8 @@ import type { DashboardPlatformToOrchMessage } from '@kici-dev/engine';
 import { invalidateDashboardWritePolicyCache } from '../policy/dashboard-write-policy.js';
 import { createUnavailableSecretStore, type ScopedSecretStore } from '../secrets/scope-routing.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
+import { makeDashboardEncryption } from '../__test-helpers__/dashboard-seal.js';
+import { DashboardSealedWriteError } from '@kici-dev/engine/protocol/messages/dashboard-sealed-write';
 
 /** The store the orchestrator falls back to when it has no pg secret store. */
 const degradedStore: ScopedSecretStore = createUnavailableSecretStore();
@@ -67,15 +69,19 @@ describe('degraded secret store refuses dashboard writes', () => {
   });
 
   it('surfaces an error to the dashboard when a set lands on the degraded store', async () => {
+    // The degraded store exists only without a master key, which also leaves the
+    // orchestrator with no dashboard encryption key, so a sealed set fails closed
+    // as `encryption_unavailable`: the real outcome on a key-less orchestrator.
     const deps = createDeps(degradedStore);
     const handler = new DashboardContextHandler(deps);
+    const throwaway = await makeDashboardEncryption();
 
     const handled = await handler.handleMessage({
       type: 'dashboard.contexts.secrets.set',
       requestId: 'req-degraded-set',
       scope: 'aws/prod',
       key: 'API_KEY',
-      value: 'super-secret',
+      sealed: throwaway.seal('super-secret'),
     } as DashboardPlatformToOrchMessage);
 
     expect(handled).toBe(true);
@@ -85,8 +91,7 @@ describe('degraded secret store refuses dashboard writes', () => {
       'req-degraded-set',
     );
     expect(res).toBeDefined();
-    expect(res.error).toBeDefined();
-    expect(String(res.error)).toMatch(/unavailable/i);
+    expect(res.error).toBe(DashboardSealedWriteError.enum.encryption_unavailable);
   });
 
   it('surfaces an error to the dashboard when a delete lands on the degraded store', async () => {
@@ -113,7 +118,8 @@ describe('degraded secret store refuses dashboard writes', () => {
 
   it('still writes normally when a real store is configured', async () => {
     const store = createRecordingStore();
-    const deps = createDeps(store);
+    const enc = await makeDashboardEncryption();
+    const deps = { ...createDeps(store), dashboardEncryption: enc.dep };
     const handler = new DashboardContextHandler(deps);
 
     await handler.handleMessage({
@@ -121,7 +127,7 @@ describe('degraded secret store refuses dashboard writes', () => {
       requestId: 'req-ok-set',
       scope: 'aws/prod',
       key: 'API_KEY',
-      value: 'super-secret',
+      sealed: enc.seal('super-secret'),
     } as DashboardPlatformToOrchMessage);
 
     const res = responseFor(deps.sent, 'dashboard.contexts.secrets.set.response', 'req-ok-set');

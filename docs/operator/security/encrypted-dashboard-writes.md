@@ -3,7 +3,9 @@ title: Encrypted dashboard writes
 description: The encrypted dashboard-write posture, where the browser seals a secret or variable value to your orchestrator so the hosted control plane never sees the plaintext
 ---
 
-The `encrypted` posture on the [dashboard-write policy](./dashboard-write-policy.md) keeps the web UI's value-entry form for the two plaintext operations (`secrets.set`, `variables.set`) while removing the hosted control plane from the plaintext path. When an operation is set to `encrypted`, the **browser encrypts the value to your orchestrator before it leaves the page**, and the control plane relays only opaque ciphertext.
+The `encrypted` posture on the [dashboard-write policy](./dashboard-write-policy.md) keeps the web UI's value-entry form for the two plaintext operations (`secrets.set`, `variables.set`) while removing the hosted control plane from the plaintext path. Under `encrypted`, the **browser encrypts the value to your orchestrator before it leaves the page**, and the control plane relays only opaque ciphertext.
+
+A secret value is always sealed: `encrypted` is the default for `secrets.set`, and the only other posture it accepts is `disabled` (CLI only). No configuration is needed. For `variables.set`, `encrypted` is opt-in: set it with `kici-admin org-settings dashboard-writes set --op variables.set=encrypted`.
 
 This gives you dashboard UX for secret and variable entry with the same trust property you get from `kici-admin secret set`: the hosted control plane process never receives the plaintext value.
 
@@ -64,8 +66,14 @@ automatically when only one is connected, and otherwise ask which one you mean.
 The `encrypted` posture never silently falls back to sending plaintext through the control plane:
 
 - If the browser cannot fetch or verify the encryption key, the value form is disabled and the UI points you at `kici-admin secret set` — it does not send plaintext.
-- The orchestrator refuses a plaintext value for an `encrypted`-posture operation (defense in depth against a misbehaving or outdated client), returning a structured error rather than storing it.
+- The control plane refuses a plaintext secret value with `operation_requires_encryption` before anything reaches your orchestrator.
+- The orchestrator refuses a `secrets.set` request that carries a plaintext value, and a plaintext value for a variable under the `encrypted` posture (defense in depth against a misbehaving or outdated client). It returns a structured error and stores nothing.
 - An envelope sealed to an unknown key, or one that fails to decrypt, is refused — never stored.
+
+### When no encryption key is published
+
+- **Cold boot.** An orchestrator publishes its key within seconds after it starts. Until then the form shows that no key is published; select **Try again** to fetch it again.
+- **No `KICI_SECRET_KEY`.** An orchestrator without a master key publishes no encryption key and has no secret store. Configure `KICI_SECRET_KEY`, or set the value with `kici-admin secret set` on an orchestrator that has one.
 
 ## Key rotation
 

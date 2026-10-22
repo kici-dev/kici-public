@@ -4,6 +4,17 @@ import { createOrgSettingsRoutes } from './admin-org-settings.js';
 import { RbacEnforcer } from '../secrets/rbac.js';
 import type { AccessLogRecord, AccessLogWriter } from '../audit/access-log.js';
 
+const loggerSpies = vi.hoisted(() => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
+}));
+vi.mock('@kici-dev/shared', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@kici-dev/shared')>()),
+  createLogger: () => loggerSpies,
+}));
+
 vi.mock('../policy/dashboard-write-policy.js', async (importOriginal) => ({
   getDashboardWritePolicy: vi.fn(),
   setDashboardWritePolicy: vi.fn(),
@@ -829,6 +840,42 @@ describe('PATCH /org-settings/dashboard-writes', () => {
     expect(res.status).toBe(200);
     expect(setDashboardWritePolicy).toHaveBeenCalledOnce();
     expect(resetDashboardWritePolicy).not.toHaveBeenCalled();
+  });
+
+  /** PATCH the dashboard-writes route with `updates` for the test org. */
+  const patchUpdates = (updates: Record<string, string>) =>
+    buildTestApp().request('/org-settings/dashboard-writes', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ customerId: 'acmeOrg00001', updates }),
+    });
+
+  it('refuses secrets.set=permissive with a 400 naming the allowed postures', async () => {
+    // fails-when: the route parses updates with the read schema, which tolerates permissive.
+    const res = await patchUpdates({ 'secrets.set': 'permissive' });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string; details: unknown };
+    expect(body.error).toBe('Validation error');
+    expect(JSON.stringify(body.details)).toContain('Allowed: encrypted, disabled');
+    expect(setDashboardWritePolicy).not.toHaveBeenCalled();
+    // A refused posture is a client error, never logged at error level.
+    expect(loggerSpies.error).not.toHaveBeenCalled();
+  });
+
+  it('logs a server fault at error level (positive control for the logger spy)', async () => {
+    vi.mocked(setDashboardWritePolicy).mockRejectedValueOnce(new Error('db down'));
+    expect((await patchUpdates({ 'secrets.set': 'disabled' })).status).toBe(500);
+    expect(loggerSpies.error).toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ 'secrets.set': 'disabled' }],
+    [{ 'secrets.set': 'encrypted' }],
+    [{ 'variables.set': 'permissive' }],
+  ])('accepts the allowed posture %j', async (updates) => {
+    // breaks-if-wrong: every allowed posture still reaches the policy store.
+    expect((await patchUpdates(updates)).status).toBe(200);
+    expect(setDashboardWritePolicy).toHaveBeenCalledOnce();
   });
 
   it('rejects {customerId, updates: {non-empty}, reset: true} with 400', async () => {

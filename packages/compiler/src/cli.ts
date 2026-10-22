@@ -5,6 +5,7 @@ import { realpathSync } from 'node:fs';
 
 import { Command, Argument, CommanderError } from 'commander';
 import pc from 'picocolors';
+import { makeCliStdioBlocking } from '@kici-dev/core';
 import { shouldSuppressBanner } from './cli-banner.js';
 import { guardUnsettledExit } from './cli-unsettled-guard.js';
 
@@ -1143,6 +1144,7 @@ function handleCliParseExit(err: CommanderError, argv: string[], program: Comman
  * while the command's action is still pending.
  */
 export function runCli(argv: string[] = process.argv): void {
+  makeCliStdioBlocking();
   const program = buildProgram();
   program.exitOverride();
   const run = program.parseAsync(argv);

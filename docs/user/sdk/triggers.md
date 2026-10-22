@@ -445,7 +445,7 @@ export default workflow('deploy-prod', {
 - **`ctx.dispatchInputs`** is always present (a validated map of
   `string | number | boolean | null`), distinct from `ctx.inputs` (typed outputs
   from `needs` dependencies). Rules see the same values via `ctx.dispatchInputs`,
-  so `skipUnless(ctx => !ctx.dispatchInputs.skipCveScan)` works.
+  so `skip('skip CVE scan', (ctx) => ctx.dispatchInputs.skipCveScan === true)` works.
 - **Defaults are applied once**, on the orchestrator (the authoritative side); the
   CLI pre-validates `--input` for fast feedback and forwards the raw operator pairs.
 

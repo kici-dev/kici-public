@@ -17,36 +17,14 @@ import {
 } from './ephemeral-keys.js';
 import { generateKeyPairSync, diffieHellman, hkdfSync, randomBytes } from 'node:crypto';
 import { createCipheriv, createPrivateKey, createPublicKey } from 'node:crypto';
+import { sealToDer } from '../__test-helpers__/dashboard-seal.js';
 
 /**
- * Simulate the browser-side seal for a dashboard write: exactly what the
- * dashboard's @noble sealed-box must produce, expressed with node:crypto so the
+ * The browser-side seal for a dashboard write, expressed with node:crypto so the
  * interop contract (DER-SPKI ephemeral pubkey + `kici-dashboard-sealed-write`
  * HKDF info + IV||tag||ct framing) is locked from the node decrypt side.
  */
-function browserSealDashboardWrite(
-  value: string,
-  orchPublicKeyDer: Buffer,
-): { ephemeralPublicKey: string; encrypted: string } {
-  const eph = generateKeyPairSync('x25519', {
-    publicKeyEncoding: { type: 'spki', format: 'der' },
-    privateKeyEncoding: { type: 'pkcs8', format: 'der' },
-  });
-  const shared = diffieHellman({
-    privateKey: createPrivateKey({ key: eph.privateKey as Buffer, format: 'der', type: 'pkcs8' }),
-    publicKey: createPublicKey({ key: orchPublicKeyDer, format: 'der', type: 'spki' }),
-  });
-  const aesKey = Buffer.from(
-    hkdfSync('sha256', shared, Buffer.alloc(0), 'kici-dashboard-sealed-write', 32),
-  );
-  const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', aesKey, iv, { authTagLength: 16 });
-  const ct = Buffer.concat([cipher.update(value, 'utf-8'), cipher.final()]);
-  return {
-    ephemeralPublicKey: (eph.publicKey as Buffer).toString('base64'),
-    encrypted: Buffer.concat([iv, cipher.getAuthTag(), ct]).toString('base64'),
-  };
-}
+const browserSealDashboardWrite = sealToDer;
 
 // Helper to simulate agent-side encryption (what the agent would do)
 function agentEncryptSecret(

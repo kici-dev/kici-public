@@ -366,9 +366,10 @@ Receives a `DynamicJobContext`:
 | Property       | Type                                | Description                                                             |
 | -------------- | ----------------------------------- | ----------------------------------------------------------------------- |
 | `$`            | zx shell                            | Shell executor                                                          |
-| `ctx`          | `{ workflow, event? }`              | Workflow metadata and event                                             |
+| `ctx`          | `{ workflow, event?, needs? }`      | Workflow metadata, event, and upstream outputs (result-aware only)      |
 | `log`          | `Logger`                            | Structured logger                                                       |
 | `env`          | `Record<string, string\|undefined>` | Environment variables                                                   |
+| `kici`         | `KiciApi`                           | Orchestrator queries, for example `kici.infrastructure.list()`          |
 | `sourceRepo`   | `RepoInfo \| undefined`             | Repo whose event triggered the run, when the evaluation has a checkout  |
 | `workflowRepo` | `RepoInfo \| undefined`             | Repo that registered the workflow (same repo outside a global workflow) |
 

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   WS_MAX_PAYLOAD_BYTES,
   DASHBOARD_REQUEST_TYPE_SET,
+  DashboardResponseErrorCode,
   PROTOCOL_VERSION,
   JoinErrorCode,
   buildJoinRefusal,
@@ -1545,6 +1546,54 @@ describe('PlatformClient', () => {
   });
 
   describe('error handling', () => {
+    const SEALED = { keyId: 'kid-1', ephemeralPublicKey: 'ZXBo', encrypted: 'Y2lwaGVy' };
+
+    it('answers invalid_payload for a secrets.set frame carrying a plaintext value', () => {
+      // The real parser and dispatcher; the socket is the module-level ws mock.
+      // fails-when: `value` is stripped or still accepted by contextSecretSetRequestSchema.
+      const onDashboardEnvMessage = vi.fn();
+      const client = createClient({ onDashboardEnvMessage });
+      const mock = authenticateClient(client);
+      for (const [requestId, extra] of [
+        ['req-plain', { value: 'pt' }],
+        ['req-both', { value: 'pt', sealed: SEALED }],
+      ] as const) {
+        mock.sentMessages = [];
+        simulateMessage(mock, {
+          type: 'dashboard.contexts.secrets.set',
+          requestId,
+          actor: { type: 'user', sub: 's' },
+          scope: 'prod',
+          key: 'K',
+          ...extra,
+        });
+        const resp = getSentMessages(mock).find(
+          (m) => (m as { requestId?: string }).requestId === requestId,
+        ) as { code?: string } | undefined;
+        expect(resp?.code, requestId).toBe(DashboardResponseErrorCode.enum.invalid_payload);
+      }
+      expect(onDashboardEnvMessage).not.toHaveBeenCalled();
+    });
+
+    it('dispatches a sealed-only secrets.set frame to the dashboard handler', () => {
+      // breaks-if-wrong: the browser's sealed frame still reaches the handler.
+      const onDashboardEnvMessage = vi.fn();
+      const client = createClient({ onDashboardEnvMessage });
+      const mock = authenticateClient(client);
+      simulateMessage(mock, {
+        type: 'dashboard.contexts.secrets.set',
+        requestId: 'req-sealed',
+        actor: { type: 'user', sub: 's' },
+        scope: 'prod',
+        key: 'K',
+        sealed: SEALED,
+      });
+      expect(onDashboardEnvMessage).toHaveBeenCalledTimes(1);
+      expect(onDashboardEnvMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ requestId: 'req-sealed', sealed: SEALED }),
+      );
+    });
+
     it('handles malformed JSON from server gracefully', () => {
       const client = createClient();
       client.connect();

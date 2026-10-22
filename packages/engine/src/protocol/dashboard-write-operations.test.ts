@@ -6,7 +6,12 @@ import {
   DASHBOARD_WRITE_OPERATIONS_BY_NAME,
   DASHBOARD_WRITE_OPERATIONS_BY_WIRE_TYPE,
   DASHBOARD_WRITE_OPERATION_VALUES,
+  dashboardWritePolicyMap,
   dashboardWritePolicyMapSchema,
+  dashboardWritePolicyUpdate,
+  defaultPolicyState,
+  isAllowedPolicyState,
+  policyStateRefusalMessage,
   getDashboardWriteOperationDescriptor,
   getDashboardWriteOperationsByCategory,
   getDashboardWriteOperationsBySensitivity,
@@ -14,6 +19,7 @@ import {
   isEncryptedState,
   resolvePolicyState,
   resolveFullPolicyStateView,
+  resolveFullPolicyView,
 } from './dashboard-write-operations.js';
 
 describe('DashboardWriteOperation enum', () => {
@@ -127,14 +133,35 @@ describe('three-state policy', () => {
     expect(DashboardWritePolicyState.options).toEqual(['permissive', 'encrypted', 'disabled']);
   });
 
-  it('defaults an absent op to permissive', () => {
-    expect(resolvePolicyState({}, 'secrets.set')).toBe('permissive');
-    expect(resolvePolicyState(null, 'secrets.set')).toBe('permissive');
+  it('resolves an absent secrets.set to encrypted', () => {
+    // fails-when: the default is read from anywhere but the descriptor (pinned to a literal).
+    expect(resolvePolicyState({}, 'secrets.set')).toBe('encrypted');
+    expect(resolvePolicyState(null, 'secrets.set')).toBe('encrypted');
+  });
+
+  it('resolves every other absent operation to permissive', () => {
+    // breaks-if-wrong: a property over the registry, not a hand list.
+    for (const op of DASHBOARD_WRITE_OPERATION_VALUES.filter((o) => o !== 'secrets.set'))
+      expect(resolvePolicyState({}, op), op).toBe('permissive');
+  });
+
+  it('maps a legacy stored permissive secrets.set to encrypted, keeping disabled', () => {
+    expect(resolvePolicyState({ 'secrets.set': 'permissive' }, 'secrets.set')).toBe('encrypted');
+    expect(isEncryptedState({ 'secrets.set': 'permissive' }, 'secrets.set')).toBe(true);
+    expect(resolvePolicyState({ 'secrets.set': 'disabled' }, 'secrets.set')).toBe('disabled');
+    expect(resolvePolicyState({ 'variables.set': 'permissive' }, 'variables.set')).toBe(
+      'permissive',
+    );
+  });
+
+  it('the full state view reports secrets.set encrypted and enabled for an empty map', () => {
+    expect(resolveFullPolicyStateView({})['secrets.set']).toBe('encrypted');
+    expect(resolveFullPolicyView({})['secrets.set']).toBe(true);
   });
 
   it('isEncryptedState true only for encrypted', () => {
-    expect(isEncryptedState({ 'secrets.set': 'encrypted' }, 'secrets.set')).toBe(true);
-    expect(isEncryptedState({ 'secrets.set': 'permissive' }, 'secrets.set')).toBe(false);
+    expect(isEncryptedState({ 'variables.set': 'encrypted' }, 'variables.set')).toBe(true);
+    expect(isEncryptedState({ 'variables.set': 'permissive' }, 'variables.set')).toBe(false);
     expect(isEncryptedState({ 'secrets.set': 'disabled' }, 'secrets.set')).toBe(false);
   });
 
@@ -169,6 +196,16 @@ describe('three-state policy', () => {
     }
   });
 
+  it('read schema accepts exactly what it accepted before per-op postures', () => {
+    // Pinned against `sensitivity`, not `allowedStates`, so it cannot pass by construction.
+    // fails-when: the read schema rejects a legacy `permissive` for secrets.set.
+    for (const d of DASHBOARD_WRITE_OPERATIONS)
+      for (const s of DashboardWritePolicyState.options)
+        expect(dashboardWritePolicyMap.safeParse({ [d.name]: s }).success, `${d.name}=${s}`).toBe(
+          s !== 'encrypted' || d.sensitivity === 'plaintext',
+        );
+  });
+
   it('resolveFullPolicyStateView expands sparse map to all ops', () => {
     const view = resolveFullPolicyStateView({ 'secrets.set': 'encrypted' });
     expect(view['secrets.set']).toBe('encrypted');
@@ -197,5 +234,77 @@ describe('dashboardWritePolicyMapSchema', () => {
 
   it('defaults to empty object when input is undefined', () => {
     expect(dashboardWritePolicyMapSchema.parse(undefined)).toEqual({});
+  });
+});
+
+describe('per-operation postures', () => {
+  it('every descriptor allows its own default', () => {
+    // fails-when: a descriptor's defaultState is outside its allowedStates.
+    for (const d of DASHBOARD_WRITE_OPERATIONS)
+      expect(d.allowedStates, d.name).toContain(d.defaultState);
+  });
+
+  it('only plaintext-sensitivity operations allow encrypted', () => {
+    // Pinned against `sensitivity`, an independently authored field.
+    for (const d of DASHBOARD_WRITE_OPERATIONS)
+      expect(d.allowedStates.includes('encrypted'), d.name).toBe(d.sensitivity === 'plaintext');
+  });
+
+  it('secrets.set defaults to encrypted and allows only encrypted or disabled', () => {
+    const d = getDashboardWriteOperationDescriptor('secrets.set');
+    expect(d.defaultState).toBe('encrypted');
+    expect(defaultPolicyState('secrets.set')).toBe('encrypted');
+    expect([...d.allowedStates].sort()).toEqual(['disabled', 'encrypted']);
+    expect(isAllowedPolicyState('secrets.set', 'permissive')).toBe(false);
+  });
+
+  it('every other operation defaults to permissive', () => {
+    for (const d of DASHBOARD_WRITE_OPERATIONS.filter((x) => x.name !== 'secrets.set'))
+      expect(d.defaultState, d.name).toBe('permissive');
+  });
+
+  it('variables.set keeps every posture', () => {
+    expect([...getDashboardWriteOperationDescriptor('variables.set').allowedStates].sort()).toEqual(
+      [...DashboardWritePolicyState.options].sort(),
+    );
+  });
+
+  it('policyStateRefusalMessage names the allowed postures', () => {
+    expect(policyStateRefusalMessage('secrets.set', 'permissive')).toBe(
+      '"permissive" is not allowed for secrets.set. Allowed: encrypted, disabled.',
+    );
+  });
+});
+
+describe('dashboardWritePolicyUpdate', () => {
+  it('refuses permissive for secrets.set and names the allowed postures', () => {
+    const r = dashboardWritePolicyUpdate.safeParse({ 'secrets.set': 'permissive' });
+    expect(r.success).toBe(false);
+    expect(r.error!.issues[0]!.message).toBe(
+      '"permissive" is not allowed for secrets.set. Allowed: encrypted, disabled.',
+    );
+    expect(r.error!.issues[0]!.path).toEqual(['secrets.set']);
+  });
+
+  it('refuses encrypted for an authority operation', () => {
+    expect(dashboardWritePolicyUpdate.safeParse({ 'held_runs.approve': 'encrypted' }).success).toBe(
+      false,
+    );
+  });
+
+  it('accepts every allowed posture', () => {
+    // breaks-if-wrong: the legitimate writes still parse.
+    for (const u of [
+      { 'secrets.set': 'disabled' },
+      { 'secrets.set': 'encrypted' },
+      { 'variables.set': 'permissive' },
+      { 'variables.set': 'encrypted' },
+      { 'event_dlq.retry': 'disabled' },
+    ])
+      expect(dashboardWritePolicyUpdate.safeParse(u).success, JSON.stringify(u)).toBe(true);
+  });
+
+  it('rejects an unknown operation key', () => {
+    expect(dashboardWritePolicyUpdate.safeParse({ 'bogus.op': 'disabled' }).success).toBe(false);
   });
 });

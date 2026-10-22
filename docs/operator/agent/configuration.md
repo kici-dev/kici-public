@@ -5,11 +5,11 @@ description: Environment variables, labels, container executor setup
 
 > **See also:** [Environment variable reference](../env-reference.md) — shared env vars; agent-specific vars are listed below. Unknown `KICI_*` env vars cause the agent to refuse to start (typo catcher); set `KICI_DEV=true` for warn-only behaviour during local development.
 
-All agent configuration is provided via environment variables.
+The agent reads all its configuration from environment variables.
 
 ## Command-line options
 
-The agent reads its configuration only from environment variables. It accepts these options:
+The agent accepts these options:
 
 | Option            | Effect                                                                                       |
 | ----------------- | -------------------------------------------------------------------------------------------- |
@@ -160,7 +160,7 @@ A reused agent serves many jobs in turn on a shared host (the bare-metal / in-pl
 | `KICI_AGENT_BETWEEN_JOBS_RESET_COMMAND`    | _(unset)_ | A host-reset command run between jobs (for example, pruning a container cache). Unset disables it. It runs after the reap and work-directory deletion. Fail-open: a failure never fails the finished job and never crashes the agent.                                                          |
 | `KICI_AGENT_BETWEEN_JOBS_RESET_TIMEOUT_MS` | `60000`   | Timeout for the reset command.                                                                                                                                                                                                                                                                 |
 | `KICI_AGENT_BETWEEN_JOBS_RESET_RUN_ON`     | `always`  | When the reset command runs: `always`, or `on-failure` to run it only after a failed job.                                                                                                                                                                                                      |
-| `KICI_AGENT_DRAIN_ON_RESET_FAILURE`        | `false`   | When `true`, the agent stops accepting new jobs after repeated consecutive reset failures, so a persistently dirty host stops taking work.                                                                                                                                                     |
+| `KICI_AGENT_DRAIN_ON_RESET_FAILURE`        | `false`   | When `true`, the agent stops accepting new jobs after three consecutive reset failures, so a persistently dirty host stops taking work.                                                                                                                                                        |
 
 Set a reset command when jobs on a shared host leave state the reap and work-directory deletion do not cover — a container image cache, a package cache, or a scratch mount. The `orphanCleanup` reap and the out-of-band cleanup re-run apply to the bare-metal / in-place profiles; the reset command runs for any backend but is meaningful only where jobs share a host. This phase is the primary cross-job cleanup; the agent's startup temp-directory sweep stays as a backstop.
 

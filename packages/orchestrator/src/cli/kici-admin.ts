@@ -14,6 +14,7 @@ import { resolve } from 'node:path';
 import { realpathSync } from 'node:fs';
 
 import { Command, Option, type ParseOptionsResult } from 'commander';
+import { makeCliStdioBlocking } from '@kici-dev/shared';
 import { AdminApiClient, DEFAULT_ADMIN_URL } from './api-client.js';
 import { registerSecretCommands } from './commands/secret.js';
 import { registerRotateCommand } from './commands/rotate.js';
@@ -200,6 +201,7 @@ export function buildProgram(): Command {
 
 /** The bin-shim entry point. */
 export function runCli(argv: string[] = process.argv): void {
+  makeCliStdioBlocking();
   buildProgram().parse(argv);
 }
 

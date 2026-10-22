@@ -19,22 +19,22 @@ Secret values are written either through the dashboard or through `kici-admin` r
 
 ### Default — dashboard or CLI
 
-A fresh orchestrator starts in **permissive** mode: both surfaces are available.
+On a fresh orchestrator both surfaces are available.
 
-- **Dashboard:** Settings → Secrets → pick a scope → enter the secret name and value.
+- **Dashboard:** Settings → Secrets → pick a scope → enter the secret name and value. The dashboard encrypts the value in your browser, and the hosted KiCI Platform relays only ciphertext to your orchestrator.
 - **CLI:** `kici-admin secret set <orgId> <scope> <KEY>` against the orchestrator's HTTP admin API.
 
 Use whichever fits the workflow — most small teams stay on the dashboard; ops engineers and CI scripts use the CLI.
 
 ### When the operator has disabled dashboard writes
 
-The orchestrator operator can flip `secrets.set` (and `variables.set`) to **CLI-only** as part of the [dashboard-write policy](../operator/security/dashboard-write-policy.md). When that flip is on:
+The orchestrator operator can set `secrets.set` (and `variables.set`) to **disabled** (CLI-only) as part of the [dashboard-write policy](../operator/security/dashboard-write-policy.md). When that flip is on:
 
 - The dashboard's "Add secret" / "Edit value" controls render with a lock icon. Hovering or keyboard-focusing the lock shows a tooltip with the exact `kici-admin secret set` invocation needed. The control itself is inert, so there is nothing to click.
 - The dashboard's secrets page still lists secret **names**, scopes, and bindings — only the value-entry path moves to the CLI.
 - `kici-admin secret set` becomes the single entry point for new and updated secret values.
 
-This configuration is common for SOC2-prep and regulated workloads, where the customer requirement is "the SaaS control plane process never receives plaintext customer secret values." The dashboard remains usable for everything else (read paths, name CRUD, context bindings).
+This configuration is common for SOC2-prep and regulated workloads that keep all value entry on the orchestrator host. The dashboard remains usable for everything else (read paths, name CRUD, context bindings).
 
 ### CLI input modes
 

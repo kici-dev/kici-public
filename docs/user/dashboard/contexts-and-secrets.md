@@ -34,7 +34,7 @@ Secret values are stored in the orchestrator's secret store and authorized throu
 
 Whether secret **values** can be set from the dashboard depends on the orchestrator's [dashboard-write policy](../../operator/security/dashboard-write-policy.md):
 
-- **Permissive (default):** the "Add secret" and "Edit value" controls accept plaintext directly in the dashboard. This is how a typical SaaS CI tool works and is the right default for small teams.
+- **Encrypted (default):** the "Add secret" and "Edit value" controls accept a value in the dashboard. Your browser encrypts the value before it leaves the page, and the hosted KiCI Platform relays only ciphertext. The form shows the URL the encryption key came from.
 - **`secrets.set` disabled by policy:** the controls render with a lock icon, grayed out. Hovering or keyboard-focusing the lock shows the exact `kici-admin secret set` invocation needed; a copy button puts it on the clipboard. The control is inert — it leaves the tab order entirely and the dashboard issues no mutating request. Use the CLI to enter values; the dashboard refreshes within ~30 seconds and shows the new secret name.
 
 The policy state is visible at three layers in the UI:

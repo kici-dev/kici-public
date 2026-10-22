@@ -27,19 +27,19 @@ exports[`org-settings help pin > keeps the full command tree unchanged 1`] = `
       --source <routingKey> mandatory=false :: Match an entry pinned to this routing key. Omit to match an unqualified entry.
       --format <format> mandatory=false default=table :: Output format: json|table
   dashboard-writes :: Manage per-orch dashboard write policy (which Platform-routed dashboard.* writes the orch accepts)
-    show :: Print current dashboard-write policy. Empty = all enabled.
+    show :: Print the current dashboard-write policy.
       --org <id> mandatory=true :: Org id
       --category <name> mandatory=false :: Filter to one category (Secrets|Variables|Environments|Bindings|"Held runs"|DLQ|Registrations|Topology)
       --sensitivity <name> mandatory=false :: Filter to one sensitivity bucket (plaintext|authority|dispatch)
       --format <format> mandatory=false default=table :: Output format: json|table
-    set :: Set one or more operations. Use --op <name>=<permissive|encrypted|disabled> per operation. "encrypted" is valid only for plaintext operations (secrets.set, variables.set). Sugar: --category or --sensitivity + --enabled <bool> expands to the matching operations.
+    set :: Set one or more operations. Use --op <name>=<permissive|encrypted|disabled> per operation. "encrypted" is valid only for secrets.set and variables.set; secrets.set does not accept "permissive". Sugar: --category or --sensitivity + --enabled <bool> expands to the matching operations; --enabled true sets each one to its default posture.
       --org <id> mandatory=true :: Org id
       --op <op=state> mandatory=false default= :: Single operation posture; repeatable (e.g. --op secrets.set=encrypted --op variables.set=disabled)
       --category <name> mandatory=false :: Apply --enabled to every operation in this category
       --sensitivity <name> mandatory=false :: Apply --enabled to every operation in this sensitivity bucket
       --enabled <bool> mandatory=false :: Pair with --category or --sensitivity to flip the whole group
       --format <format> mandatory=false default=table :: Output format: json|table
-    reset :: Reset all operations to enabled (permissive default).
+    reset :: Reset every operation to its default posture.
       --org <id> mandatory=true :: Org id
       --format <format> mandatory=false default=table :: Output format: json|table
   allow-http-npm :: Permit plain http:// npm registry URLs in workflow registries:. Default false; loopback / *.local are always allowed regardless.
@@ -590,12 +590,13 @@ Options:
   -h, --help       display help for command
 
 Commands:
-  show [options]   Print current dashboard-write policy. Empty = all enabled.
+  show [options]   Print the current dashboard-write policy.
   set [options]    Set one or more operations. Use --op <name>=<permissive|encrypted|disabled> per
-                   operation. "encrypted" is valid only for plaintext operations (secrets.set,
-                   variables.set). Sugar: --category or --sensitivity + --enabled <bool> expands to
-                   the matching operations.
-  reset [options]  Reset all operations to enabled (permissive default).
+                   operation. "encrypted" is valid only for secrets.set and variables.set;
+                   secrets.set does not accept "permissive". Sugar: --category or --sensitivity +
+                   --enabled <bool> expands to the matching operations; --enabled true sets each one
+                   to its default posture.
+  reset [options]  Reset every operation to its default posture.
   help [command]   display help for command
 "
 `;
@@ -603,7 +604,7 @@ Commands:
 exports[`org-settings help pin > org-settings dashboard-writes reset --help is unchanged 1`] = `
 "Usage: kici-admin org-settings dashboard-writes reset [options]
 
-Reset all operations to enabled (permissive default).
+Reset every operation to its default posture.
 
 Options:
   --org <id>         Org id
@@ -616,8 +617,9 @@ exports[`org-settings help pin > org-settings dashboard-writes set --help is unc
 "Usage: kici-admin org-settings dashboard-writes set [options]
 
 Set one or more operations. Use --op <name>=<permissive|encrypted|disabled> per operation.
-"encrypted" is valid only for plaintext operations (secrets.set, variables.set). Sugar: --category
-or --sensitivity + --enabled <bool> expands to the matching operations.
+"encrypted" is valid only for secrets.set and variables.set; secrets.set does not accept
+"permissive". Sugar: --category or --sensitivity + --enabled <bool> expands to the matching
+operations; --enabled true sets each one to its default posture.
 
 Options:
   --org <id>            Org id
@@ -634,7 +636,7 @@ Options:
 exports[`org-settings help pin > org-settings dashboard-writes show --help is unchanged 1`] = `
 "Usage: kici-admin org-settings dashboard-writes show [options]
 
-Print current dashboard-write policy. Empty = all enabled.
+Print the current dashboard-write policy.
 
 Options:
   --org <id>            Org id

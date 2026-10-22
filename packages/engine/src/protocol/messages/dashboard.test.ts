@@ -40,6 +40,7 @@ import {
   dashboardRunStructuredRequestSchema,
   dashboardRunStructuredResponseSchema,
   contextCreateRequestSchema,
+  contextSecretSetRequestSchema,
   contextUpdateRequestSchema,
   contextHistoryResponseSchema,
   heldRunsListRequestSchema,
@@ -1928,5 +1929,47 @@ describe('registrationItemSchema compile schema fields', () => {
     expect(
       registrationItemSchema.parse({ ...item, compileSchemaVersion: null }).compileSchemaVersion,
     ).toBeNull();
+  });
+});
+
+describe('contextSecretSetRequestSchema', () => {
+  const SEALED = { keyId: 'kid-1', ephemeralPublicKey: 'ZXBo', encrypted: 'Y2lwaGVy' };
+  const base = {
+    type: 'dashboard.contexts.secrets.set' as const,
+    requestId: 'req-1',
+    actor: { type: 'user' as const, sub: 's' },
+    scope: 'prod',
+    key: 'API_KEY',
+  };
+
+  it('accepts a sealed-only frame', () => {
+    // breaks-if-wrong: the browser's only frame shape still parses.
+    expect(contextSecretSetRequestSchema.safeParse({ ...base, sealed: SEALED }).success).toBe(true);
+  });
+
+  it('refuses a value-only frame', () => {
+    // fails-when: a plaintext value is accepted.
+    expect(contextSecretSetRequestSchema.safeParse({ ...base, value: 'pt' }).success).toBe(false);
+  });
+
+  it('refuses value + sealed instead of stripping value', () => {
+    // fails-when: `value` is undeclared, so z.object strips it and the frame parses.
+    expect(
+      contextSecretSetRequestSchema.safeParse({ ...base, value: 'pt', sealed: SEALED }).success,
+    ).toBe(false);
+  });
+
+  it('refuses value: "" with sealed', () => {
+    expect(
+      contextSecretSetRequestSchema.safeParse({ ...base, value: '', sealed: SEALED }).success,
+    ).toBe(false);
+  });
+
+  it('the platform→orch union refuses the same frames', () => {
+    expect(dashboardPlatformToOrchSchema.safeParse({ ...base, value: 'pt' }).success).toBe(false);
+    expect(
+      dashboardPlatformToOrchSchema.safeParse({ ...base, value: 'pt', sealed: SEALED }).success,
+    ).toBe(false);
+    expect(dashboardPlatformToOrchSchema.safeParse({ ...base, sealed: SEALED }).success).toBe(true);
   });
 });

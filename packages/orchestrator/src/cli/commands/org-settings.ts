@@ -16,6 +16,10 @@ import {
   DashboardWriteOperation,
   DashboardWritePolicyState,
   DashboardWriteSensitivity,
+  defaultPolicyState,
+  getDashboardWriteOperationDescriptor,
+  isAllowedPolicyState,
+  policyStateRefusalMessage,
   type DashboardWritePolicyMap,
 } from '@kici-dev/engine/protocol/dashboard-write-operations';
 import { cliAction } from './shared/cli-action.js';
@@ -916,7 +920,16 @@ function parseOpFlag(
     );
     process.exit(1);
   }
-  previous.push([op as DashboardWriteOperation, state]);
+  const operation = op as DashboardWriteOperation;
+  if (!isAllowedPolicyState(operation, state)) {
+    const hint =
+      defaultPolicyState(operation) === DashboardWritePolicyState.enum.encrypted
+        ? ` A secret value is always encrypted in the browser, or set with ${getDashboardWriteOperationDescriptor(operation).cliEquivalent}.`
+        : '';
+    console.error(`Error: ${policyStateRefusalMessage(operation, state)}${hint}`);
+    process.exit(1);
+  }
+  previous.push([operation, state]);
   return previous;
 }
 
@@ -931,7 +944,7 @@ function registerDashboardWritesCommands(
     );
 
   dw.command('show')
-    .description('Print current dashboard-write policy. Empty = all enabled.')
+    .description('Print the current dashboard-write policy.')
     .requiredOption('--org <id>', 'Org id')
     .option(
       '--category <name>',
@@ -959,9 +972,9 @@ function registerDashboardWritesCommands(
   dw.command('set')
     .description(
       'Set one or more operations. Use --op <name>=<permissive|encrypted|disabled> per operation. ' +
-        '"encrypted" is valid only for plaintext operations ' +
-        '(secrets.set, variables.set). Sugar: --category or --sensitivity + --enabled <bool> ' +
-        'expands to the matching operations.',
+        '"encrypted" is valid only for secrets.set and variables.set; secrets.set does not ' +
+        'accept "permissive". Sugar: --category or --sensitivity + --enabled <bool> expands to ' +
+        'the matching operations; --enabled true sets each one to its default posture.',
     )
     .requiredOption('--org <id>', 'Org id')
     .option(
@@ -1007,7 +1020,7 @@ function registerDashboardWritesCommands(
     );
 
   dw.command('reset')
-    .description('Reset all operations to enabled (permissive default).')
+    .description('Reset every operation to its default posture.')
     .requiredOption('--org <id>', 'Org id')
     .option('--format <format>', 'Output format: json|table', 'table')
     .action(
@@ -1065,15 +1078,17 @@ function collectUpdates(opts: {
     if (enabled !== 'true' && enabled !== 'false') {
       throw new Error('--enabled must be "true" or "false"');
     }
-    // Group sugar flips the whole set enabled (permissive) / disabled — the
-    // encrypted posture is per-operation only, set via --op.
-    const value: DashboardWritePolicyState = enabled === 'true' ? 'permissive' : 'disabled';
+    // `--enabled true` turns each matched write back on at its default posture;
+    // the `encrypted` posture for variables.set is per-operation only, via --op.
     const cat = opts.category ? DashboardWriteCategory.parse(opts.category) : undefined;
     const sens = opts.sensitivity ? DashboardWriteSensitivity.parse(opts.sensitivity) : undefined;
     for (const descriptor of DASHBOARD_WRITE_OPERATIONS) {
       if (cat && descriptor.category !== cat) continue;
       if (sens && descriptor.sensitivity !== sens) continue;
-      updates[descriptor.name] = value;
+      updates[descriptor.name] =
+        enabled === 'true'
+          ? defaultPolicyState(descriptor.name)
+          : DashboardWritePolicyState.enum.disabled;
     }
   }
   return updates;

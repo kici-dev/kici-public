@@ -1542,23 +1542,22 @@ const contextSecretsListResponseSchema = z.object({
 });
 
 /**
- * Set (create or update) a scoped secret. The browser sends the plaintext
- * `value` under the `permissive` posture, or a `sealed` envelope under
- * `encrypted`; exactly one is present.
+ * Set (create or update) a scoped secret. The browser always seals a secret
+ * value; a plaintext value is refused at the Platform and at this schema.
  */
-export const contextSecretSetRequestSchema = z
-  .object({
-    type: z.literal('dashboard.contexts.secrets.set'),
-    requestId: z.string(),
-    actor: actorPrincipalSchema,
-    scope: z.string(),
-    key: z.string(),
-    value: z.string().optional(),
-    sealed: dashboardSealedEnvelopeSchema.optional(),
-  })
-  .refine((m) => (m.value === undefined) !== (m.sealed === undefined), {
-    message: 'exactly one of value / sealed must be present',
-  });
+export const contextSecretSetRequestSchema = z.object({
+  type: z.literal('dashboard.contexts.secrets.set'),
+  requestId: z.string(),
+  actor: actorPrincipalSchema,
+  scope: z.string(),
+  key: z.string(),
+  sealed: dashboardSealedEnvelopeSchema,
+  // A `z.object` strips unknown keys, so an undeclared `value` would let a frame
+  // carrying both parse with the plaintext silently dropped. Declared `never`,
+  // any frame carrying `value` fails to parse and the orchestrator answers
+  // `invalid_payload`.
+  value: z.never().optional(),
+});
 
 const contextSecretSetResponseSchema = z.object({
   type: z.literal('dashboard.contexts.secrets.set.response'),

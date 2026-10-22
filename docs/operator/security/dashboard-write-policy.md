@@ -5,17 +5,17 @@ description: Per-orchestrator, per-operation policy that decides which dashboard
 
 The orchestrator decides, per operation, whether a mutating dashboard action stays on the web UI or becomes **CLI-only** (reachable solely through `kici-admin` against the orchestrator's HTTP admin API). The policy is configured by the orchestrator operator and is read by three layers — the dashboard (for rendering), the SaaS control plane (for HTTP route gating), and the orchestrator itself (for defense-in-depth handler enforcement). All three layers read the same operation registry.
 
-The default at first boot is **permissive**: every operation is enabled. Small teams onboard with the dashboard doing everything they expect a CI control plane to do. Customers preparing for SOC2 or running regulated workloads ratchet specific operations off as their compliance posture demands. There is no "all-or-nothing" switch — every operation flips independently.
+At first boot every operation is enabled. `secrets.set` defaults to **encrypted**: the dashboard encrypts a secret value in your browser, and the hosted control plane relays only ciphertext. Every other operation defaults to **permissive**. Small teams onboard with the dashboard doing everything they expect a CI control plane to do. Customers preparing for SOC2 or running regulated workloads ratchet specific operations off as their compliance posture demands. There is no "all-or-nothing" switch — every operation flips independently.
 
 ## Three postures per operation
 
 Each operation carries one of three postures:
 
-- **`permissive`** — the write is accepted through the web UI and its value transits the hosted control plane in the clear (today's default; the shape most SaaS CI vendors have).
+- **`permissive`** — the write is accepted through the web UI and its value transits the hosted control plane in the clear (the default for every operation except `secrets.set`; the shape most SaaS CI vendors have).
 - **`encrypted`** — for the two `plaintext`-sensitivity operations (`secrets.set`, `variables.set`) only: the web UI keeps the value-entry form, but the **browser encrypts the value to the orchestrator before it leaves the page**, so the control plane relays only opaque ciphertext and never sees the plaintext. See [Encrypted dashboard writes](./encrypted-dashboard-writes.md).
 - **`disabled`** — the write is refused on the web UI; the operator must use `kici-admin`.
 
-`encrypted` is only valid for the plaintext operations — an operation with no plaintext payload has nothing to seal, so the CLI rejects `encrypted` for any other operation. Existing operators keep the familiar permissive/disabled behavior unchanged; `encrypted` is opt-in.
+Each operation has a default posture and a set of allowed postures. `secrets.set` defaults to `encrypted` and accepts only `encrypted` or `disabled`: a secret value never transits the control plane in the clear. `variables.set` defaults to `permissive` and accepts all three postures, so `encrypted` is opt-in there. Every other operation defaults to `permissive` and accepts `permissive` or `disabled`. An operation with no plaintext payload has nothing to seal, so the CLI rejects `encrypted` for it.
 
 ## The operation registry
 
@@ -63,7 +63,7 @@ Dual-control for held runs on a Platform-attached deployment — routing approva
 
 The **sensitivity** bucket describes the threat each operation participates in when routed through the dashboard:
 
-- `plaintext` — the operation carries a customer-supplied plaintext value (a secret value, a variable value) that traverses the control plane's process memory on its way to the orchestrator. Disabling these routes the value through `kici-admin` (operator's machine → orchestrator HTTP admin API) and the control plane never sees the plaintext.
+- `plaintext` — the operation carries a customer-supplied value (a secret value, a variable value). Under `permissive` the plaintext traverses the control plane's process memory on its way to the orchestrator. Under `encrypted` the control plane relays only ciphertext, and a secret value is always encrypted. Disabling these routes the value through `kici-admin` (operator's machine → orchestrator HTTP admin API), and the control plane never sees the value at all.
 - `authority` — the operation reshapes the orchestrator's resolution tree or RBAC posture (environment CRUD, bindings, scope rename / delete). No plaintext, but the action's authority is the operator's, not the dashboard user's.
 - `dispatch` — the operation releases or cancels execution (held-run approve / reject, DLQ retry / discard, registration disable / delete, scaler topology). Routing dispatch through `kici-admin` keeps the dispatch decision on the operator's side of the trust boundary.
 
@@ -96,7 +96,7 @@ kici-admin org-settings dashboard-writes set --org <org-id> --op secrets.set=dis
 kici-admin org-settings dashboard-writes set --org <org-id> --op secrets.set=encrypted   # plaintext ops only
 ```
 
-Each `--op <name>=<state>` takes one of `permissive`, `encrypted`, or `disabled`. Multiple `--op` flags are accepted in one call. `encrypted` is rejected for any operation outside the two plaintext ops. The CLI prints a diff of what's about to change and refuses if any operation name is unknown.
+Each `--op <name>=<state>` takes one of `permissive`, `encrypted`, or `disabled`. Multiple `--op` flags are accepted in one call. `encrypted` is rejected for any operation outside the two plaintext ops, and `permissive` is rejected for `secrets.set`. The CLI prints a diff of what's about to change and refuses if any operation name is unknown.
 
 ### Disable a whole category or sensitivity bucket
 
@@ -105,15 +105,15 @@ kici-admin org-settings dashboard-writes set --org <org-id> --category=Secrets -
 kici-admin org-settings dashboard-writes set --org <org-id> --sensitivity=plaintext --enabled=false
 ```
 
-`--category` and `--sensitivity` are convenience flags that expand to the equivalent `--op` list before the database update — the underlying storage only knows individual operations. The CLI prints the expanded set before applying so the operator sees exactly which operations they are touching.
+`--category` and `--sensitivity` are convenience flags that expand to the equivalent `--op` list before the database update — the underlying storage only knows individual operations. `--enabled=true` sets each matched operation to its default posture. The CLI prints the expanded set before applying so the operator sees exactly which operations they are touching.
 
-### Reset to permissive
+### Reset to the defaults
 
 ```bash
 kici-admin org-settings dashboard-writes reset --org <org-id>
 ```
 
-Erases every override; every operation flips back to the permissive default.
+Erases every override; every operation returns to its default posture.
 
 ## Recommended postures
 
@@ -121,7 +121,7 @@ These are starting points. Every operator should flip switches based on their ow
 
 ### Small team, no compliance requirement
 
-Keep the permissive default. The dashboard works the way most CI control planes work, and the trust model is identical to a typical SaaS CI vendor.
+Keep the defaults. The dashboard works the way most CI control planes work. It still sets secret values, which your browser encrypts before they leave the page.
 
 ### SOC2 preparation, internal customers
 
@@ -166,7 +166,7 @@ for op in $(kici-admin org-settings dashboard-writes show --org "$ORG" |
     # orchestrator refuses the write; the guard here keeps the loop going.
     held_runs.approve | held_runs.reject) continue ;;
   esac
-  kici-admin org-settings dashboard-writes set --org "$ORG" --op "$op=false"
+  kici-admin org-settings dashboard-writes set --org "$ORG" --op "$op=disabled"
 done
 ```
 
@@ -272,7 +272,7 @@ The orchestrator sends its policy view to the control plane in the `capabilities
 }
 ```
 
-The `dashboardWrites` map is **sparse**: only operations that deviate from the permissive default appear. A missing key resolves to `permissive`, so an orchestrator running the default policy sends an empty map rather than all 27 operations. Each value is one of the three policy states: `"permissive"`, `"encrypted"` (allowed only as a browser-sealed write, and valid only for `secrets.set` and `variables.set`), or `"disabled"` (blocked). A frame carrying any other value fails to parse.
+The `dashboardWrites` map is **sparse**: only operations that deviate from their default posture appear. A missing key resolves to that operation's default posture (`encrypted` for `secrets.set`, `permissive` for every other operation), so an orchestrator running the default policy sends an empty map rather than one entry per operation. Each value is one of the three policy states: `"permissive"`, `"encrypted"` (allowed only as a browser-sealed write, and valid only for `secrets.set` and `variables.set`), or `"disabled"` (blocked). A frame carrying any other value fails to parse.
 
 The dashboard's `GET /api/v1/orgs/:customerId/orchestrators/:clusterName/capabilities` endpoint reads this cache and expands the sparse map into a full row per operation for the SPA.
 

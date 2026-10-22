@@ -275,11 +275,11 @@ kici-admin org-settings dashboard-writes set --org <id> --op <name>=<permissive|
 kici-admin org-settings dashboard-writes reset --org <id> [--format json|table]
 ```
 
-Manages the per-orch dashboard write policy — the matrix of `dashboard.*` write operations the orchestrator will accept when proxied through Platform. Empty policy = all operations enabled (permissive default).
+Manages the per-orch dashboard write policy — the matrix of `dashboard.*` write operations the orchestrator will accept when proxied through Platform. Empty policy = every operation at its default posture: `secrets.set` encrypted, every other operation permissive.
 
 - `show` prints the current policy. Filter to one category (`Secrets`, `Variables`, `Contexts`, `Bindings`, `Held runs`, `DLQ`, `Attestations`, `Registrations`, `Topology`, `Fleet`) or one sensitivity bucket (`plaintext`, `authority`, `dispatch`).
-- `set` flips one or more operations. Pass `--op <name>=<permissive|encrypted|disabled>` (repeatable) for individual operations, or combine `--category` / `--sensitivity` with `--enabled <bool>` to flip every operation in the matching group at once. The CLI prints the planned change before applying.
-- `reset` returns every operation to the permissive default.
+- `set` flips one or more operations. Pass `--op <name>=<permissive|encrypted|disabled>` (repeatable) for individual operations, or combine `--category` / `--sensitivity` with `--enabled <bool>` to flip every operation in the matching group at once; `--enabled true` sets each one to its default posture. `secrets.set` accepts only `encrypted` or `disabled`. The CLI prints the planned change before applying.
+- `reset` returns every operation to its default posture.
 - `--org <id>` selects the org row.
 
 ### trust-policy -- CI trust policy for fork pull requests
@@ -799,7 +799,7 @@ Synopsis: `kici-admin org-settings dashboard-writes`
 
 ### `kici-admin org-settings dashboard-writes reset`
 
-Reset all operations to enabled (permissive default).
+Reset every operation to its default posture.
 
 Synopsis: `kici-admin org-settings dashboard-writes reset [options]`
 
@@ -812,7 +812,7 @@ Synopsis: `kici-admin org-settings dashboard-writes reset [options]`
 
 ### `kici-admin org-settings dashboard-writes set`
 
-Set one or more operations. Use --op <name>=<permissive|encrypted|disabled> per operation. "encrypted" is valid only for plaintext operations (secrets.set, variables.set). Sugar: --category or --sensitivity + --enabled <bool> expands to the matching operations.
+Set one or more operations. Use --op <name>=<permissive|encrypted|disabled> per operation. "encrypted" is valid only for secrets.set and variables.set; secrets.set does not accept "permissive". Sugar: --category or --sensitivity + --enabled <bool> expands to the matching operations; --enabled true sets each one to its default posture.
 
 Synopsis: `kici-admin org-settings dashboard-writes set [options]`
 
@@ -829,7 +829,7 @@ Synopsis: `kici-admin org-settings dashboard-writes set [options]`
 
 ### `kici-admin org-settings dashboard-writes show`
 
-Print current dashboard-write policy. Empty = all enabled.
+Print the current dashboard-write policy.
 
 Synopsis: `kici-admin org-settings dashboard-writes show [options]`
 

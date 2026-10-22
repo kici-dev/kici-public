@@ -13,7 +13,7 @@
  * — the coverage test guards which operations are gated; this test
  * guards what the gate actually does at runtime.
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeAll } from 'vitest';
 import type { DashboardWritePolicyMap } from '@kici-dev/engine/protocol/dashboard-write-operations';
 import {
   DashboardContextHandler,
@@ -21,6 +21,12 @@ import {
 } from '../ws/dashboard-context-handler.js';
 import { createMockDb } from '../__test-helpers__/mock-db.js';
 import { invalidateDashboardWritePolicyCache } from './dashboard-write-policy.js';
+import { makeDashboardEncryption } from '../__test-helpers__/dashboard-seal.js';
+
+let enc: Awaited<ReturnType<typeof makeDashboardEncryption>>;
+beforeAll(async () => {
+  enc = await makeDashboardEncryption();
+});
 
 function buildDepsWithDisabledPolicy(disabled: DashboardWritePolicyMap): {
   deps: DashboardContextHandlerDeps;
@@ -50,6 +56,7 @@ function buildDepsWithDisabledPolicy(disabled: DashboardWritePolicyMap): {
       deleteSecret,
     },
     db: db as never,
+    dashboardEncryption: enc.dep,
   };
 
   return { deps, sent, setSecret, deleteSecret };
@@ -67,7 +74,7 @@ describe('orch-side dashboard-write policy gate (behaviour)', () => {
       actor: { type: 'user', id: 'u-1', sub: 'sub-1' },
       scope: 'pg:aws/prod',
       key: 'API_KEY',
-      value: 'plaintext-from-dashboard',
+      sealed: enc.seal('plaintext-from-dashboard'),
     } as never);
 
     expect(setSecret).not.toHaveBeenCalled();
@@ -101,9 +108,9 @@ describe('orch-side dashboard-write policy gate (behaviour)', () => {
     expect(response.operation).toBe('secrets.delete');
   });
 
-  it('allows the operation when policy is permissive (default)', async () => {
+  it('allows a sealed value under the default encrypted posture', async () => {
     invalidateDashboardWritePolicyCache();
-    // Empty policy row → permissive default. The setSecret stub should fire.
+    // Empty policy row → the encrypted default for secrets.set. The setSecret stub should fire.
     const { deps, sent, setSecret } = buildDepsWithDisabledPolicy({});
     const handler = new DashboardContextHandler(deps);
 
@@ -113,7 +120,7 @@ describe('orch-side dashboard-write policy gate (behaviour)', () => {
       actor: { type: 'user', id: 'u-1', sub: 'sub-1' },
       scope: 'pg:aws/prod',
       key: 'API_KEY',
-      value: 'plaintext-from-dashboard',
+      sealed: enc.seal('plaintext-from-dashboard'),
     } as never);
 
     expect(setSecret).toHaveBeenCalledOnce();

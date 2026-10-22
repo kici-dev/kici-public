@@ -22,18 +22,19 @@ Derived from the orchestrator-to-Platform protocol schema in the
 `@kici-dev/engine` package (`packages/engine/src/protocol/messages/`); the
 message types named below are the wire contract.
 
-| Data                     | Examples                                                                                 | Stored by the Platform                 | Protocol message              |
-| ------------------------ | ---------------------------------------------------------------------------------------- | -------------------------------------- | ----------------------------- |
-| Run lifecycle metadata   | run id, workflow name, status, timestamps, durations, job count, re-run lineage          | Yes                                    | `execution.status`            |
-| Repository identity      | `owner/repo`, provider, commit sha, ref, trigger event, first line of the commit message | Yes                                    | `execution.status`            |
-| Trigger actor identity   | provider username and user id of the pusher / PR author                                  | Yes                                    | `execution.status`            |
-| Job metadata             | job names, statuses, durations, error messages, agent labels, context names              | Yes                                    | `job.status.forward`          |
-| Step metadata            | step names, statuses, and step-level error messages                                      | No — transit only (see below)          | `step.status.forward`         |
-| Secret key names         | names of secrets a step accessed — never the values                                      | No — transit only (see below)          | `step.status.forward`         |
-| Job context              | environment variable names (secret values masked), runtime and sandbox info, SDK version | Yes                                    | `job.context`                 |
-| Run timeline and timings | clone/spawn/execution phase markers with durations                                       | Yes                                    | `run.event`                   |
-| Log line content         | live log lines while a run streams                                                       | **No — transit only** (see below)      | `log.chunk`, `orch-log.chunk` |
-| Operational metrics      | orchestrator telemetry counters and histograms                                           | Retained in the hosted metrics backend | `orch.metrics`                |
+| Data                            | Examples                                                                                 | Stored by the Platform                 | Protocol message                 |
+| ------------------------------- | ---------------------------------------------------------------------------------------- | -------------------------------------- | -------------------------------- |
+| Run lifecycle metadata          | run id, workflow name, status, timestamps, durations, job count, re-run lineage          | Yes                                    | `execution.status`               |
+| Repository identity             | `owner/repo`, provider, commit sha, ref, trigger event, first line of the commit message | Yes                                    | `execution.status`               |
+| Trigger actor identity          | provider username and user id of the pusher / PR author                                  | Yes                                    | `execution.status`               |
+| Job metadata                    | job names, statuses, durations, error messages, agent labels, context names              | Yes                                    | `job.status.forward`             |
+| Step metadata                   | step names, statuses, and step-level error messages                                      | No — transit only (see below)          | `step.status.forward`            |
+| Secret key names                | names of secrets a step accessed — never the values                                      | No — transit only (see below)          | `step.status.forward`            |
+| Job context                     | environment variable names (secret values masked), runtime and sandbox info, SDK version | Yes                                    | `job.context`                    |
+| Run timeline and timings        | clone/spawn/execution phase markers with durations                                       | Yes                                    | `run.event`                      |
+| Log line content                | live log lines while a run streams                                                       | **No — transit only** (see below)      | `log.chunk`, `orch-log.chunk`    |
+| Operational metrics             | orchestrator telemetry counters and histograms                                           | Retained in the hosted metrics backend | `orch.metrics`                   |
+| Dashboard-entered secret values | a value typed into the dashboard, sealed in your browser                                 | No — transit only, as ciphertext       | `dashboard.contexts.secrets.set` |
 
 ## What transits but is not stored
 
@@ -47,6 +48,10 @@ streaming, the Platform forwards each of these straight to the dashboard and
 drops it; nothing is persisted. For logs,
 the only figures the Platform keeps are aggregate byte counts recorded as run
 metadata. Both step logs and orchestration/provisioning logs stream the same way.
+
+A secret value entered in the dashboard is encrypted in your browser to your
+orchestrator's key, so the Platform relays only ciphertext and never sees the
+plaintext.
 
 Historical log views in the hosted dashboard are served identically: they are
 fetched from **your** orchestrator on demand and passed through the relay. Log

@@ -227,31 +227,37 @@ export class DashboardContextHandler {
   }
 
   /**
-   * Plaintext for a secret/variable set. A `sealed` envelope is decrypted with the
-   * orchestrator's X25519 key under any posture: the client chose to seal, so that
-   * plaintext never transits the Platform. Otherwise `encrypted` refuses a plaintext
-   * `value` (fail-closed) and `permissive` uses it. Errors are structured codes the
-   * caller records and sends back.
+   * Decrypt a browser-sealed envelope with the orchestrator's X25519 key. Errors are
+   * structured codes the caller records and sends back.
+   */
+  private async decryptSealed(
+    sealed: DashboardSealedEnvelope,
+  ): Promise<{ plaintext: string } | { error: DashboardSealedWriteError }> {
+    const resolved = await this.deps.dashboardEncryption?.resolve();
+    if (!resolved) {
+      return { error: DashboardSealedWriteError.enum.encryption_unavailable };
+    }
+    const priv = await resolved.decryptPrivateKeyDer(sealed.keyId);
+    if (!priv) {
+      return { error: DashboardSealedWriteError.enum.unknown_encryption_key };
+    }
+    try {
+      return { plaintext: decryptDashboardSealedWrite(sealed, priv) };
+    } catch {
+      return { error: DashboardSealedWriteError.enum.decryption_failed };
+    }
+  }
+
+  /**
+   * Plaintext for a variable set. A `sealed` envelope is decrypted under any posture:
+   * the client chose to seal, so that plaintext never transits the Platform. Otherwise
+   * `encrypted` refuses a plaintext `value` (fail-closed) and `permissive` uses it.
    */
   private async resolveWriteValue(
     msg: { value?: string; sealed?: DashboardSealedEnvelope },
     op: DashboardWriteOperation,
   ): Promise<{ plaintext: string } | { error: DashboardSealedWriteError }> {
-    if (msg.sealed) {
-      const resolved = await this.deps.dashboardEncryption?.resolve();
-      if (!resolved) {
-        return { error: DashboardSealedWriteError.enum.encryption_unavailable };
-      }
-      const priv = await resolved.decryptPrivateKeyDer(msg.sealed.keyId);
-      if (!priv) {
-        return { error: DashboardSealedWriteError.enum.unknown_encryption_key };
-      }
-      try {
-        return { plaintext: decryptDashboardSealedWrite(msg.sealed, priv) };
-      } catch {
-        return { error: DashboardSealedWriteError.enum.decryption_failed };
-      }
-    }
+    if (msg.sealed) return this.decryptSealed(msg.sealed);
     const state = await getDashboardWritePolicyState(this.deps.db, this.deps.orgId, op);
     if (state === 'encrypted') {
       // Fail-closed: never accept a plaintext value under the encrypted posture.
@@ -1085,7 +1091,11 @@ export class DashboardContextHandler {
     ) {
       return;
     }
-    const resolved = await this.resolveWriteValue(msg, 'secrets.set');
+    // A secret value arrives only sealed; the `else` arm guards a frame that bypassed
+    // the wire schema and never reads the posture.
+    const resolved = msg.sealed
+      ? await this.decryptSealed(msg.sealed)
+      : { error: DashboardSealedWriteError.enum.operation_requires_encryption };
     if ('error' in resolved) {
       this.access.record(
         msg.actor,

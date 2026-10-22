@@ -35,6 +35,7 @@ import {
   dashboardWritePolicyEvents,
   findHeldRunLockouts,
   getDashboardWritePolicy,
+  getDashboardWritePolicyState,
   HeldRunLockoutRefusedError,
   invalidateDashboardWritePolicyCache,
   isDashboardWriteEnabled,
@@ -213,7 +214,7 @@ describe('getDashboardWritePolicy', () => {
 });
 
 describe('isDashboardWriteEnabled', () => {
-  it('returns true for an unset operation (permissive default)', async () => {
+  it('returns true for an unset operation (its default posture is enabled)', async () => {
     const { db } = makeFakeDb();
     expect(await isDashboardWriteEnabled(db, 'customer-1', 'secrets.set')).toBe(true);
   });
@@ -274,7 +275,7 @@ describe('setDashboardWritePolicy', () => {
     expect(handle.get('customer-1')).toEqual({ 'secrets.set': 'disabled' });
   });
 
-  it('normalizes "true" away — permissive is the absence of a key', async () => {
+  it('normalizes a default posture away — the default is the absence of a key', async () => {
     const { db, handle } = makeFakeDb([
       {
         customer_id: 'customer-1',
@@ -284,10 +285,66 @@ describe('setDashboardWritePolicy', () => {
     await setDashboardWritePolicy(
       db,
       'customer-1',
-      { 'secrets.set': 'permissive' },
+      { 'variables.set': 'permissive' },
       { actor, mode },
     );
-    expect(handle.get('customer-1')).toEqual({ 'variables.set': 'disabled' });
+    expect(handle.get('customer-1')).toEqual({ 'secrets.set': 'disabled' });
+  });
+
+  it('refuses secrets.set=permissive with the write schema and writes nothing', async () => {
+    // fails-when: the update is parsed with the read schema, which tolerates a legacy permissive.
+    const { db, handle } = makeFakeDb();
+    await expect(
+      setDashboardWritePolicy(db, 'customer-1', { 'secrets.set': 'permissive' }, { actor, mode }),
+    ).rejects.toThrow(/not allowed for secrets\.set/);
+    expect(handle.size()).toBe(0);
+    expect(notifyCalls()).toHaveLength(0);
+  });
+
+  it('stores nothing for secrets.set=encrypted, its default', async () => {
+    const { db, handle } = makeFakeDb();
+    const eventSpy = vi.fn();
+    dashboardWritePolicyEvents.on('changed', eventSpy);
+    await setDashboardWritePolicy(
+      db,
+      'customer-1',
+      { 'secrets.set': 'encrypted' },
+      { actor, mode },
+    );
+    expect(handle.get('customer-1')).toBeUndefined();
+    expect(eventSpy).not.toHaveBeenCalled();
+  });
+
+  it('drops a stored secrets.set=disabled when set to encrypted and reports the change', async () => {
+    const { db, handle } = makeFakeDb([
+      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': 'disabled' } },
+    ]);
+    const onChange = vi.fn().mockResolvedValue(undefined);
+    await setDashboardWritePolicy(
+      db,
+      'customer-1',
+      { 'secrets.set': 'encrypted' },
+      { actor, mode, onChange },
+    );
+    expect(handle.get('customer-1')).toEqual({});
+    expect(onChange).toHaveBeenCalledOnce();
+    expect(onChange.mock.calls[0]?.[0]).toMatchObject({
+      op: 'secrets.set',
+      prior: 'disabled',
+      next: 'encrypted',
+    });
+  });
+
+  it('a legacy stored map keeps its other entries and resolves secrets.set to encrypted', async () => {
+    // fails-when: the legacy map is discarded by a strict read parse.
+    const { db } = makeFakeDb([
+      {
+        customer_id: 'c',
+        dashboard_write_policy: { 'secrets.set': 'permissive', 'event_dlq.retry': 'disabled' },
+      },
+    ]);
+    expect(await getDashboardWritePolicyState(db, 'c', 'secrets.set')).toBe('encrypted');
+    expect(await getDashboardWritePolicyState(db, 'c', 'event_dlq.retry')).toBe('disabled');
   });
 
   it('rejects unknown operation keys via the engine schema', async () => {
@@ -340,7 +397,8 @@ describe('setDashboardWritePolicy', () => {
     for (const ev of events) {
       expect(ev.actor).toEqual(actor);
       expect(ev.customerId).toBe('customer-1');
-      expect(ev.prior).toBe('permissive');
+      // Each operation's prior is its default posture: encrypted for secrets.set.
+      expect(ev.prior).toBe(ev.op === 'secrets.set' ? 'encrypted' : 'permissive');
       expect(ev.next).toBe('disabled');
     }
   });
@@ -408,6 +466,52 @@ describe('resetDashboardWritePolicy', () => {
     expect(handle.get('customer-1')).toEqual({});
   });
 
+  it('reset of a disabled secrets.set yields stored {} and state encrypted', async () => {
+    // breaks-if-wrong: reset must not write permissive for secrets.set (the write schema refuses it).
+    const { db, handle } = makeFakeDb([
+      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': 'disabled' } },
+    ]);
+    const next = await resetDashboardWritePolicy(db, 'customer-1', { actor, mode });
+    expect(next).toEqual({});
+    expect(handle.get('customer-1')).toEqual({});
+    expect(await getDashboardWritePolicyState(db, 'customer-1', 'secrets.set')).toBe('encrypted');
+  });
+
+  it('reset drops a redundant stored encrypted key without a change event', async () => {
+    const { db, handle } = makeFakeDb([
+      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': 'encrypted' } },
+    ]);
+    const eventSpy = vi.fn();
+    dashboardWritePolicyEvents.on('changed', eventSpy);
+    await resetDashboardWritePolicy(db, 'customer-1', { actor, mode });
+    expect(handle.get('customer-1')).toEqual({});
+    expect(eventSpy).not.toHaveBeenCalled();
+    expect(notifyCalls()).toHaveLength(1);
+  });
+
+  it('reset drops a hand-edited stored permissive secrets.set without a change event', async () => {
+    const { db, handle } = makeFakeDb([
+      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': 'permissive' } },
+    ]);
+    const eventSpy = vi.fn();
+    const onChange = vi.fn().mockResolvedValue(undefined);
+    dashboardWritePolicyEvents.on('changed', eventSpy);
+    await resetDashboardWritePolicy(db, 'customer-1', { actor, mode, onChange });
+    expect(handle.get('customer-1')).toEqual({});
+    expect(eventSpy).not.toHaveBeenCalled();
+    expect(onChange).not.toHaveBeenCalled();
+    expect(notifyCalls()).toHaveLength(1);
+  });
+
+  it('a pure key drop invalidates the cache so show reflects it at once', async () => {
+    const { db } = makeFakeDb([
+      { customer_id: 'customer-1', dashboard_write_policy: { 'secrets.set': 'encrypted' } },
+    ]);
+    expect(await getDashboardWritePolicy(db, 'customer-1')).toEqual({ 'secrets.set': 'encrypted' });
+    await resetDashboardWritePolicy(db, 'customer-1', { actor, mode });
+    expect(await getDashboardWritePolicy(db, 'customer-1')).toEqual({});
+  });
+
   it('no-ops when policy is already empty', async () => {
     const { db } = makeFakeDb();
     const eventSpy = vi.fn();
@@ -417,7 +521,7 @@ describe('resetDashboardWritePolicy', () => {
     expect(eventSpy).not.toHaveBeenCalled();
   });
 
-  // A reset only ever writes `permissive`, so it can never create a lockout —
+  // A reset only ever writes each operation's default, so it can never create a lockout —
   // and must stay usable as the way OUT of one.
   it('is permitted on a Platform-attached orchestrator even when a held-run write is disabled', async () => {
     const { db, handle } = makeFakeDb([
@@ -555,7 +659,7 @@ describe('findHeldRunLockouts', () => {
 });
 
 describe('resolveFullPolicyView', () => {
-  it('returns the full operation map with permissive defaults', () => {
+  it('returns the full operation map with every default posture enabled', () => {
     const view = resolveFullPolicyView({});
     expect(Object.keys(view).length).toBe(DASHBOARD_WRITE_OPERATION_VALUES.length);
     expect(new Set(Object.keys(view))).toEqual(new Set(DASHBOARD_WRITE_OPERATION_VALUES));

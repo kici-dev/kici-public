@@ -24,7 +24,7 @@ import {
 import type { RepoPatternEntry } from '@kici-dev/engine/protocol/dashboard-global-workflows';
 import {
   DashboardWriteOperation,
-  dashboardWritePolicyMapSchema,
+  dashboardWritePolicyUpdate,
   resolveFullPolicyView,
   resolveFullPolicyStateView,
 } from '@kici-dev/engine/protocol/dashboard-write-operations';
@@ -489,7 +489,7 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
 
   const dashboardWritesUpdateSchema = z.object({
     customerId: z.string().min(1),
-    updates: dashboardWritePolicyMapSchema.optional(),
+    updates: dashboardWritePolicyUpdate.optional(),
     reset: z.boolean().optional(),
   });
 
@@ -512,9 +512,9 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
   });
 
   // PATCH /api/v1/admin/org-settings/dashboard-writes
-  //   body: { customerId, updates?: {[op]: boolean}, reset?: true }
-  //   updates: merge-shape; permissive default lives in the absence of a key.
-  //   reset: clears every disabled flag back to permissive.
+  //   body: { customerId, updates?: { [op]: posture }, reset?: true }
+  //   updates: merge-shape; an absent key means the op's default posture.
+  //   reset: every operation back to its default posture.
   app.patch('/org-settings/dashboard-writes', async (c) => {
     try {
       deps.rbac.requirePermission(c.get('role'), 'secret.write');
@@ -568,6 +568,8 @@ export function createOrgSettingsRoutes(deps: OrgSettingsRouteDeps): Hono<AdminE
       if (err instanceof HeldRunLockoutRefusedError) {
         return c.json({ error: err.message, operations: err.operations }, 409);
       }
+      // A refused posture or a malformed body is a client error, not a server fault.
+      if (err instanceof z.ZodError) return handleAdminError(c, err, logger);
       logger.error('Failed to update dashboard-write policy', { error: toErrorMessage(err) });
       return handleAdminError(c, err, logger);
     }

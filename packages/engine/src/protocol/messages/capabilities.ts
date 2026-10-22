@@ -33,7 +33,8 @@ export const orchCapabilitiesSchema = z
     orchRole: OrchRole,
     /**
      * Per-operation dashboard-write policy: a sparse map where each present key
-     * flips one `DashboardWriteOperation` to false; missing keys mean `true`.
+     * sets one `DashboardWriteOperation`'s posture; a missing key means that
+     * operation's default posture.
      * Sent on auth so the Platform's per-org cache populates immediately, and
      * rebroadcast via `orch.capabilities.update` on policy change.
      */

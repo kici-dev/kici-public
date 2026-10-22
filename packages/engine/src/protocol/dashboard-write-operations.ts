@@ -10,19 +10,20 @@
  *   - Dashboard: renders per-control state (enabled / disabled / loading).
  *
  * A new operation goes in both `DashboardWriteOperation` and
- * `DASHBOARD_WRITE_OPERATIONS`; the orchestrator and Platform tests fail until
- * at least one gate handler references it.
+ * `DASHBOARD_WRITE_OPERATIONS`, and chooses its `defaultState` and
+ * `allowedStates`; the orchestrator and Platform tests fail until at least one
+ * gate handler references it.
  */
 import { z } from 'zod';
 
 export const DashboardWriteOperation = z.enum([
-  // Secrets — plaintext values traverse Platform memory when policy is enabled.
+  // Secrets — values arrive only sealed in the browser; the Platform relays ciphertext.
   'secrets.set',
   'secrets.delete',
   'secrets.scope.create',
   'secrets.scope.rename',
   'secrets.scope.delete',
-  // Variables — plaintext values traverse Platform memory when policy is enabled.
+  // Variables — plaintext values traverse Platform memory when the posture is permissive.
   'variables.set',
   'variables.delete',
   // Contexts — definition CRUD; no plaintext.
@@ -106,6 +107,25 @@ export const DashboardWriteSensitivity = z.enum(['plaintext', 'authority', 'disp
 export type DashboardWriteSensitivity = z.infer<typeof DashboardWriteSensitivity>;
 
 /**
+ * Per-operation dashboard-write posture.
+ *
+ *   - `permissive` — the write is accepted and its plaintext value transits
+ *     the hosted Platform process.
+ *   - `encrypted` — the write is accepted but the value is sealed in the
+ *     browser to the orchestrator's published X25519 key, so the Platform
+ *     relays only opaque ciphertext. Valid ONLY for `plaintext`-sensitivity
+ *     operations (`secrets.set`, `variables.set`): nothing else has a
+ *     plaintext payload to seal.
+ *   - `disabled` — the write is refused; the operator must use the CLI.
+ *
+ * The default is per operation (`defaultState`), and so is the allowed set
+ * (`allowedStates`): `secrets.set` defaults to `encrypted` and never allows
+ * `permissive`; every other operation defaults to `permissive`.
+ */
+export const DashboardWritePolicyState = z.enum(['permissive', 'encrypted', 'disabled']);
+export type DashboardWritePolicyState = z.infer<typeof DashboardWritePolicyState>;
+
+/**
  * Descriptor for one dashboard write operation. The non-enforcement fields
  * (label, cliEquivalent) feed the dashboard SPA's policy-aware UI and the docs
  * generator.
@@ -126,7 +146,25 @@ export interface DashboardWriteOperationDescriptor {
    * resolves every entry against the `kici-admin` command tree.
    */
   readonly cliEquivalent: string;
+  /** Posture the operation has when the stored policy map omits it. */
+  readonly defaultState: DashboardWritePolicyState;
+  /** Postures an operator may store for the operation; always includes `defaultState`. */
+  readonly allowedStates: readonly DashboardWritePolicyState[];
 }
+
+const PERMISSIVE_OR_DISABLED: readonly DashboardWritePolicyState[] = Object.freeze([
+  DashboardWritePolicyState.enum.permissive,
+  DashboardWritePolicyState.enum.disabled,
+]);
+const ANY_POSTURE: readonly DashboardWritePolicyState[] = Object.freeze([
+  DashboardWritePolicyState.enum.permissive,
+  DashboardWritePolicyState.enum.encrypted,
+  DashboardWritePolicyState.enum.disabled,
+]);
+const SEALED_OR_DISABLED: readonly DashboardWritePolicyState[] = Object.freeze([
+  DashboardWritePolicyState.enum.encrypted,
+  DashboardWritePolicyState.enum.disabled,
+]);
 
 export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescriptor[] =
   Object.freeze([
@@ -137,6 +175,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Set secret value',
       sensitivity: 'plaintext',
       cliEquivalent: 'kici-admin secret set',
+      defaultState: DashboardWritePolicyState.enum.encrypted,
+      allowedStates: SEALED_OR_DISABLED,
     },
     {
       name: 'secrets.delete',
@@ -145,6 +185,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Delete secret',
       sensitivity: 'authority',
       cliEquivalent: 'kici-admin secret delete',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'secrets.scope.create',
@@ -153,6 +195,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Create secret scope',
       sensitivity: 'authority',
       cliEquivalent: 'kici-admin secret scope create',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'secrets.scope.rename',
@@ -161,6 +205,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Rename secret scope',
       sensitivity: 'authority',
       cliEquivalent: 'kici-admin secret scope rename',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'secrets.scope.delete',
@@ -169,6 +215,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Delete secret scope',
       sensitivity: 'authority',
       cliEquivalent: 'kici-admin secret scope delete',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'variables.set',
@@ -177,6 +225,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Set variable value',
       sensitivity: 'plaintext',
       cliEquivalent: 'kici-admin variable set',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: ANY_POSTURE,
     },
     {
       name: 'variables.delete',
@@ -185,6 +235,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Delete variable',
       sensitivity: 'authority',
       cliEquivalent: 'kici-admin variable delete',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'contexts.create',
@@ -193,6 +245,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Create context',
       sensitivity: 'authority',
       cliEquivalent: 'kici-admin context create',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'contexts.update',
@@ -201,6 +255,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Update context',
       sensitivity: 'authority',
       cliEquivalent: 'kici-admin context set-policy',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'contexts.test_access.set',
@@ -209,6 +265,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Set context test access',
       sensitivity: 'authority',
       cliEquivalent: 'kici-admin context set-policy --allow-local-execution',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'contexts.delete',
@@ -217,6 +275,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Delete context',
       sensitivity: 'authority',
       cliEquivalent: 'kici-admin context delete',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'contexts.bindings.set',
@@ -225,6 +285,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Set context binding',
       sensitivity: 'authority',
       cliEquivalent: 'kici-admin context bind',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'contexts.source_overrides.set',
@@ -233,6 +295,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Set source override',
       sensitivity: 'authority',
       cliEquivalent: 'kici-admin context source-override set',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'contexts.source_overrides.delete',
@@ -241,6 +305,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Delete source override',
       sensitivity: 'authority',
       cliEquivalent: 'kici-admin context source-override delete',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'held_runs.approve',
@@ -249,6 +315,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Approve held run',
       sensitivity: 'dispatch',
       cliEquivalent: 'kici-admin held-run approve',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'held_runs.reject',
@@ -257,6 +325,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Reject held run',
       sensitivity: 'dispatch',
       cliEquivalent: 'kici-admin held-run reject',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'event_dlq.retry',
@@ -265,6 +335,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Retry dead-lettered webhook',
       sensitivity: 'dispatch',
       cliEquivalent: 'kici-admin event-dlq retry',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'event_dlq.discard',
@@ -273,6 +345,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Discard dead-lettered webhook',
       sensitivity: 'dispatch',
       cliEquivalent: 'kici-admin event-dlq discard',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'attestations.retry',
@@ -281,6 +355,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Retry deferred attestations',
       sensitivity: 'dispatch',
       cliEquivalent: 'kici-admin attestations retry',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'registration.disable',
@@ -289,6 +365,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Disable workflow registration',
       sensitivity: 'dispatch',
       cliEquivalent: 'kici-admin registration disable',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'registration.delete',
@@ -297,6 +375,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Delete workflow registration',
       sensitivity: 'dispatch',
       cliEquivalent: 'kici-admin registration delete',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'global_workflows.update',
@@ -307,6 +387,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       // The group: its allow-add / allow-remove / deny-add / deny-remove leaves
       // together cover the whole-list write the dashboard sends.
       cliEquivalent: 'kici-admin org-settings global-workflows',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'backends.sync',
@@ -315,6 +397,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Sync all scaler backends',
       sensitivity: 'dispatch',
       cliEquivalent: 'kici-admin backend sync',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'backends.sync_one',
@@ -323,6 +407,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Sync one scaler backend',
       sensitivity: 'dispatch',
       cliEquivalent: 'kici-admin backend sync <name>',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'backends.test',
@@ -331,6 +417,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Test scaler backend',
       sensitivity: 'dispatch',
       cliEquivalent: 'kici-admin backend test',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'fleet.host.declare',
@@ -339,6 +427,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Declare a static host',
       sensitivity: 'dispatch',
       cliEquivalent: 'kici-admin host declare',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
     {
       name: 'fleet.host.remove',
@@ -347,6 +437,8 @@ export const DASHBOARD_WRITE_OPERATIONS: readonly DashboardWriteOperationDescrip
       label: 'Remove a host from the roster',
       sensitivity: 'dispatch',
       cliEquivalent: 'kici-admin host remove',
+      defaultState: DashboardWritePolicyState.enum.permissive,
+      allowedStates: PERMISSIVE_OR_DISABLED,
     },
   ]);
 
@@ -387,6 +479,28 @@ export function getDashboardWriteOperationDescriptor(
   return descriptor;
 }
 
+/** Posture of `op` when the stored policy map omits it. */
+export function defaultPolicyState(op: DashboardWriteOperation): DashboardWritePolicyState {
+  return getDashboardWriteOperationDescriptor(op).defaultState;
+}
+
+/** Whether an operator may store `state` for `op`. */
+export function isAllowedPolicyState(
+  op: DashboardWriteOperation,
+  state: DashboardWritePolicyState,
+): boolean {
+  return getDashboardWriteOperationDescriptor(op).allowedStates.includes(state);
+}
+
+/** Operator-facing refusal for a posture `op` does not allow. */
+export function policyStateRefusalMessage(
+  op: DashboardWriteOperation,
+  state: DashboardWritePolicyState,
+): string {
+  const allowed = getDashboardWriteOperationDescriptor(op).allowedStates.join(', ');
+  return `"${state}" is not allowed for ${op}. Allowed: ${allowed}.`;
+}
+
 export function getDashboardWriteOperationsByCategory(
   category: DashboardWriteCategory,
 ): readonly DashboardWriteOperationDescriptor[] {
@@ -400,22 +514,7 @@ export function getDashboardWriteOperationsBySensitivity(
 }
 
 /**
- * Per-operation dashboard-write posture.
- *
- *   - `permissive` (the default, also for an absent key) — the write is
- *     accepted and its plaintext value transits the hosted Platform process.
- *   - `encrypted` — the write is accepted but the value is sealed in the
- *     browser to the orchestrator's published X25519 key, so the Platform
- *     relays only opaque ciphertext. Valid ONLY for `plaintext`-sensitivity
- *     operations (`secrets.set`, `variables.set`): nothing else has a
- *     plaintext payload to seal.
- *   - `disabled` — the write is refused; the operator must use the CLI.
- */
-export const DashboardWritePolicyState = z.enum(['permissive', 'encrypted', 'disabled']);
-export type DashboardWritePolicyState = z.infer<typeof DashboardWritePolicyState>;
-
-/**
- * Map of operation → posture. Omitted operations default to `permissive`.
+ * Map of operation → posture. An omitted operation has its own `defaultState`.
  * The orch persists this shape verbatim as JSONB; the Platform mirrors it in
  * its per-org cache.
  */
@@ -424,19 +523,21 @@ export type DashboardWritePolicyMap = Partial<
 >;
 
 /**
- * Validates a sparse policy map, rejecting `encrypted` for any operation whose
- * sensitivity is not `plaintext` (authority/dispatch ops would need signing,
- * a separate feature). Use it where the value is required but may be empty
- * (e.g. the orch JSONB column); an optional outer field embeds it with
- * `.optional()` so omission stays `undefined` rather than `{}`.
+ * Read and wire shape of a sparse policy map: the orch JSONB column, the
+ * `orch.capabilities` broadcast and the Platform cache. A missing key means
+ * the operation's default posture. It accepts every posture the operation
+ * allows plus the legacy `permissive`, so a stored or broadcast legacy value
+ * never discards the whole map; resolution maps that value to the default.
+ * It still rejects `encrypted` for an operation with no plaintext payload.
+ * Writes use {@link dashboardWritePolicyUpdate}. An optional outer field embeds
+ * it with `.optional()` so omission stays `undefined` rather than `{}`.
  */
 export const dashboardWritePolicyMap = z
   .partialRecord(DashboardWriteOperation, DashboardWritePolicyState)
   .superRefine((map, ctx) => {
     for (const [op, state] of Object.entries(map)) {
-      if (state !== 'encrypted') continue;
-      const descriptor = DASHBOARD_WRITE_OPERATIONS_BY_NAME.get(op as DashboardWriteOperation);
-      if (descriptor?.sensitivity !== 'plaintext') {
+      if (state === undefined || state === DashboardWritePolicyState.enum.permissive) continue;
+      if (!isAllowedPolicyState(op as DashboardWriteOperation, state)) {
         ctx.addIssue({
           code: 'custom',
           message: `"encrypted" is only valid for plaintext operations, not "${op}"`,
@@ -448,12 +549,37 @@ export const dashboardWritePolicyMap = z
 
 export const dashboardWritePolicyMapSchema = dashboardWritePolicyMap.default({});
 
-/** Effective posture of an operation; an absent entry is `permissive`. */
+/**
+ * Write shape of a sparse policy map: refuses any posture the operation does
+ * not allow, one issue per refused entry. Callers: the orchestrator admin
+ * PATCH route and `setDashboardWritePolicy`.
+ */
+export const dashboardWritePolicyUpdate = z
+  .partialRecord(DashboardWriteOperation, DashboardWritePolicyState)
+  .superRefine((map, ctx) => {
+    for (const [op, state] of Object.entries(map)) {
+      if (state === undefined) continue;
+      const operation = op as DashboardWriteOperation;
+      if (!isAllowedPolicyState(operation, state)) {
+        ctx.addIssue({
+          code: 'custom',
+          message: policyStateRefusalMessage(operation, state),
+          path: [op],
+        });
+      }
+    }
+  });
+
+/**
+ * Effective posture of an operation; an absent entry, or one outside the op's
+ * allowed postures, resolves to the op's default.
+ */
 export function resolvePolicyState(
   policy: DashboardWritePolicyMap | null | undefined,
   op: DashboardWriteOperation,
 ): DashboardWritePolicyState {
-  return policy?.[op] ?? 'permissive';
+  const stored = policy?.[op];
+  return stored !== undefined && isAllowedPolicyState(op, stored) ? stored : defaultPolicyState(op);
 }
 
 /** `true` unless the operation's posture is `disabled`. */
@@ -474,7 +600,7 @@ export function isEncryptedState(
 
 /**
  * Expand a sparse policy map into the enabled boolean for every operation;
- * unmentioned operations are `true`. {@link resolveFullPolicyStateView} gives
+ * unmentioned operations resolve to their default posture. {@link resolveFullPolicyStateView} gives
  * the tri-state.
  */
 export function resolveFullPolicyView(

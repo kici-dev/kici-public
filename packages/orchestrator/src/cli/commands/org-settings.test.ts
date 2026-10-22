@@ -760,6 +760,82 @@ describe('kici-admin org-settings dashboard-writes', () => {
     expect(body.updates).toEqual({ 'secrets.set': 'disabled', 'variables.set': 'disabled' });
   });
 
+  it('refuses --op secrets.set=permissive before any HTTP call', async () => {
+    // fails-when: the refusal is server-side only.
+    const result = await runCommand(
+      ['org-settings', 'dashboard-writes', 'set', '--org', ORG, '--op', 'secrets.set=permissive'],
+      client,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain(
+      '"permissive" is not allowed for secrets.set. Allowed: encrypted, disabled.',
+    );
+    expect(result.stderr).toContain('kici-admin secret set');
+    expect(mockGet).not.toHaveBeenCalled();
+    expect(mockPatch).not.toHaveBeenCalled();
+  });
+
+  it('refuses --op held_runs.approve=encrypted before any HTTP call', async () => {
+    const result = await runCommand(
+      [
+        'org-settings',
+        'dashboard-writes',
+        'set',
+        '--org',
+        ORG,
+        '--op',
+        'held_runs.approve=encrypted',
+      ],
+      client,
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain('"encrypted" is not allowed for held_runs.approve');
+    expect(result.stderr).not.toContain('kici-admin secret set');
+    expect(mockGet).not.toHaveBeenCalled();
+    expect(mockPatch).not.toHaveBeenCalled();
+  });
+
+  it('--category Secrets --enabled true sends each operation its default posture', async () => {
+    // breaks-if-wrong: re-enabling the group must not send the refused permissive for secrets.set.
+    await runCommand(
+      [
+        'org-settings',
+        'dashboard-writes',
+        'set',
+        '--org',
+        ORG,
+        '--category',
+        'Secrets',
+        '--enabled',
+        'true',
+      ],
+      client,
+    );
+    const body = mockPatch.mock.calls[0]?.[1] as { updates: Record<string, string> };
+    expect(body.updates['secrets.set']).toBe('encrypted');
+    expect(body.updates['secrets.delete']).toBe('permissive');
+    expect(body.updates['secrets.scope.create']).toBe('permissive');
+  });
+
+  it('--sensitivity plaintext --enabled true sends secrets.set encrypted and variables.set permissive', async () => {
+    await runCommand(
+      [
+        'org-settings',
+        'dashboard-writes',
+        'set',
+        '--org',
+        ORG,
+        '--sensitivity',
+        'plaintext',
+        '--enabled',
+        'true',
+      ],
+      client,
+    );
+    const body = mockPatch.mock.calls[0]?.[1] as { updates: Record<string, string> };
+    expect(body.updates).toEqual({ 'secrets.set': 'encrypted', 'variables.set': 'permissive' });
+  });
+
   it('set rejects unknown --op operations', async () => {
     const result = await runCommand(
       ['org-settings', 'dashboard-writes', 'set', '--org', ORG, '--op', 'bogus.op=disabled'],

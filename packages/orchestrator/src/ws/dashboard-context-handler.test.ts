@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 import { DashboardContextHandler } from './dashboard-context-handler.js';
 import type { DashboardContextHandlerDeps } from './dashboard-context-handler.js';
 import type { DashboardPlatformToOrchMessage } from '@kici-dev/engine';
@@ -14,15 +14,14 @@ import { invalidateDashboardWritePolicyCache } from '../policy/dashboard-write-p
 import { loadRoutableStores } from '../secrets/scope-routing.js';
 import { generateDashboardEncryptionKey } from '../secrets/dashboard-encryption-key.js';
 import { decryptPrivateKey } from '../secrets/ephemeral-keys.js';
-import {
-  generateKeyPairSync,
-  createPrivateKey,
-  createPublicKey,
-  diffieHellman,
-  hkdfSync,
-  randomBytes,
-  createCipheriv,
-} from 'node:crypto';
+import { makeDashboardEncryption, sealToDer } from '../__test-helpers__/dashboard-seal.js';
+import { DashboardSealedWriteError } from '@kici-dev/engine/protocol/messages/dashboard-sealed-write';
+
+/** One real dashboard encryption key shared by every handler built from `createMockDeps`. */
+let enc: Awaited<ReturnType<typeof makeDashboardEncryption>>;
+beforeAll(async () => {
+  enc = await makeDashboardEncryption();
+});
 
 /** A pending hold with no clauses: any actor the self-approval gate admits may decide it. */
 function mockApprovals() {
@@ -131,6 +130,7 @@ function createMockDeps(): DashboardContextHandlerDeps & { sent: unknown[] } {
       set: vi.fn().mockReturnThis(),
       executeTakeFirst: vi.fn().mockResolvedValue({ numUpdatedRows: 1n }),
     } as any,
+    dashboardEncryption: enc.dep,
     sent,
   };
 }
@@ -557,7 +557,7 @@ describe('DashboardContextHandler', () => {
         requestId: 'req-s1',
         scope: 'vault:aws/prod',
         key: 'NEW_KEY',
-        value: 'secret-value',
+        sealed: enc.seal('secret-value'),
       } as DashboardPlatformToOrchMessage);
 
       expect(handled).toBe(true);
@@ -594,7 +594,7 @@ describe('DashboardContextHandler', () => {
         requestId: 'req-cfg',
         scope: 'pg:aws/prod',
         key: 'NEW_KEY',
-        value: 'secret-value',
+        sealed: enc.seal('secret-value'),
       } as DashboardPlatformToOrchMessage);
 
       expect(deps.secretStore.setSecret).toHaveBeenCalledWith(
@@ -612,7 +612,7 @@ describe('DashboardContextHandler', () => {
         requestId: 'req-s2',
         scope: 'pg:aws/prod',
         key: 'NEW_KEY',
-        value: 'secret-value',
+        sealed: enc.seal('secret-value'),
       } as DashboardPlatformToOrchMessage);
 
       expect(handled).toBe(true);
@@ -925,7 +925,7 @@ describe('DashboardContextHandler', () => {
         requestId: 'r4',
         scope: 'pg:a//b',
         key: 'K',
-        value: 'V',
+        sealed: enc.seal('V'),
       } as DashboardPlatformToOrchMessage);
 
       expect(deps.secretStore.setSecret).not.toHaveBeenCalled();
@@ -944,7 +944,7 @@ describe('DashboardContextHandler', () => {
         requestId: 'r5',
         scope: 'pg:prod',
         key: 'c:d',
-        value: 'V',
+        sealed: enc.seal('V'),
       } as DashboardPlatformToOrchMessage);
 
       expect(deps.secretStore.setSecret).not.toHaveBeenCalled();
@@ -1055,7 +1055,7 @@ describe('DashboardContextHandler', () => {
         requestId: 'req-orgid-1',
         scope: 'pg:aws/prod',
         key: 'API_KEY',
-        value: 'attacker-controlled-value',
+        sealed: enc.seal('attacker-controlled-value'),
       } as DashboardPlatformToOrchMessage);
 
       expect(deps.secretStore.setSecret).toHaveBeenCalledOnce();
@@ -1086,7 +1086,7 @@ describe('DashboardContextHandler', () => {
           requestId: `req-malicious-${scope}`,
           scope,
           key: 'EVIL_KEY',
-          value: 'evil-value',
+          sealed: enc.seal('evil-value'),
         } as DashboardPlatformToOrchMessage);
 
         // The store layer (PG/Vault) accepts or rejects the scope shape; either
@@ -1106,7 +1106,7 @@ describe('DashboardContextHandler', () => {
         requestId: 'req-smuggle-orgid',
         scope: 'pg:test',
         key: 'KEY',
-        value: 'value',
+        sealed: enc.seal('value'),
         orgId: 'other-tenant-org',
       } as unknown as DashboardPlatformToOrchMessage);
 
@@ -1223,27 +1223,8 @@ describe('DashboardContextHandler — encrypted dashboard writes', () => {
   let key: Awaited<ReturnType<typeof generateDashboardEncryptionKey>>;
   const SECRET = 'a'.repeat(64);
 
-  /** Node stand-in for the browser seal (DER-SPKI eph pubkey + dashboard info). */
   function seal(value: string, orchPubDer: Buffer) {
-    const eph = generateKeyPairSync('x25519', {
-      publicKeyEncoding: { type: 'spki', format: 'der' },
-      privateKeyEncoding: { type: 'pkcs8', format: 'der' },
-    });
-    const shared = diffieHellman({
-      privateKey: createPrivateKey({ key: eph.privateKey as Buffer, format: 'der', type: 'pkcs8' }),
-      publicKey: createPublicKey({ key: orchPubDer, format: 'der', type: 'spki' }),
-    });
-    const aes = Buffer.from(
-      hkdfSync('sha256', shared, Buffer.alloc(0), 'kici-dashboard-sealed-write', 32),
-    );
-    const iv = randomBytes(12);
-    const c = createCipheriv('aes-256-gcm', aes, iv, { authTagLength: 16 });
-    const ct = Buffer.concat([c.update(value, 'utf-8'), c.final()]);
-    return {
-      keyId: key.kid,
-      ephemeralPublicKey: (eph.publicKey as Buffer).toString('base64'),
-      encrypted: Buffer.concat([iv, c.getAuthTag(), ct]).toString('base64'),
-    };
+    return { keyId: key.kid, ...sealToDer(value, orchPubDer) };
   }
 
   beforeEach(async () => {
@@ -1297,10 +1278,9 @@ describe('DashboardContextHandler — encrypted dashboard writes', () => {
     );
   });
 
-  it('fail-closed: rejects a plaintext value under the encrypted posture', async () => {
-    (deps.db.executeTakeFirst as any).mockResolvedValue({
-      dashboard_write_policy: { 'secrets.set': 'encrypted' },
-    });
+  it('refuses a frame with no sealed envelope under any posture', async () => {
+    // The plaintext frame bypasses the wire schema; the handler refuses it without
+    // reading the posture.
     const handled = await handler.handleMessage({
       type: 'dashboard.contexts.secrets.set',
       requestId: 'r-plain',
@@ -1308,11 +1288,11 @@ describe('DashboardContextHandler — encrypted dashboard writes', () => {
       scope: 'prod',
       key: 'API_KEY',
       value: 'plaintext-leak',
-    } as DashboardPlatformToOrchMessage);
+    } as unknown as DashboardPlatformToOrchMessage);
     expect(handled).toBe(true);
     expect(deps.secretStore.setSecret).not.toHaveBeenCalled();
     const resp = deps.sent.at(-1) as any;
-    expect(resp.error).toBe('operation_requires_encryption');
+    expect(resp.error).toBe(DashboardSealedWriteError.enum.operation_requires_encryption);
   });
 
   it('rejects a sealed envelope whose keyId is unknown', async () => {
@@ -1346,16 +1326,50 @@ describe('DashboardContextHandler — encrypted dashboard writes', () => {
     expect((deps.sent.at(-1) as any).error).toBe('encryption_unavailable');
   });
 
-  it('permissive posture still accepts a plaintext value', async () => {
+  it('decrypts a sealed secrets.set under an absent posture and under a stored encrypted posture', async () => {
     await handler.handleMessage({
       type: 'dashboard.contexts.secrets.set',
-      requestId: 'r-perm',
+      requestId: 'r-absent',
       actor: { type: 'user', sub: 'u' },
       scope: 'prod',
       key: 'API_KEY',
+      sealed: seal('first', key.publicKeyDer),
+    } as DashboardPlatformToOrchMessage);
+    expect(deps.secretStore.setSecret).toHaveBeenCalledWith('org-1', 'prod', 'API_KEY', 'first');
+
+    invalidateDashboardWritePolicyCache();
+    (deps.db.executeTakeFirst as any).mockResolvedValue({
+      dashboard_write_policy: { 'secrets.set': 'encrypted' },
+    });
+    await handler.handleMessage({
+      type: 'dashboard.contexts.secrets.set',
+      requestId: 'r-stored',
+      actor: { type: 'user', sub: 'u' },
+      scope: 'prod',
+      key: 'API_KEY',
+      sealed: seal('second', key.publicKeyDer),
+    } as DashboardPlatformToOrchMessage);
+    expect(deps.secretStore.setSecret).toHaveBeenCalledWith('org-1', 'prod', 'API_KEY', 'second');
+    expect((deps.sent.at(-1) as any).error).toBeUndefined();
+  });
+
+  it('variables.set still accepts a plaintext value under the permissive default', async () => {
+    // breaks-if-wrong: the tri-state path for variables still uses a plaintext value.
+    await handler.handleMessage({
+      type: 'dashboard.contexts.variables.set',
+      requestId: 'r-vplain',
+      actor: { type: 'user', sub: 'u' },
+      contextId: 'ctx-1',
+      key: 'TOKEN',
       value: 'plain-ok',
     } as DashboardPlatformToOrchMessage);
-    expect(deps.secretStore.setSecret).toHaveBeenCalledWith('org-1', 'prod', 'API_KEY', 'plain-ok');
+    expect(deps.variableStore.setVar).toHaveBeenCalledWith(
+      'org-1',
+      'ctx-1',
+      'TOKEN',
+      'plain-ok',
+      undefined,
+    );
   });
 });
 

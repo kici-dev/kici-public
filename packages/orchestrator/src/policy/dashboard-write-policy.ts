@@ -3,9 +3,10 @@
  * the orch accepts from Platform.
  *
  * Storage: a JSONB column on the existing `org_settings` table, keyed by
- * `customer_id`. Empty object means every operation is enabled
- * (permissive default at first-boot). Operators flip individual
- * operations off via `kici-admin org-settings dashboard-writes set`.
+ * `customer_id`. Empty object means every operation sits at its default
+ * posture (`secrets.set` encrypted, every other operation permissive).
+ * Operators change individual operations via
+ * `kici-admin org-settings dashboard-writes set`.
  *
  * Three callers:
  *   - The kici-admin CLI mutates via `setDashboardWritePolicy`.
@@ -26,6 +27,8 @@ import {
   DASHBOARD_WRITE_OPERATIONS_BY_NAME,
   DashboardWriteOperation,
   dashboardWritePolicyMapSchema,
+  dashboardWritePolicyUpdate,
+  defaultPolicyState,
   type DashboardWritePolicyMap,
   type DashboardWritePolicyState,
   isDashboardWriteOperationEnabled,
@@ -225,8 +228,8 @@ export function invalidateDashboardWritePolicyCache(customerId?: string): void {
 /**
  * Read the full policy map for a customer. Hits the in-process cache
  * for 30 s after the first read; falls back to the DB on cache miss.
- * Returns an empty map (everything enabled) when no `org_settings` row
- * exists for the customer.
+ * Returns an empty map (every operation at its default posture) when no
+ * `org_settings` row exists for the customer.
  */
 export async function getDashboardWritePolicy(
   db: Kysely<Database>,
@@ -292,17 +295,22 @@ export async function assertDashboardWriteAllowed(
 /**
  * Merge `updates` into the persisted policy and persist the result.
  * Unknown keys in `updates` are rejected at the Zod schema layer
- * before this function runs (kici-admin already validates). Any
- * operation explicitly set to `'permissive'` is normalized away — the
- * permissive default lives in the absence of the key, keeping the
- * JSONB shape minimal.
+ * before this function runs (kici-admin already validates), and so is a
+ * posture the operation does not allow (`secrets.set=permissive`). Any
+ * operation explicitly set to its default posture is normalized away — the
+ * default lives in the absence of the key, keeping the JSONB shape minimal.
  *
- * Each changed operation invokes the optional `onChange` callback
- * once — the caller decides what to do with it (typically: write
- * one `access_log` row per change).
+ * The stored map is persisted, and peers notified, whenever it changes —
+ * including a pure key drop that leaves every effective posture unchanged, so
+ * every coordinator drops its cached map at once.
  *
- * Emits `'changed'` on `dashboardWritePolicyEvents` with the new map
- * so the WS publisher can rebroadcast capabilities.
+ * Each operation whose effective posture changed invokes the optional
+ * `onChange` callback once — the caller decides what to do with it
+ * (typically: write one `access_log` row per change).
+ *
+ * Emits `'changed'` on `dashboardWritePolicyEvents` with the new map only
+ * when an effective posture changed, so the WS publisher can rebroadcast
+ * capabilities.
  *
  * Throws {@link HeldRunLockoutRefusedError} when the write would disable a
  * held-run operation on a Platform-attached orchestrator, where no other surface
@@ -320,15 +328,20 @@ export async function setDashboardWritePolicy(
     onChange?: (event: PolicyChangeEvent) => Promise<void>;
   },
 ): Promise<DashboardWritePolicyMap> {
-  // Validate every key/value pair up front. The schema rejects unknown ops.
-  const parsed = dashboardWritePolicyMapSchema.parse(updates);
+  // Validate every key/value pair up front. The write schema rejects unknown ops
+  // and any posture an operation does not allow.
+  const parsed = dashboardWritePolicyUpdate.parse(updates);
 
   const lockout = findHeldRunLockout(parsed, options.mode);
   if (lockout.length > 0) {
     throw new HeldRunLockoutRefusedError(lockout);
   }
 
-  const { policy: result, didChange } = await db.transaction().execute(async (tx) => {
+  const {
+    policy: result,
+    didChange,
+    effectiveChanged,
+  } = await db.transaction().execute(async (tx) => {
     const existing = await tx
       .selectFrom('org_settings')
       .select('dashboard_write_policy')
@@ -346,8 +359,8 @@ export async function setDashboardWritePolicy(
       [DashboardWriteOperation, DashboardWritePolicyState]
     >) {
       const priorEffective = resolvePolicyState(current, op);
-      if (value === 'permissive') {
-        // Normalize: permissive is the absent-key default — drop the key.
+      if (value === defaultPolicyState(op)) {
+        // Normalize: the default posture is the absent key — drop it.
         delete next[op];
       } else {
         next[op] = value;
@@ -357,8 +370,8 @@ export async function setDashboardWritePolicy(
       }
     }
 
-    if (changed.length === 0) {
-      return { policy: current, didChange: false };
+    if (sameStoredPolicy(current, next)) {
+      return { policy: current, didChange: false, effectiveChanged: false };
     }
 
     await tx
@@ -393,14 +406,23 @@ export async function setDashboardWritePolicy(
         });
       }
     }
-    return { policy: next, didChange: true };
+    return { policy: next, didChange: true, effectiveChanged: changed.length > 0 };
   });
 
   if (didChange) {
     invalidateDashboardWritePolicyCache(customerId);
+  }
+  if (effectiveChanged) {
     dashboardWritePolicyEvents.emit('changed', { customerId, policy: result });
   }
   return result;
+}
+
+/** Whether two stored policy maps hold the same keys with the same postures. */
+function sameStoredPolicy(a: DashboardWritePolicyMap, b: DashboardWritePolicyMap): boolean {
+  const aKeys = Object.keys(a) as DashboardWriteOperation[];
+  if (aKeys.length !== Object.keys(b).length) return false;
+  return aKeys.every((op) => a[op] === b[op]);
 }
 
 /**
@@ -418,8 +440,8 @@ export interface PolicyChangeEvent {
 }
 
 /**
- * Reset to the permissive defaults (everything enabled). Useful for
- * the `kici-admin org-settings dashboard-writes reset` subcommand.
+ * Reset every operation to its default posture. Useful for the
+ * `kici-admin org-settings dashboard-writes reset` subcommand.
  */
 export async function resetDashboardWritePolicy(
   db: Kysely<Database>,
@@ -430,12 +452,12 @@ export async function resetDashboardWritePolicy(
     onChange?: (event: PolicyChangeEvent) => Promise<void>;
   },
 ): Promise<DashboardWritePolicyMap> {
-  // Reset = explicit `permissive` for every key currently set. The
+  // Reset = each operation's default posture for every key currently set. The
   // updates are normalized to "remove keys" so the JSONB ends up empty.
   const current = await getDashboardWritePolicy(db, customerId);
   const updates: DashboardWritePolicyMap = {};
   for (const op of Object.keys(current) as DashboardWriteOperation[]) {
-    updates[op] = 'permissive';
+    updates[op] = defaultPolicyState(op);
   }
   if (Object.keys(updates).length === 0) {
     return current;

@@ -17,9 +17,9 @@ Key properties:
 
 ## Where secret values are entered
 
-Secret values are written into the store either through the dashboard or through `kici-admin`. Which surfaces accept value writes is decided per-orchestrator by the [dashboard-write policy](./dashboard-write-policy.md). The default at first-boot is **permissive**: both surfaces accept writes.
+Secret values are written into the store either through the dashboard or through `kici-admin`. Which surfaces accept value writes is decided per-orchestrator by the [dashboard-write policy](./dashboard-write-policy.md). By default both surfaces accept writes. The dashboard encrypts a secret value in your browser, and the hosted control plane relays only ciphertext, so it never receives the plaintext value.
 
-- Customers preparing for SOC2 or running regulated workloads typically flip `secrets.set` (and `variables.set`) to CLI-only, which routes plaintext exclusively through the orchestrator's HTTP admin API. The control plane never receives the plaintext value in that mode.
+- Customers preparing for SOC2 or running regulated workloads can disable `secrets.set` (and `variables.set`), which makes value entry CLI-only: values reach the orchestrator only through its HTTP admin API.
 - The dashboard remains usable for secret-name CRUD, scope CRUD, context bindings, and read paths regardless of the policy. Only the value-entry path moves to the CLI.
 
 The matching `kici-admin secret set` invocation accepts five input modes (interactive prompt, stdin pipe, file, env var, argv); see [CLI input modes](#cli-input-modes) below.

@@ -5,16 +5,7 @@ import {
 } from './dashboard-encryption-key.js';
 import { decryptPrivateKey, decryptDashboardSealedWrite } from './ephemeral-keys.js';
 import type { DashboardEncryptionKeyRepo } from '../db/repos/dashboard-encryption-keys-repo.js';
-import {
-  createPublicKey,
-  createPrivateKey,
-  generateKeyPairSync,
-  diffieHellman,
-  hkdfSync,
-  randomBytes,
-  createCipheriv,
-} from 'node:crypto';
-import type { JWK } from 'jose';
+import { sealToJwk } from '../__test-helpers__/dashboard-seal.js';
 
 const SECRET = 'a'.repeat(64);
 
@@ -50,35 +41,6 @@ function fakeRepo(seed: Row[] = []) {
     },
   };
   return { repo, rows };
-}
-
-/** Node-side stand-in for the browser seal (DER-SPKI eph pubkey + dashboard info). */
-function sealToJwk(
-  value: string,
-  orchPublicJwk: JWK,
-): { ephemeralPublicKey: string; encrypted: string } {
-  const orchPubDer = createPublicKey({ key: orchPublicJwk as never, format: 'jwk' }).export({
-    type: 'spki',
-    format: 'der',
-  }) as Buffer;
-  const eph = generateKeyPairSync('x25519', {
-    publicKeyEncoding: { type: 'spki', format: 'der' },
-    privateKeyEncoding: { type: 'pkcs8', format: 'der' },
-  });
-  const shared = diffieHellman({
-    privateKey: createPrivateKey({ key: eph.privateKey as Buffer, format: 'der', type: 'pkcs8' }),
-    publicKey: createPublicKey({ key: orchPubDer, format: 'der', type: 'spki' }),
-  });
-  const aes = Buffer.from(
-    hkdfSync('sha256', shared, Buffer.alloc(0), 'kici-dashboard-sealed-write', 32),
-  );
-  const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', aes, iv, { authTagLength: 16 });
-  const ct = Buffer.concat([cipher.update(value, 'utf-8'), cipher.final()]);
-  return {
-    ephemeralPublicKey: (eph.publicKey as Buffer).toString('base64'),
-    encrypted: Buffer.concat([iv, cipher.getAuthTag(), ct]).toString('base64'),
-  };
 }
 
 describe('generateDashboardEncryptionKey', () => {

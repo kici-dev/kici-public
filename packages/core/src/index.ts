@@ -58,3 +58,4 @@ export {
   isCompileSchemaMismatchMessage,
   type CompileSchemaMismatchInput,
 } from './compile-schema.js';
+export { makeCliStdioBlocking } from './stdio.js';

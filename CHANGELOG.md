@@ -2,6 +2,16 @@
 
 Release notes for the public KiCI packages.
 
+## v0.26.0 — 2026-10-22
+
+### Features
+
+- Breaking: the dashboard now encrypts every secret value in your browser before it leaves the page, and the hosted Platform refuses a plaintext secret value. secrets.set accepts only the encrypted posture (the default) or disabled; kici-admin org-settings dashboard-writes set --op secrets.set=permissive is refused. Scripts that set secret values use kici-admin secret set.
+
+### Fixes
+
+- The `kici`, `kici-admin` and `kici-platform-admin` commands now deliver all of their output to a pipe. Before, `--json` output piped to a slow reader could stop after 8192 bytes, with exit code 0.
+
 ## v0.25.0 — 2026-10-21
 
 ### Fixes
