@@ -8,7 +8,7 @@ ARG DHI_PREFIX=dhi.io
 # Stage 1: Build (on the -dev variant — keeps apt + shell + corepack so we
 # can install/compile/rebuild oxc-transform in the usual pnpm flow). DHI
 # ships ca-certificates by default, so no apt-get for certs is needed.
-FROM ${DHI_PREFIX}/node:24.22.0-0-debian13-dev AS builder
+FROM ${DHI_PREFIX}/node:24.22.1-0-debian13-dev AS builder
 WORKDIR /app
 
 # Enable pnpm. Pin 11.28.6 to match the runtime stage (see below): the same
@@ -151,7 +151,7 @@ RUN rm -f .npmrc \
 # Runtime base is the -dev variant: the agent needs apt-installed host tools
 # (git/bash/iptables), and a job installs more Debian packages with apt.
 # ca-certificates ships with the DHI base, so it isn't installed here.
-FROM ${DHI_PREFIX}/node:24.22.0-0-debian13-dev
+FROM ${DHI_PREFIX}/node:24.22.1-0-debian13-dev
 
 # Install the CI userland: what the agent needs (listed above), then the
 # baseline a CI job expects on a Debian host — ps, hostname, ip, ping, unzip,
@@ -281,9 +281,9 @@ ENV COREPACK_DEFAULT_TO_LATEST=0
 # an unverified tarball here would execute in every customer job container.
 # The download retries on any error, like the corepack steps above: a single
 # dropped TLS handshake must not fail the whole image build.
-ARG KICI_RUNTIME_NODE_VERSION=24.22.0
-ARG KICI_RUNTIME_NODE_SHA256_X64=cc2f601cee82d9a5a233302fe307abc600727035fd7d2c3a3571755989e95008
-ARG KICI_RUNTIME_NODE_SHA256_ARM64=fef00bb4d36e1c50104a9775a10359beee98f162b4104dd12472c75065c6a143
+ARG KICI_RUNTIME_NODE_VERSION=24.22.1
+ARG KICI_RUNTIME_NODE_SHA256_X64=6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6
+ARG KICI_RUNTIME_NODE_SHA256_ARM64=dbabf7a1cbf947e6059ffad2c27b80041db97dea1e553b62afdee7f13fca336e
 RUN set -eu; \
   arch="$(dpkg --print-architecture)"; \
   case "$arch" in \

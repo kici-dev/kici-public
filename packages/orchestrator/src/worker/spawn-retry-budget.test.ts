@@ -101,6 +101,30 @@ describe('SpawnRetryBudget', () => {
     expect(redrive).toHaveBeenCalledTimes(1);
   });
 
+  it('the re-drive the backoff timer fires is admitted even when the wall clock lags the timer', () => {
+    // A timer runs on the event loop's cached clock, which can trail the wall clock
+    // read when the timer was armed, so it can fire a millisecond before the
+    // wall-clock deadline the gate compares against.
+    let skewMs = 1;
+    budget = new SpawnRetryBudget({
+      isQueued: (id) => queued.has(id),
+      redrive,
+      logger,
+      now: () => Date.now() + skewMs,
+    });
+    const gates: SpawnAttemptGate[] = [];
+    redrive.mockImplementation(async (id) => gates.push(budget.beginAttempt(id)));
+    budget.register('job-1', 'run-1', { maxAttempts: 3, backoffMs: 20_000 });
+    attempt('a1');
+    budget.recordFailure('job-1', 'a1');
+    skewMs = 0;
+
+    vi.advanceTimersByTime(20_000);
+    // fails-when: the gate refuses the timer's own re-drive as still backing off,
+    // and nothing offers the job to the scaler again
+    expect(gates).toEqual([SpawnAttemptGate.enum.begun]);
+  });
+
   it('a release during the backoff cancels the re-drive', () => {
     budget.register('job-1', 'run-1', { maxAttempts: 3, backoffMs: 1000 });
     attempt('a1');

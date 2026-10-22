@@ -181,6 +181,11 @@ export class SpawnRetryBudget {
     entry.timer = setTimeout(() => {
       entry.timer = undefined;
       if (this.entries.get(jobId) !== entry) return;
+      // The timer firing ends the backoff. A timer runs on the event loop's cached
+      // clock, which can trail the wall clock `backoffUntil` was computed from, so
+      // it can fire a millisecond early; the gate would then refuse this re-drive
+      // as still backing off, and nothing would offer the job again.
+      entry.backoffUntil = 0;
       this.deps.logger.info('Retrying spawn for a rerouted job after backoff', {
         runId: entry.runId,
         jobId,

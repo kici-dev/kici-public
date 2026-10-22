@@ -2,6 +2,13 @@
 
 Release notes for the public KiCI packages.
 
+## v0.26.1 — 2026-10-22
+
+### Fixes
+
+- The orchestrator and agent container images, and the Node.js runtime that the agent mounts into job containers, now run Node.js 24.22.1. Node.js 24.22.1 blocks the compromised eMudhra intermediate certificates and fixes CVE-2026-111497, CVE-2026-105483, CVE-2026-106069, CVE-2026-106072 and CVE-2026-105482. The packages of this release run on Node.js 24.22.1: before you upgrade a light package, install Node.js 24.22.1 into its cache. If you run `kici` or `kici-admin` from npm, update the Node.js that runs them to 24.22.1 or a later Node.js 24 release.
+- A cluster worker retrying a failed agent spawn for a rerouted job now always starts the retry when its backoff ends. Before, the retry could be skipped, and the coordinator then failed the job when its spawn window ran out.
+
 ## v0.26.0 — 2026-10-22
 
 ### Features

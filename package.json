@@ -1,6 +1,6 @@
 {
   "name": "kici-monorepo",
-  "version": "0.26.0",
+  "version": "0.26.1",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.28.6",

@@ -57,7 +57,7 @@ KiCI's defaults make self-hosting defensible, not risk-free. The honest division
 
 - **Prefer private repositories.** If your repository is public, keep the fork-PR policy at `ignore` (the default), or set it to `hold` and review held runs before releasing them — or route them to the Firecracker backend.
 - **Match the backend to the code you run.** Bare metal without the namespace sandbox is for fully trusted, internal-only workflows. Untrusted code belongs in containers at minimum, microVMs ideally.
-- **Harden and patch the host.** KiCI isolates jobs from the host and your network, but the host OS, container runtime, and kernel updates are yours to maintain.
+- **Harden and patch the host.** KiCI isolates jobs from the host and your network, but the host OS, container runtime, and kernel updates are yours to maintain. For a native install, so is the Node.js runtime that runs the orchestrator and the agent.
 - **Scope your secrets.** Bind secret scopes to specific environments so a job only receives the secrets it needs — never hand every job every secret.
 
 ## Go deeper

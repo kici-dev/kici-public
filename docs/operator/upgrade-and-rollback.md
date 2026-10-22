@@ -145,6 +145,14 @@ are preserved on disk. See
 [Service installation](./distribution/service-installation.md) for the full
 command reference.
 
+A native install from npm runs on the Node.js of the host. Node.js checks TLS
+certificates against its own built-in certificate store, and only a Node.js
+update changes that store. Keep the host on the newest Node.js 24 patch release.
+A full package carries its own Node.js, and an upgrade to a newer release
+replaces it. A light package runs on the Node.js version that its release
+names: before the upgrade,
+[install that version into the cache](./distribution/sea-binaries.md#install-nodejs-into-the-cache).
+
 Before it restarts the orchestrator, `kici-admin orchestrator upgrade` reads the
 scaler config (`KICI_SCALER_CONFIG_PATH` and `KICI_SCALER_CONFIG_DIR`) and
 warns about each container label set that would keep spawning an old agent:
