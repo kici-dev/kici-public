@@ -122,6 +122,7 @@ export const ACCESS_LOG_WARM_DAYS: Record<AccessLogAction, number> = {
   'db.create_readonly_user': 180,
   'db.reindex': 180,
   'db.refresh_collation_version': 180,
+  'db.analyze': 180,
 
   // event DLQ admin actions (at-least-once delivery): list read 30 days,
   // retry / discard 180 days
@@ -449,6 +450,7 @@ export const ACCESS_LOG_COLD_DAYS: Record<AccessLogAction, ColdRetention> = {
   'db.create_readonly_user': 730,
   'db.reindex': 730,
   'db.refresh_collation_version': 730,
+  'db.analyze': 730,
 
   // event DLQ admin actions (at-least-once delivery): list read 180 days,
   // retry / discard 730 days

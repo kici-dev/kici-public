@@ -49,6 +49,8 @@ kici-admin db schema-diff [--json]                             # Exit 2 when the
 kici-admin db collation-check [--database-url <url>] [--json]   # Exit 2 on collation drift
 kici-admin db reindex --confirm --reason <text> [--database-url <url>]
 kici-admin db refresh-collation-version --reason <text> [--database-url <url>]
+kici-admin db stats-check [--database-url <url>] [--json]       # Exit 2 when a table needs ANALYZE
+kici-admin db analyze --table <schema.table> [--table ...] --reason <text> [--dry-run] [--database-url <url>]
 
 # Backup / restore (direct DB — wraps pg_dump / pg_restore).
 kici-admin db backup [--output <path> | --output-dir <dir> [--keep <n>]] [--database-url <url>]
@@ -58,13 +60,15 @@ kici-admin db restore --input <path> [--yes] [--database-url <url>]
 
 - `migrate` goes through the orchestrator HTTP admin API (orchestrator auto-migrates on startup by default; set `KICI_AUTO_MIGRATE=false` to disable and run manually). `migrate --database-url <url>` runs the same migrator directly against the database, so the orchestrator does not need to run; it cannot be combined with `--to` or `--status`, and it records a `db.migrate` access-log row. `migrate --to <migration>` reverts every migration newer than the named one. Run it before a rollback, while the newer version still serves — only that version carries the `down()` functions of its own migrations.
 - `ensure` creates the database when it is missing. `--owner` sets a separate owner role, `--revoke-connect-public` revokes `CONNECT` from `PUBLIC`, and `--grant-connect-role` (repeatable) grants `CONNECT` to a named role. Every successful migration run records the bundled-migration content hash in `_migration_content_hash` — including warm runs that apply zero migrations — so `check-schema` reports the schema as current on a long-lived database whose migrations are already up to date.
-- `fresh` / `ensure` / `create-role` / `create-readonly-user` / `check-schema` / `schema-diff` / `collation-check` / `reindex` / `refresh-collation-version` open their own pool and run SQL directly — needed for deploy / bootstrap / DR workflows.
+- `fresh` / `ensure` / `create-role` / `create-readonly-user` / `check-schema` / `schema-diff` / `collation-check` / `reindex` / `refresh-collation-version` / `stats-check` / `analyze` open their own pool and run SQL directly — needed for deploy / bootstrap / DR workflows.
 - `fresh` prompts for the target database name as a confirmation. Pass `--yes` to skip the prompt (scripted use).
 - `check-schema` compares the bundled migration manifest (names + body hash) against the live schema and the stored `_migration_content_hash` marker. Exit code 2 means drift — call `fresh` or run `migrate` depending on intent. Exit code 1 means the database could not be read. `--json` prints `{"current", "kind", "reason"}`; `kind` is one of `current`, `missing`, `pending`, `unknown-applied`, `hash-missing` or `hash-mismatch`.
 - `schema-diff` reads the live schema from the PostgreSQL catalog — columns, constraints, indexes, functions, triggers, sequences and extensions — and compares it with the schema this release builds from its migrations. It prints one line per difference: `missing` (the release expects it, the database does not have it), `extra` (the database has it, the release does not expect it) or `changed`. `--json` prints `{"differences": [...]}`. Exit code 0 means the schema matches, 2 means at least one difference, and 1 means an error. The indexes the orchestrator builds in the background after startup are not compared. An extension that the database has and the release does not use is not a difference, because your database host can install its own extensions. Use it after an upgrade, or after a restore, to find a schema that `check-schema` reports as current but that a manual change or an edited migration made different.
 - `collation-check` compares `pg_database.datcollversion` against the running libc collation version. Exit code 2 means the stamped and actual collation versions differ — a libc upgrade changed sort order out from under existing indexes.
 - `reindex` runs `REINDEX DATABASE CONCURRENTLY`, rebuilding every index under the current libc collation rules. Non-blocking but takes minutes and roughly 2× temporary disk. Requires `--confirm` and `--reason`.
 - `refresh-collation-version` runs `ALTER DATABASE … REFRESH COLLATION VERSION` — a metadata-only bump that clears the drift warning. Pair it with `db reindex` after a libc-base image rebuild so the indexes match the new collation. Requires `--reason`.
+- `stats-check` finds every table that has a GIN index and checks its row estimate, `pg_class.reltuples`. PostgreSQL 18.6 fixed a defect where a parallel GIN index build could write a wrong estimate, such as `NaN` or `Infinity`. Autovacuum then does not process the table again, so the value stays wrong until you run `ANALYZE`. The check reports a value as invalid when it is `NaN`, `Infinity` or `-Infinity`, when it is negative other than `-1` (the "never analyzed" marker), or when it is larger than the table's pages can hold. Exit code 0 means every value is valid, 2 means at least one table needs `ANALYZE`, and 1 means an error. The text output prints the `db analyze` command that fixes the reported tables. `--json` prints `{"database", "clean", "tables", "needsAnalyze"}`; each `tables` entry has `table`, `reltuples`, `relpages`, `ginIndexes` and `problem` (`nan`, `infinite`, `negative`, `exceeds_page_capacity`, or `null` when the value is valid). Run it after you upgrade PostgreSQL to a new minor version.
+- `analyze` runs `ANALYZE` on the tables you name with `--table` (repeat the option for more tables). Give each name with its schema, for example `public.access_log`. The command checks every name first. If one name is not a table, it stops with exit code 1 and analyzes nothing. `--dry-run` prints the statements and does not run them. Requires `--reason`, and records a `db.analyze` access-log row.
 - `backup` wraps `pg_dump -Fc` into a custom-format dump (default `./kici-orchestrator-backup-<timestamp>.dump`, override with `--output`) and writes a sidecar `<dump>.manifest.json` recording the creation time, byte size, secret-key version, Postgres server version, migrations hash, cluster id, and hostname. Each run is also recorded in the `backup_runs` table, which is what the [backup-freshness](./org-settings.md) WARN threshold reads. `--output-dir` writes a timestamped dump into a directory and keeps the newest `--keep` dumps (default 7).
 - `backup --install-timer` installs a scheduled backup service and timer for the named orchestrator instance, then exits; `--uninstall-timer` removes it. See [Schedule backups](../db-backup-restore.md#schedule-backups) for the per-platform behavior of `--schedule`.
 - `restore` wraps `pg_restore --clean --if-exists --no-owner` and is **destructive** — it drops and recreates the target's objects. It prompts before proceeding; pass `--yes` for scripted use. Afterwards it reports whether the dump carried encrypted secrets, because those only decrypt under the **same** `KICI_SECRET_KEY` the source orchestrator used.
@@ -250,6 +254,21 @@ Database management
 
 Synopsis: `kici-admin db`
 
+### `kici-admin db analyze`
+
+ANALYZE the named tables, refreshing their planner statistics and pg_class.reltuples. Every table must exist.
+
+Synopsis: `kici-admin db analyze [options]`
+
+**Options**
+
+| Option                   | Default | Description                                                       |
+| ------------------------ | ------- | ----------------------------------------------------------------- |
+| `--database-url <url>`   |         | Target DB URL (else KICI_DATABASE_URL / DATABASE_URL)             |
+| `--table <schema.table>` |         | Table to analyze, schema-qualified. Repeatable.                   |
+| `--reason <text>`        |         | Reason (recorded in the access log)                               |
+| `--dry-run`              |         | Validate the tables and print the statements without running them |
+
 ### `kici-admin db backup`
 
 Dump the orchestrator DB to a local file (pg_dump custom format)
@@ -430,5 +449,18 @@ Synopsis: `kici-admin db schema-diff [options]`
 | ---------------------- | ------- | -------------------------------------------- |
 | `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL)       |
 | `--json`               | `false` | Emit JSON instead of one line per difference |
+
+### `kici-admin db stats-check`
+
+Report tables with a GIN index whose planner row estimate (pg_class.reltuples) is NaN, infinite or impossible. Exit 2 when a table needs ANALYZE.
+
+Synopsis: `kici-admin db stats-check [options]`
+
+**Options**
+
+| Option                 | Default | Description                                           |
+| ---------------------- | ------- | ----------------------------------------------------- |
+| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL / DATABASE_URL) |
+| `--json`               | `false` | Emit JSON instead of human-readable lines             |
 
 <!-- END GENERATED: kici-admin-config-and-db -->

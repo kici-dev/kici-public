@@ -607,8 +607,7 @@ when it has a `package.json`. The generator decides _whether to create a gate_;
 `optional` decides _what a created gate does when nothing subscribes_.
 
 **Failure, timeout, concurrency — the standard job vocabulary.** The gate is a
-standard job. `continueOnError` tolerates a failed invoked run. A downstream
-`needs` `when: on-failure` reacts to a failed gate. The job `timeout` bounds the
+standard job. A downstream `needs` `when: on-failure` reacts to a failed gate. The job `timeout` bounds the
 wait — the orchestrator enforces it, since the gate has no agent. `maxParallel`
 and `failFast` bound the fan-out over the proxies.
 

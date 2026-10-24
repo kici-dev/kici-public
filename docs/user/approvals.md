@@ -26,9 +26,13 @@ export default workflow('deploy', {
   on: [push({ branches: ['main'] })],
   jobs: [
     job('deploy-production', {
-      runsOn: 'default',
+      runsOn: 'kici:os:linux',
       approval: [{ team: 'leads' }],
-      steps: [step('deploy', async (ctx) => ctx.$`deploy --prod`)],
+      steps: [
+        step('deploy', async (ctx) => {
+          await ctx.$`deploy --prod`;
+        }),
+      ],
     }),
   ],
 });
@@ -44,7 +48,7 @@ When the run reaches this job, it is held instead of dispatched. The held run ap
 
 ```typescript
 job('deploy', {
-  runsOn: 'default',
+  runsOn: 'kici:os:linux',
   approval: true,
   steps: [/* ... */],
 });
@@ -113,7 +117,7 @@ A job-level gate holds just that job; other jobs in the run proceed normally:
 
 ```typescript
 job('publish', {
-  runsOn: 'default',
+  runsOn: 'kici:os:linux',
   approval: [{ team: 'leads' }],
   steps: [/* ... */],
 });
@@ -125,14 +129,20 @@ A step-level gate pauses mid-job, immediately before the named step. Earlier ste
 
 ```typescript
 job('migrate-and-deploy', {
-  runsOn: 'default',
+  runsOn: 'kici:os:linux',
   steps: [
-    step('build-plan', async (ctx) => ctx.$`./gen-migration-plan.sh`),
+    step('build-plan', async (ctx) => {
+      await ctx.$`./gen-migration-plan.sh`;
+    }),
     step('apply-migration', {
       approval: [{ team: 'dba' }],
-      run: async (ctx) => ctx.$`./apply-migration.sh`,
+      run: async (ctx) => {
+        await ctx.$`./apply-migration.sh`;
+      },
     }),
-    step('deploy', async (ctx) => ctx.$`deploy --prod`),
+    step('deploy', async (ctx) => {
+      await ctx.$`deploy --prod`;
+    }),
   ],
 });
 ```
@@ -155,12 +165,13 @@ When the gate fires, the held run carries the **computed drift** as a payload: t
 
 ```typescript
 job('patch-prod', {
-  runsOn: 'default',
+  runsOn: 'kici:os:linux',
   steps: [
     step('apply-nginx-config', {
       check: async (ctx) => ((await inSync(ctx)) ? null : { want: DESIRED_CONF }),
-      summarize: (drift) => `would rewrite nginx.conf (${drift.want.length} bytes)`,
-      run: async (ctx, drift) => {
+      summarize: (drift: { want: string }) =>
+        `would rewrite nginx.conf (${drift.want.length} bytes)`,
+      run: async (ctx, drift: { want: string }) => {
         await writeConfig(drift.want);
       },
       approval: { when: 'drift', approvers: [{ team: 'ops' }], reason: 'prod patch' },

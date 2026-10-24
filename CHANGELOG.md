@@ -2,6 +2,12 @@
 
 Release notes for the public KiCI packages.
 
+## v0.28.0 — 2026-10-24
+
+### Features
+
+- Add `kici-admin db stats-check` and `kici-admin db analyze`. `stats-check` reports tables with a GIN index whose row estimate (`pg_class.reltuples`) is NaN, infinite or larger than the table can hold, which a parallel GIN index build before PostgreSQL 18.6 could write. `analyze --table <schema.table>` runs `ANALYZE` on the named tables to fix them.
+
 ## v0.27.0 — 2026-10-24
 
 ### Features

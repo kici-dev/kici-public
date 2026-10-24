@@ -11,6 +11,8 @@
  *   db collation-check            Check pg_database.datcollversion vs running libc (direct DB)
  *   db reindex                    REINDEX DATABASE CONCURRENTLY (direct DB)
  *   db refresh-collation-version  ALTER DATABASE REFRESH COLLATION VERSION (direct DB)
+ *   db stats-check                Report GIN-indexed tables with invalid reltuples (direct DB)
+ *   db analyze                    ANALYZE the named tables (direct DB)
  *
  * Direct-DB subcommands skip HTTP because the target database may not exist
  * yet or is about to be dropped; like `kici-admin peer create-token`, they open
@@ -43,6 +45,13 @@ import {
   refreshDatabaseCollationVersion,
   reindexDatabaseConcurrently,
 } from '@kici-dev/shared/db-collation';
+import {
+  analyzeStatement,
+  analyzeTables,
+  getGinTableStatsReport,
+  renderStatsCheckReport,
+  resolveAnalyzeTargets,
+} from '@kici-dev/shared/db-stats';
 import { createDb } from '../../db/client.js';
 import { createMigrationProvider } from '../../db/migration-provider.js';
 import { DEFERRED_INDEXES } from '../../db/deferred-indexes.js';
@@ -703,5 +712,79 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
           await pool.end().catch(() => undefined);
         }
       }),
+    );
+
+  db.command('stats-check')
+    .description(
+      'Report tables with a GIN index whose planner row estimate (pg_class.reltuples) is NaN, infinite or impossible. Exit 2 when a table needs ANALYZE.',
+    )
+    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
+    .option('--json', 'Emit JSON instead of human-readable lines', false)
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; json?: boolean }) => {
+        const url = resolveDatabaseUrl(opts.databaseUrl);
+        const { dbName } = parseDatabaseUrl(url);
+        const pool = createPool(url);
+        let clean: boolean;
+        try {
+          const report = await getGinTableStatsReport(pool);
+          clean = report.clean;
+          process.stdout.write(renderStatsCheckReport('kici-admin', dbName, report, !!opts.json));
+        } finally {
+          await pool.end().catch(() => undefined);
+        }
+        if (!clean) process.exit(2);
+      }),
+    );
+
+  db.command('analyze')
+    .description(
+      'ANALYZE the named tables, refreshing their planner statistics and pg_class.reltuples. Every table must exist.',
+    )
+    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
+    .requiredOption(
+      '--table <schema.table>',
+      'Table to analyze, schema-qualified. Repeatable.',
+      (val: string, acc: string[]) => acc.concat([val]),
+      [] as string[],
+    )
+    .requiredOption('--reason <text>', 'Reason (recorded in the access log)')
+    .option('--dry-run', 'Validate the tables and print the statements without running them')
+    .action(
+      cliAction(
+        async (opts: {
+          databaseUrl?: string;
+          table: string[];
+          reason: string;
+          dryRun?: boolean;
+        }) => {
+          const url = resolveDatabaseUrl(opts.databaseUrl);
+          const { dbName } = parseDatabaseUrl(url);
+          const pool = createPool(url);
+          try {
+            const targets = await resolveAnalyzeTargets(pool, opts.table);
+            const statements = targets.map(analyzeStatement);
+            if (opts.dryRun) {
+              for (const statement of statements) console.log(`${statement};`);
+              return;
+            }
+            logInvocation(`analyze ${opts.table.join(' ')} (${opts.reason})`, url);
+            await analyzeTables(pool, targets);
+            await recordAdminCliAccess(
+              {
+                action: 'db.analyze',
+                target: { type: 'database', id: dbName },
+                outcome: 'allowed',
+                meta: { reason: opts.reason, tables: targets.map((t) => `${t.schema}.${t.name}`) },
+              },
+              url,
+            );
+            for (const statement of statements)
+              console.log(`db analyze: ${dbName} — ${statement} completed`);
+          } finally {
+            await pool.end().catch(() => undefined);
+          }
+        },
+      ),
     );
 }

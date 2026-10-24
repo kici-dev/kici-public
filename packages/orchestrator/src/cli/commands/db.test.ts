@@ -54,6 +54,19 @@ vi.mock('@kici-dev/shared/db-collation', () => ({
   refreshDatabaseCollationVersion: (...a: unknown[]) => mockRefresh(...(a as [])),
 }));
 
+const mockStatsReport = vi.fn();
+const mockResolveTargets = vi.fn();
+const mockAnalyzeTables = vi.fn(async () => undefined);
+vi.mock('@kici-dev/shared/db-stats', async (importActual) => {
+  const actual = await importActual<typeof import('@kici-dev/shared/db-stats')>();
+  return {
+    ...actual,
+    getGinTableStatsReport: (...a: unknown[]) => mockStatsReport(...a),
+    resolveAnalyzeTargets: (...a: unknown[]) => mockResolveTargets(...a),
+    analyzeTables: (...a: unknown[]) => mockAnalyzeTables(...(a as [])),
+  };
+});
+
 vi.mock('../../db/client.js', () => ({
   createDb: vi.fn(() => ({ destroy: vi.fn(async () => undefined) })),
 }));
@@ -183,7 +196,8 @@ async function runDb(args: string[]): Promise<{ exitCode: number | null; stdout:
   console.error = () => undefined;
   process.stderr.write = (() => true) as never;
   process.exit = ((code?: number) => {
-    exitCode = code ?? 0;
+    // The first exit wins: cliAction's catch would otherwise turn exit(2) into exit(1).
+    exitCode ??= code ?? 0;
     throw new Error(`EXIT:${code}`);
   }) as never;
 
@@ -599,5 +613,141 @@ describe('db backup --install-timer — the timer follows the install, not the h
     } finally {
       exitSpy.mockRestore();
     }
+  });
+});
+
+describe('kici-admin db stats-check', () => {
+  const URL_ARGS = ['--database-url', 'postgres://u:p@h:5432/kici'];
+  const healthy = {
+    table: 'public.access_log',
+    schema: 'public',
+    name: 'access_log',
+    relkind: 'r',
+    reltuples: '120',
+    relpages: 3,
+    ginIndexes: ['access_log_trgm'],
+    problem: null,
+  };
+
+  beforeEach(() => {
+    mockStatsReport.mockReset();
+    mockRecord.mockClear();
+  });
+
+  it('exits 0 and prints the clean JSON shape on a healthy DB', async () => {
+    // breaks-if-wrong: a healthy DB must exit 0, or every post-upgrade check reads red.
+    mockStatsReport.mockResolvedValue({ clean: true, tables: [healthy], needsAnalyze: [] });
+    const { exitCode, stdout } = await runDb(['db', 'stats-check', '--json', ...URL_ARGS]);
+    expect(exitCode).toBeNull();
+    expect(JSON.parse(stdout)).toEqual({
+      database: 'kici',
+      clean: true,
+      tables: [healthy],
+      needsAnalyze: [],
+    });
+    expect(mockRecord).not.toHaveBeenCalled();
+  });
+
+  it('exits 2 and names the table plus the fix when reltuples is invalid', async () => {
+    // fails-when: an invalid row is printed but the exit code stays 0.
+    const broken = { ...healthy, reltuples: 'NaN', problem: 'nan' };
+    mockStatsReport.mockResolvedValue({
+      clean: false,
+      tables: [broken],
+      needsAnalyze: ['public.access_log'],
+    });
+    const { exitCode, stdout } = await runDb(['db', 'stats-check', ...URL_ARGS]);
+    expect(exitCode).toBe(2);
+    expect(stdout).toContain('1 table(s) need ANALYZE');
+    expect(stdout).toContain('public.access_log  reltuples=NaN  (nan)');
+    expect(stdout).toContain("kici-admin db analyze --table public.access_log --reason '<why>'");
+  });
+
+  it('exits 1 when the catalog query fails', async () => {
+    mockStatsReport.mockRejectedValue(new Error('connection refused'));
+    const { exitCode } = await runDb(['db', 'stats-check', ...URL_ARGS]);
+    expect(exitCode).toBe(1);
+  });
+});
+
+describe('kici-admin db analyze', () => {
+  const URL_ARGS = ['--database-url', 'postgres://u:p@h:5432/kici'];
+
+  beforeEach(() => {
+    mockResolveTargets.mockReset();
+    mockAnalyzeTables.mockClear();
+    mockRecord.mockClear();
+  });
+
+  it('analyzes every --table and records db.analyze against the operated DB', async () => {
+    mockResolveTargets.mockResolvedValue([
+      { schema: 'public', name: 'access_log' },
+      { schema: 'public', name: 'runs' },
+    ]);
+    const { exitCode, stdout } = await runDb([
+      'db',
+      'analyze',
+      '--table',
+      'public.access_log',
+      '--table',
+      'public.runs',
+      '--reason',
+      'pg 18.6 reltuples',
+      ...URL_ARGS,
+    ]);
+    expect(exitCode).toBeNull();
+    expect(mockResolveTargets.mock.calls[0][1]).toEqual(['public.access_log', 'public.runs']);
+    expect(mockAnalyzeTables).toHaveBeenCalledOnce();
+    expect(stdout).toContain('db analyze: kici — ANALYZE "public"."access_log" completed');
+    expect(mockRecord).toHaveBeenCalledOnce();
+    expect(mockRecord.mock.calls[0][0]).toMatchObject({
+      action: 'db.analyze',
+      target: { type: 'database', id: 'kici' },
+      outcome: 'allowed',
+      meta: { reason: 'pg 18.6 reltuples', tables: ['public.access_log', 'public.runs'] },
+    });
+    expect(mockRecord.mock.calls[0][1]).toBe('postgres://u:p@h:5432/kici');
+  });
+
+  it('--dry-run prints the statements and neither analyzes nor records', async () => {
+    mockResolveTargets.mockResolvedValue([{ schema: 'public', name: 'access_log' }]);
+    const { exitCode, stdout } = await runDb([
+      'db',
+      'analyze',
+      '--table',
+      'public.access_log',
+      '--reason',
+      'preview',
+      '--dry-run',
+      ...URL_ARGS,
+    ]);
+    expect(exitCode).toBeNull();
+    expect(stdout.trim()).toBe('ANALYZE "public"."access_log";');
+    expect(mockAnalyzeTables).not.toHaveBeenCalled();
+    expect(mockRecord).not.toHaveBeenCalled();
+  });
+
+  it('exits 1 on an unknown table and analyzes nothing', async () => {
+    // fails-when: the validation is skipped and ANALYZE runs on the valid half.
+    mockResolveTargets.mockRejectedValue(new Error('Unknown table(s): public.nope.'));
+    const { exitCode } = await runDb([
+      'db',
+      'analyze',
+      '--table',
+      'public.nope',
+      '--reason',
+      'typo',
+      ...URL_ARGS,
+    ]);
+    expect(exitCode).toBe(1);
+    expect(mockAnalyzeTables).not.toHaveBeenCalled();
+    expect(mockRecord).not.toHaveBeenCalled();
+  });
+
+  it('requires --table and --reason', async () => {
+    const db = buildDbCommand();
+    const analyze = db.commands.find((c) => c.name() === 'analyze')!;
+    const required = analyze.options.filter((o) => o.mandatory).map((o) => o.long);
+    expect(required).toEqual(expect.arrayContaining(['--table', '--reason']));
   });
 });

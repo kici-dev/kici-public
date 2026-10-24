@@ -118,7 +118,9 @@ export default workflow('org-container-lint', {
     job('lint-dockerfile', {
       runsOn: ['kici:os:linux'],
       steps: [
-        step('lint', async ({ $, env }) => $`hadolint ${env.KICI_SOURCE_REPO_PATH}/Dockerfile`),
+        step('lint', async ({ $, env }) => {
+          await $`hadolint ${env.KICI_SOURCE_REPO_PATH}/Dockerfile`;
+        }),
       ],
     }),
   ],
@@ -176,7 +178,11 @@ const perRepoJobs: DynamicJobFn = async ({ sourceRepo }) => {
     .map((s) =>
       job(s.replace(':', '-'), {
         runsOn: ['kici:os:linux'],
-        steps: [step('run', async ({ $ }) => $`pnpm ${s}`)],
+        steps: [
+          step('run', async ({ $ }) => {
+            await $`pnpm ${s}`;
+          }),
+        ],
       }),
     );
 };
@@ -252,7 +258,7 @@ An emit that matches **zero** subscribers **fails** the gate. A repo that forgot
 job('repo-tests', { invoke: invokeSource('myorg.repo-tests', { optional: true }) });
 ```
 
-A zero-subscriber gate with `optional: true` succeeds immediately with no proxies. `optional` is separate from `continueOnError`: `optional` governs whether there was anything to invoke, `continueOnError` governs whether an invoked run passed.
+A zero-subscriber gate with `optional: true` succeeds immediately with no proxies. `optional` governs only whether there was anything to invoke; a failed invoked run still fails the gate.
 
 ### Reading invoked-run results
 
@@ -260,12 +266,11 @@ Each invoked run appears as a **proxy node** under the gate in the run graph, an
 
 ### Standard job options apply
 
-The gate is a standard job. Tolerate a failed invoked run with `continueOnError`, react to a failed gate with a downstream `needs` `when: 'on-failure'`, bound the wait with the job `timeout`, and bound the fan-out with `maxParallel` / `failFast`:
+The gate is a standard job. React to a failed gate with a downstream `needs` `when: 'on-failure'`, bound the wait with the job `timeout`, and bound the fan-out with `maxParallel` / `failFast`:
 
 ```ts
 job('repo-tests', {
   invoke: invokeSource('myorg.repo-tests'),
-  continueOnError: true,
   timeout: 60 * 60 * 1000, // one hour, in milliseconds
   maxParallel: 10,
   failFast: true,

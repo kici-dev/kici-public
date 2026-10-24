@@ -27,7 +27,7 @@ export default workflow('deploy', {
   on: [push({ branches: ['main'] })],
   jobs: [
     job('deploy-staging', {
-      runsOn: 'default',
+      runsOn: 'kici:os:linux',
       context: 'staging',
       steps: [
         step('deploy', async (ctx) => {
@@ -47,12 +47,15 @@ export default workflow('deploy', {
 
 ### Dynamic contexts
 
-The context name can be a string or a function (sync or async) for dynamic contexts (e.g., per-PR review contexts). The function receives the normalized event envelope, with the raw provider body nested at `event.payload`:
+The context name can be a string or a function (sync or async) for dynamic contexts (e.g., per-PR review contexts). The function receives the normalized event envelope, with the raw provider body nested at `event.payload`. Narrow on `event.type` to read the typed body of one event kind:
 
 ```typescript
 job('deploy-review', {
-  runsOn: 'default',
-  context: (event) => `review/PR-${event.payload.pull_request.number}`,
+  runsOn: 'kici:os:linux',
+  context: (event) =>
+    event.type === 'pull_request'
+      ? `review/PR-${event.payload.pull_request.number}`
+      : 'review/default',
   steps: [
     step('deploy', async (ctx) => {
       // ctx.context is 'review/PR-123' (resolved at runtime)
@@ -70,7 +73,7 @@ A job can bind more than one context with `contexts`, an ordered array. This let
 
 ```typescript
 job('deploy', {
-  runsOn: 'default',
+  runsOn: 'kici:os:linux',
   contexts: ['staging', 'my-testing'],
   steps: [
     step('deploy', async (ctx) => {
@@ -100,7 +103,7 @@ The `env` property on a job provides static or dynamic environment variables:
 
 ```typescript
 job('deploy', {
-  runsOn: 'default',
+  runsOn: 'kici:os:linux',
   context: 'production',
   env: { DEPLOY_TARGET: 'us-east-1' },
   // Or dynamic:
@@ -122,7 +125,7 @@ Control concurrent deployments to the same context:
 
 ```typescript
 job('deploy', {
-  runsOn: 'default',
+  runsOn: 'kici:os:linux',
   context: 'production',
   concurrencyGroup: 'production-api',
   // Or dynamic:

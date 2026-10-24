@@ -27,6 +27,9 @@ returned:
 ```typescript
 import { step, z } from '@kici-dev/sdk';
 
+// TypeScript does not infer the drift type from `check`; annotate it where it is read.
+type NginxDrift = { want: string };
+
 const configureNginx = step('configure-nginx', {
   // optional schema for the drift value — gives the dashboard a typed shape
   drift: z.object({ want: z.string() }),
@@ -39,10 +42,10 @@ const configureNginx = step('configure-nginx', {
 
   // human-readable preview line — REQUIRED when check is set. It is the drift's
   // serializable face: it streams to the logs and persists for the dashboard.
-  summarize: (drift) => `would rewrite nginx.conf (${drift.want.length} bytes)`,
+  summarize: (drift: NginxDrift) => `would rewrite nginx.conf (${drift.want.length} bytes)`,
 
   // apply — runs only when check returned drift (apply mode); receives that drift
-  run: async (ctx, drift) => {
+  run: async (ctx, drift: NginxDrift) => {
     await writeConfig(drift.want);
     return { reloaded: true };
   },

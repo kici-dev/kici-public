@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/shared",
-  "version": "0.27.0",
+  "version": "0.28.0",
   "description": "Shared utilities for the KiCI CI/CD stack — logging, zx setup, crypto, telemetry, health and metrics routes. No business logic.",
   "keywords": [
     "ci",
@@ -85,6 +85,10 @@
     "./db-collation": {
       "import": "./dist/db-collation.js",
       "types": "./dist/db-collation.d.ts"
+    },
+    "./db-stats": {
+      "import": "./dist/db-stats.js",
+      "types": "./dist/db-stats.d.ts"
     },
     "./secret-crypto": {
       "import": "./dist/secret-crypto.js",

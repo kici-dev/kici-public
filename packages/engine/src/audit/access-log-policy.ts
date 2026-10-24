@@ -130,6 +130,7 @@ export const POLICY_BY_ACTION: Record<AccessLogAction, AccessLogPolicy> = {
   'db.create_readonly_user': { kind: 'always' },
   'db.reindex': { kind: 'always' },
   'db.refresh_collation_version': { kind: 'always' },
+  'db.analyze': { kind: 'always' },
   'access_log.list.read': { kind: 'always' },
   // Never sampled: reading who holds admin tokens is a low-volume, privileged
   // read, and a sampled row would leave gaps in the very trail an operator

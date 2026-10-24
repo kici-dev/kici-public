@@ -16,6 +16,7 @@ describe('access-log enums — admin_cli db subcommands', () => {
       'db.create_readonly_user',
       'db.reindex',
       'db.refresh_collation_version',
+      'db.analyze',
     ]) {
       expect(AccessLogAction.safeParse(a).success).toBe(true);
     }

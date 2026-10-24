@@ -224,6 +224,7 @@ export const AccessLogAction = z.enum([
   'db.create_readonly_user',
   'db.reindex',
   'db.refresh_collation_version',
+  'db.analyze',
 ]);
 export type AccessLogAction = z.infer<typeof AccessLogAction>;
 

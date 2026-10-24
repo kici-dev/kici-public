@@ -3,7 +3,7 @@ title: Private npm registries
 description: Authenticate `npm install` against private registries (CodeArtifact, GitHub Packages, Verdaccio, …) from a workflow's `.kici/package.json`
 ---
 
-A workflow's `.kici/package.json` may depend on packages published to a private registry — your org's internal CodeArtifact, a GitHub Packages scope, a self-hosted Verdaccio, JFrog, Cloudsmith, GitLab, etc. KiCI ships two ways to authenticate `npm install` against those registries from inside a job, plus an escape hatch for short-lived tokens.
+A workflow's `.kici/package.json` may depend on packages published to a private registry — your org's internal CodeArtifact, a GitHub Packages scope, a self-hosted Verdaccio, JFrog, Cloudsmith, GitLab, etc. KiCI ships two ways to authenticate `npm install` against those registries from inside a job. Both read the token from a stored secret; for a token that expires within hours, see [short-lived tokens](#short-lived-tokens-codeartifact-gcp-artifact-registry).
 
 ## Choose a path
 
@@ -11,7 +11,6 @@ A workflow's `.kici/package.json` may depend on packages published to a private 
 | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Option A — `registries:` block in the workflow**      | The token is a long-lived secret you rotate manually (GH Packages PAT, CodeArtifact IAM access key, Verdaccio service token). KiCI manages the `.npmrc` for you.                                              |
 | **Option C — Committed `.kici/.npmrc` + `installEnv:`** | You already have an `.npmrc` you want to keep verbatim (e.g. it carries an `audit=false` line, a custom CA, or a complex multi-scope mapping). KiCI just supplies the env vars your `${VAR}` references need. |
-| **Setup-step pattern (short-lived tokens)**             | The token is minted at workflow time (CodeArtifact authorization token, GCP Artifact Registry token). A `setup` job runs the cloud CLI, writes a fresh `.kici/.npmrc`, and the install jobs read it.          |
 
 The two channels (Option A and Option C) compose. If you declare both, the agent's auto-generated lines come **after** your committed `.npmrc`, so npm's last-wins semantics let agent-managed registries override committed ones — never the other way around.
 
@@ -33,7 +32,7 @@ export default workflow('build', {
   ],
   jobs: [
     job('build', {
-      runsOn: 'default',
+      runsOn: 'kici:os:linux',
       context: 'production',
       steps: [
         step('install-and-build', async (ctx) => {
@@ -91,9 +90,13 @@ export default workflow('build', {
   installEnv: ['production:MY_NPM_TOKEN'],
   jobs: [
     job('build', {
-      runsOn: 'default',
+      runsOn: 'kici:os:linux',
       context: 'production',
-      steps: [step('build', async (ctx) => ctx.$`npm run build`)],
+      steps: [
+        step('build', async (ctx) => {
+          await ctx.$`npm run build`;
+        }),
+      ],
     }),
   ],
 });
@@ -111,50 +114,9 @@ This path is the right answer when:
 
 AWS CodeArtifact authorization tokens expire after 12 hours; GCP Artifact Registry tokens after 60 minutes. Storing one as a long-lived `tokenSecret` does not work — by the time a build runs, the token may be expired.
 
-The supported pattern is a **setup job** that mints a fresh token, writes `.kici/.npmrc`, and downstream jobs install with it. For a `.kici/` that is a member of an npm or pnpm workspace, the setup job writes the workspace-root `.npmrc` instead.
+The orchestrator reads each `tokenSecret` and `installEnv` value from the context's secret store when it dispatches a job. The agent then installs the `.kici/` dependencies in the job's own fresh checkout, before any step runs. So a step cannot supply a token to that install, and a token that one job mints does not reach the install of a later job.
 
-```typescript
-import { workflow, job, step, push } from '@kici-dev/sdk';
-
-export default workflow('build', {
-  on: [push({ branches: ['main'] })],
-  jobs: [
-    job('mint-codeartifact-token', {
-      runsOn: 'default',
-      context: 'production',
-      steps: [
-        step('mint', async (ctx) => {
-          const awsKey = await ctx.secrets.get('AWS_ACCESS_KEY_ID');
-          const awsSecret = await ctx.secrets.get('AWS_SECRET_ACCESS_KEY');
-          process.env.AWS_ACCESS_KEY_ID = awsKey;
-          process.env.AWS_SECRET_ACCESS_KEY = awsSecret;
-
-          const token = (
-            await ctx.$`aws codeartifact get-authorization-token --domain my-domain --query authorizationToken --output text`
-          ).stdout.trim();
-
-          // Write directly into the workspace's .kici/ — the next job reuses the same workspace.
-          const npmrc = [
-            '@my-org:registry=https://my-domain-1234567890.d.codeartifact.eu-central-1.amazonaws.com/npm/workflow-deps/',
-            `//my-domain-1234567890.d.codeartifact.eu-central-1.amazonaws.com/npm/workflow-deps/:_authToken=${token}`,
-            '//my-domain-1234567890.d.codeartifact.eu-central-1.amazonaws.com/npm/workflow-deps/:always-auth=true',
-            '',
-          ].join('\n');
-          await ctx.$`tee .kici/.npmrc`.stdin(npmrc);
-        }),
-      ],
-    }),
-    job('build', {
-      runsOn: 'default',
-      context: 'production',
-      needs: ['mint-codeartifact-token'],
-      steps: [step('build', async (ctx) => ctx.$`npm run build`)],
-    }),
-  ],
-});
-```
-
-The same pattern works for GCP Artifact Registry — replace the `aws codeartifact` call with `gcloud auth print-access-token`. The manual setup-step shown here is the supported path for these short-lived flows.
+To use a short-lived token, keep the stored secret current. Write a fresh token to the context secret before the old one expires, from the dashboard or with `kici-admin secret set`. See [secrets](secrets.md).
 
 ## Provider-specific examples
 

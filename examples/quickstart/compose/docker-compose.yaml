@@ -75,7 +75,7 @@ services:
     restart: unless-stopped
 
   orchestrator:
-    image: quay.io/kici-dev/kici-orchestrator:0.27.0@sha256:e5a544f991bef2f97b15ea6356f59cbc11ee462a62a73311424bb0f6ac7f6061
+    image: quay.io/kici-dev/kici-orchestrator:0.28.0@sha256:5546eeba0c1d32630a8aa76b49bfdde9b88ed86407033b02fde228b744bd8398
     # The orchestrator image runs as the unprivileged `node` user, but the
     # container scaler needs read/write access to the bind-mounted container
     # runtime socket below. On a standard Docker host that socket is
