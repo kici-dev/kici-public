@@ -8,7 +8,7 @@ ARG DHI_PREFIX=dhi.io
 # Stage 1: Build (on the -dev variant — keeps apt + shell + corepack so we
 # can install/compile/rebuild oxc-transform in the usual pnpm flow). DHI
 # ships ca-certificates by default, so no apt-get for certs is needed.
-FROM ${DHI_PREFIX}/node:24.22.1-0-debian13-dev AS builder
+FROM ${DHI_PREFIX}/node:24.22.1-0-debian13-dev@sha256:20cf36e12660c68b1e28887d1e71a7f2494bcea9d034709368e0afce77728eb0 AS builder
 WORKDIR /app
 
 # Enable pnpm. Pin 11.28.6 to match the runtime stage (see below): the same
@@ -151,7 +151,7 @@ RUN rm -f .npmrc \
 # Runtime base is the -dev variant: the agent needs apt-installed host tools
 # (git/bash/iptables), and a job installs more Debian packages with apt.
 # ca-certificates ships with the DHI base, so it isn't installed here.
-FROM ${DHI_PREFIX}/node:24.22.1-0-debian13-dev
+FROM ${DHI_PREFIX}/node:24.22.1-0-debian13-dev@sha256:20cf36e12660c68b1e28887d1e71a7f2494bcea9d034709368e0afce77728eb0
 
 # Install the CI userland: what the agent needs (listed above), then the
 # baseline a CI job expects on a Debian host — ps, hostname, ip, ping, unzip,

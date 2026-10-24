@@ -20,11 +20,13 @@ import {
   installBackupTimer,
   launchdPlistPath,
   parseLaunchdSchedule,
+  readBackupTimer,
   readEnvValue,
   readEnvValues,
   renderLaunchdBackupPlist,
   renderSystemdBackupService,
   renderSystemdBackupTimer,
+  rewriteBackupTimerRuntime,
   systemdUnitDir,
   uninstallBackupTimer,
   unsupportedPlatformMessage,
@@ -347,5 +349,129 @@ describe('readEnvValue', () => {
     );
     expect(readEnvValue('A=1\nB="two"\n# C=3\n', 'B')).toBe('two');
     expect(readEnvValue('A=1\nB=2\n', 'C')).toBeUndefined();
+  });
+});
+
+describe('readBackupTimer — the inverse of the renderers', () => {
+  const dir = systemdUnitDir(true);
+  const name = backupTimerName('kici-orchestrator');
+
+  function systemdFiles(config: BackupTimerConfig): Record<string, string> {
+    const unitDir = systemdUnitDir(config.isUserLevel);
+    return {
+      [`${unitDir}/${name}.service`]: renderSystemdBackupService(config),
+      [`${unitDir}/${name}.timer`]: renderSystemdBackupTimer(config),
+    };
+  }
+
+  it.each([
+    ['a user-level daily timer', makeConfig()],
+    [
+      'a system-level timer with a user and a calendar spec',
+      makeConfig({ isUserLevel: false, user: 'kici', schedule: 'Mon *-*-* 03:30:00', keep: 3 }),
+    ],
+  ])('round-trips renderSystemdBackupService for %s', (_label, config) => {
+    const io = makeIo(systemdFiles(config));
+    const read = readBackupTimer('systemd', config.serviceName, config.isUserLevel, io);
+    expect(read).not.toBeNull();
+    expect(read).toMatchObject({
+      serviceName: config.serviceName,
+      schedule: config.schedule,
+      outputDir: config.outputDir,
+      keep: config.keep,
+      nodeBinPath: config.nodeBinPath,
+      cliScriptPath: config.cliScriptPath,
+      envFilePath: config.envFilePath,
+      isUserLevel: config.isUserLevel,
+    });
+    expect(read?.user).toBe(config.user);
+    // Property: rendering what was read gives back the bytes on disk.
+    const again = { ...read!, envFilePath: read!.envFilePath! };
+    expect(renderSystemdBackupService(again)).toBe(renderSystemdBackupService(config));
+    expect(renderSystemdBackupTimer(again)).toBe(renderSystemdBackupTimer(config));
+  });
+
+  it.each([
+    ['daily', makeConfig({ isUserLevel: true })],
+    [
+      '03:30 as a system daemon',
+      makeConfig({ schedule: '03:30', isUserLevel: false, user: 'kici' }),
+    ],
+  ])('round-trips renderLaunchdBackupPlist (%s)', (_label, config) => {
+    const env = { KICI_DATABASE_URL: 'postgres://u:p&q@db/kici' };
+    const plist = renderLaunchdBackupPlist(config, env);
+    const io = makeIo({ [launchdPlistPath(name, config.isUserLevel)]: plist });
+    const read = readBackupTimer('launchd', config.serviceName, config.isUserLevel, io);
+    expect(read).toMatchObject({
+      nodeBinPath: config.nodeBinPath,
+      cliScriptPath: config.cliScriptPath,
+      outputDir: config.outputDir,
+      keep: config.keep,
+      envFilePath: null,
+      env,
+    });
+    expect(read?.user).toBe(config.user);
+    expect(renderLaunchdBackupPlist({ ...read!, envFilePath: '' }, read!.env)).toBe(plist);
+  });
+
+  it('returns null when no backup unit is installed', () => {
+    expect(readBackupTimer('systemd', 'kici-orchestrator', true, makeIo())).toBeNull();
+    expect(readBackupTimer('launchd', 'kici-orchestrator', true, makeIo())).toBeNull();
+  });
+
+  it('returns null on a platform that carries no timer', () => {
+    expect(readBackupTimer('windows', 'kici-orchestrator', false, makeIo())).toBeNull();
+  });
+
+  it('throws on a unit whose ExecStart is not a backup command', () => {
+    const io = makeIo({
+      [`${dir}/${name}.service`]: '[Service]\nExecStart=/usr/bin/true\n',
+      [`${dir}/${name}.timer`]: renderSystemdBackupTimer(makeConfig()),
+    });
+    expect(() => readBackupTimer('systemd', 'kici-orchestrator', true, io)).toThrow(/ExecStart/);
+  });
+});
+
+describe('rewriteBackupTimerRuntime', () => {
+  const name = backupTimerName('kici-orchestrator');
+  const runtime = {
+    nodeBinPath: '/opt/node-24.22.1/bin/node',
+    cliScriptPath: '/opt/node-24.22.1/bin/kici-admin',
+  };
+
+  it('rewrites the systemd service with the new node and CLI, keeping the timer', () => {
+    const config = makeConfig({ isUserLevel: false, user: 'kici' });
+    const unitDir = systemdUnitDir(false);
+    const io = makeIo({
+      [`${unitDir}/${name}.service`]: renderSystemdBackupService(config),
+      [`${unitDir}/${name}.timer`]: renderSystemdBackupTimer(config),
+    });
+    const read = readBackupTimer('systemd', 'kici-orchestrator', false, io)!;
+    const files = rewriteBackupTimerRuntime('systemd', read, runtime, io);
+    expect(files).toEqual([`${unitDir}/${name}.service`]);
+    const unit = io.written.get(`${unitDir}/${name}.service`)!;
+    expect(unit).toBe(renderSystemdBackupService({ ...config, ...runtime }));
+    expect(unit).toContain(
+      'ExecStart=/opt/node-24.22.1/bin/node /opt/node-24.22.1/bin/kici-admin db backup',
+    );
+    expect(unit).toContain('Environment=PATH=/opt/node-24.22.1/bin:');
+    expect(unit).toContain('User=kici');
+    expect(io.commands).toEqual([['systemctl', ['daemon-reload']]]);
+  });
+
+  it('rewrites the launchd plist, keeping its database URL, and loads it again', () => {
+    const config = makeConfig();
+    const env = { KICI_DATABASE_URL: 'postgres://db/kici' };
+    const plistPath = launchdPlistPath(name, true);
+    const io = makeIo({ [plistPath]: renderLaunchdBackupPlist(config, env) });
+    const read = readBackupTimer('launchd', 'kici-orchestrator', true, io)!;
+    rewriteBackupTimerRuntime('launchd', read, runtime, io);
+    expect(io.written.get(plistPath)).toBe(
+      renderLaunchdBackupPlist({ ...config, ...runtime }, env),
+    );
+    expect(io.commands).toEqual([
+      ['launchctl', ['bootout', `gui/501/dev.kici.${name}`]],
+      ['launchctl', ['bootstrap', 'gui/501', plistPath]],
+    ]);
   });
 });

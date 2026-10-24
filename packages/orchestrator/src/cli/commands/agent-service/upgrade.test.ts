@@ -19,6 +19,7 @@ vi.mock('../shared/versioned-upgrade.js', async () => {
 });
 
 import { registerAgentUpgradeCommand } from './upgrade.js';
+import { NODE_OPTION_DESCRIPTION } from '../shared/node-runtime.js';
 
 describe('agent upgrade — folder-anchored', () => {
   let program: Command;
@@ -59,5 +60,29 @@ describe('agent upgrade — folder-anchored', () => {
       version: '0.3.0',
     });
     expect((opts as { name?: string }).name).toBeUndefined();
+  });
+});
+
+describe('agent upgrade --node', () => {
+  it('passes --node to performVersionedUpgrade and describes it in --help', async () => {
+    mockPerformVersionedUpgrade.mockClear();
+    const program = new Command();
+    program.name('agent');
+    registerAgentUpgradeCommand(program);
+    await program.parseAsync([
+      'node',
+      'agent',
+      'upgrade',
+      '--version',
+      '0.27.0',
+      '--node',
+      'C:\\n\\node.exe',
+    ]);
+    expect(mockPerformVersionedUpgrade.mock.calls[0]![1]).toMatchObject({
+      node: 'C:\\n\\node.exe',
+    });
+    const option = program.commands[0]!.options.find((o) => o.long === '--node');
+    expect(option?.flags).toBe('--node <path>');
+    expect(option?.description).toBe(NODE_OPTION_DESCRIPTION);
   });
 });

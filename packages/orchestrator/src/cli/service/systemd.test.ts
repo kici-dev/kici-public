@@ -758,6 +758,22 @@ describe('systemd service manager', () => {
       });
     });
 
+    // fails-when: the account is dropped, so a unit registered again runs as root.
+    it('reads the account a system-level unit runs as, from what generateUnitFile writes', async () => {
+      const system = makeConfig({
+        isUserLevel: false,
+        user: 'kici',
+        executablePath: '/n/bin/node',
+        args: ['/n/lib/node_modules/kici-admin/dist/server.js'],
+      });
+      mockedReadFileSync.mockReturnValueOnce(manager.generateUnitFile(system));
+      expect(await manager.readLaunchSpec(system)).toEqual({
+        execPath: '/n/bin/node',
+        args: ['/n/lib/node_modules/kici-admin/dist/server.js'],
+        user: 'kici',
+      });
+    });
+
     it('returns null when there is no ExecStart line', async () => {
       mockedReadFileSync.mockReturnValueOnce('[Service]\nType=simple\n');
       expect(await manager.readLaunchSpec(config)).toBeNull();

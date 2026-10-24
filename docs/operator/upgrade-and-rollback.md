@@ -153,6 +153,27 @@ replaces it. A light package runs on the Node.js version that its release
 names: before the upgrade,
 [install that version into the cache](./distribution/sea-binaries.md#install-nodejs-into-the-cache).
 
+To move a native install from npm to a new Node.js runtime, such as Node.js
+24.22.1:
+
+1. Install the new Node.js runtime on the host, at a fixed path. Do not use a
+   version-manager shim.
+2. Move the orchestrator:
+   `kici-admin orchestrator upgrade --version <version> --node <path-to-node>`.
+   The command installs the package with the npm of that runtime, registers
+   the service again to run it, and restarts it. A scheduled `db backup` unit
+   moves with it.
+3. Move each agent the same way:
+   `kici-admin agent upgrade --version <version> --node <path-to-node>`.
+4. If a bare-metal scaler starts agents, set its `binaryPath` to the
+   `kici-agent` of the new runtime. The upgrade prints a warning that names
+   this path, and the "Agent binary" line of `kici-admin orchestrator status`
+   shows it. Then restart the orchestrator.
+
+See
+[`--node` to move to another Node.js runtime](./distribution/service-installation.md#--node-to-move-to-another-nodejs-runtime)
+for the checks the upgrade does first.
+
 Before it restarts the orchestrator, `kici-admin orchestrator upgrade` reads the
 scaler config (`KICI_SCALER_CONFIG_PATH` and `KICI_SCALER_CONFIG_DIR`) and
 warns about each container label set that would keep spawning an old agent:

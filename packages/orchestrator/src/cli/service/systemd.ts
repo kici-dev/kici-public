@@ -306,7 +306,8 @@ export class SystemdServiceManager implements ServiceManager {
     if (!m) return null;
     const tokens = m[1].trim().split(/\s+/).filter(Boolean);
     if (tokens.length === 0) return null;
-    return { execPath: tokens[0]!, args: tokens.slice(1) };
+    const user = content.match(/^User=(.+?)\s*$/m)?.[1];
+    return { execPath: tokens[0]!, args: tokens.slice(1), ...(user ? { user } : {}) };
   }
 
   async list(isUserLevel: boolean): Promise<DiscoveredInstance[]> {

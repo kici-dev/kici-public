@@ -15,6 +15,7 @@ vi.mock('../agent-package.js', async (importOriginal) => ({
 import { performVersionedUpgrade } from '../shared/versioned-upgrade.js';
 import { runAgentPackageRefresh, type AgentPackageRefreshOptions } from '../agent-package.js';
 import { registerUpgradeCommand } from './upgrade.js';
+import { NODE_OPTION_DESCRIPTION } from '../shared/node-runtime.js';
 import type { ResolvedInstance } from '../../service/index.js';
 
 /** Run `orchestrator upgrade <args>` through the registered command. */
@@ -89,5 +90,46 @@ describe('orchestrator upgrade: agent package refresh', () => {
       `Run \`kici-admin agent package --upload --env-file ${envFilePath}\` manually ` +
         'to refresh the fleet payloads.',
     );
+  });
+});
+
+describe('orchestrator upgrade --node', () => {
+  beforeEach(() => {
+    vi.mocked(performVersionedUpgrade).mockReset();
+    vi.mocked(performVersionedUpgrade).mockResolvedValue({
+      manifest: { envFilePath: '/nowhere.env' },
+    } as unknown as ResolvedInstance);
+  });
+
+  // fails-when: `--node` collides with `--node-mirror`, so one swallows the other.
+  it('passes --node and --node-mirror as separate options', async () => {
+    await runUpgrade([
+      '--version',
+      '0.27.0',
+      '--node',
+      '/opt/node-24.22.1/bin/node',
+      '--node-mirror',
+      'https://mirror.example/node',
+      '--no-agent-packages',
+    ]);
+    const opts = vi.mocked(performVersionedUpgrade).mock.calls[0]![1];
+    expect(opts).toMatchObject({
+      node: '/opt/node-24.22.1/bin/node',
+      nodeMirror: 'https://mirror.example/node',
+    });
+  });
+
+  it('leaves node unset when the flag is absent', async () => {
+    await runUpgrade(['--version', '0.27.0', '--no-agent-packages']);
+    expect(vi.mocked(performVersionedUpgrade).mock.calls[0]![1].node).toBeUndefined();
+  });
+
+  it('describes --node in --help', () => {
+    const program = new Command();
+    registerUpgradeCommand(program.command('orchestrator'), () => null);
+    const upgrade = program.commands[0]!.commands.find((c) => c.name() === 'upgrade')!;
+    const option = upgrade.options.find((o) => o.long === '--node');
+    expect(option?.flags).toBe('--node <path>');
+    expect(option?.description).toBe(NODE_OPTION_DESCRIPTION);
   });
 });

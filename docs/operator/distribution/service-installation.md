@@ -535,6 +535,29 @@ kici-admin orchestrator upgrade --restart-only --yes
 
 In restart-only mode the CLI reads the version the unit will actually launch, verifies it matches the invoking `kici-admin`, and only then restarts. If the versions diverge (your manual install landed under a different runtime than the unit is pinned to), it aborts **before** stopping the service and names both versions and the launch path. On Windows, the restart also registers the service again.
 
+#### `--node` to move to another Node.js runtime
+
+A service that runs from an npm install uses the Node.js runtime that its unit names. To move it to another runtime, for example a new Node.js patch release, install that runtime first. Then pass its `node` executable with `--node`:
+
+```bash
+kici-admin orchestrator upgrade --version <version> --node /opt/node-v24.22.1/bin/node --yes
+kici-admin agent upgrade --version <version> --node /opt/node-v24.22.1/bin/node --yes
+```
+
+The upgrade installs `<package>@<version>` with the npm of that runtime, into its own global prefix. Then it registers the service again to run the new `node`, and restarts it. On Linux and macOS, the new registration keeps the account that the service runs as. The old runtime and its copy of the package stay on disk unchanged.
+
+Before it changes anything, the upgrade refuses a `--node` path that:
+
+- is a version-manager shim, which starts the version manager instead of a fixed runtime. Pass the path that `mise which node` (or your version manager's equivalent) prints.
+- is not an executable file, or does not run `--version`.
+- has no npm beside it (`<prefix>/lib/node_modules/npm` on Linux and macOS, `<prefix>\node_modules\npm` on Windows).
+
+After the install and before the restart, the upgrade reads `engines.node` of the installed package. It refuses a runtime that the package does not accept. A path through a version-manager alias, such as mise `node/24`, gets a warning: the alias moves when you install another runtime, and the service moves with it.
+
+After the restart, the upgrade checks that the unit launches the new `node`. It also moves a scheduled `db backup` unit of the orchestrator (`kici-admin db backup --install-timer`) to the new runtime. A bare-metal scaler whose `binaryPath` names the `kici-agent` of the old runtime gets a warning that names the `kici-agent` of the new runtime. Set `binaryPath` to that path in the scaler config.
+
+With `--restart-only`, `--node` restarts onto a package that you already installed with the npm of the new runtime. `--node` works only for a service that runs from a global npm install. It is refused with `--from`, `--url`, `--rollback`, `--pick`, `--cleanup` and for a compose service. A full package carries its own Node.js, and a light package runs the Node.js version of its release.
+
 #### `--force` for opaque launch targets
 
 When the service was installed with an explicit `--binary` wrapper (or any launch target whose version can't be read), there is no package metadata to resolve, so the self-driving install has no global package to update and the restart-only verification can't run. In restart-only mode, passing `--force` bypasses the launch-target verification and restarts onto the installed package, leaving the manifest's recorded version unchanged rather than guessing.
@@ -646,6 +669,7 @@ kici-admin orchestrator upgrade --instance-dir ~/kici-deploy --cleanup
 | `--url <url>`           | URL to download package archive from                                                                                                                                                                       |
 | `--version <ver>`       | Target version string (e.g., `0.3.0`). Required for archive upgrades and for the self-driving npm-source upgrade (the version to install)                                                                  |
 | `--restart-only`        | npm-source upgrades: skip the self-driving install and just restart onto an already-installed package (pre-staged / air-gapped path)                                                                       |
+| `--node <path>`         | npm-source upgrades: install the package with the npm of this Node.js executable and register the service again to run it (see [`--node`](#--node-to-move-to-another-nodejs-runtime))                      |
 | `--rollback`            | Roll back the resolved instance to its previous version                                                                                                                                                    |
 | `--pick`                | Interactively pick an already-installed version to activate (switch, no download). Requires an interactive terminal                                                                                        |
 | `--cleanup`             | Remove old versions of the resolved instance (keeps current and previous)                                                                                                                                  |

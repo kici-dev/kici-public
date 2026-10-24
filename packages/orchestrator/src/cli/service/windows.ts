@@ -93,7 +93,7 @@ const SERVICE_USE = 'as a Windows service';
 const SERVICE_REMEDY = 'Install from a path without it.';
 
 /** The command shawl registers; a batch file runs through cmd.exe ({@link BATCH_WRAPPER_ARGS}). */
-function serviceCommand(config: ServiceConfig): string[] {
+export function serviceCommand(config: ServiceConfig): string[] {
   const command = [config.executablePath, ...(config.args ?? [])];
   if (!isBatchFile(config.executablePath)) return command;
   command.forEach((token) => assertCmdSafe(token, SERVICE_USE, SERVICE_REMEDY));

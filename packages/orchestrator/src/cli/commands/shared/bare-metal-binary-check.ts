@@ -37,6 +37,8 @@ export enum BinaryPathIssue {
   OtherInstall = 'other-install',
   /** Goes through a version-manager alias or shim that can move. */
   VersionManagerPath = 'version-manager-path',
+  /** Runs the `kici-agent` of the Node.js runtime a `--node` upgrade moves the service away from. */
+  PreviousRuntime = 'previous-runtime',
 }
 
 export interface BinaryPathFinding {
@@ -63,32 +65,47 @@ function bareMetalBinaryPaths(config: ScalerConfig): ConfiguredBinaryPath[] {
   return out;
 }
 
+/** Whether a version-manager path runs the manager each time, or links to a runtime that can move. */
+export enum VersionManagerPathType {
+  /** Runs the version manager, which picks a runtime at each start. */
+  Shim = 'shim',
+  /** Links to one runtime until another one is installed or selected. */
+  Alias = 'alias',
+}
+
 /**
- * The version-manager alias or shim `binaryPath` goes through, as words for
- * the operator, or null when the path names a fixed runtime. Reads the
- * configured path, not its target: an alias resolves to the right file until
- * another runtime is installed.
+ * The version-manager alias or shim `binaryPath` goes through, or null when
+ * the path names a fixed runtime. `kind` is in words for the operator. Reads
+ * the configured path, not its target: an alias resolves to the right file
+ * until another runtime is installed.
  */
-export function versionManagerPathKind(binaryPath: string): string | null {
+export function versionManagerPath(
+  binaryPath: string,
+): { kind: string; type: VersionManagerPathType } | null {
   const p = binaryPath.replace(/\\/g, '/');
   const miseInstall = /\/mise\/installs\/node\/([^/]+)\//.exec(p);
   if (miseInstall && !/^v?\d+\.\d+\.\d+$/.test(miseInstall[1]!)) {
-    return `mise alias (node/${miseInstall[1]})`;
+    return { kind: `mise alias (node/${miseInstall[1]})`, type: VersionManagerPathType.Alias };
   }
-  const kinds: Array<[RegExp, string]> = [
-    [/\/mise\/shims\//, 'mise shim'],
-    [/\/\.asdf\/shims\//, 'asdf shim'],
-    [/\/\.volta\/bin\//, 'Volta shim'],
-    [/\/\.nodenv\/shims\//, 'nodenv shim'],
-    [/\/fnm_multishells\//, 'fnm shell link'],
-    [/\/fnm\/aliases\//, 'fnm alias'],
-    [/\/\.nvm\/current\//, 'nvm current link'],
-    [/\/shims\//, 'version-manager shim'],
+  const kinds: Array<[RegExp, string, VersionManagerPathType]> = [
+    [/\/mise\/shims\//, 'mise shim', VersionManagerPathType.Shim],
+    [/\/\.asdf\/shims\//, 'asdf shim', VersionManagerPathType.Shim],
+    [/\/\.volta\/bin\//, 'Volta shim', VersionManagerPathType.Shim],
+    [/\/\.nodenv\/shims\//, 'nodenv shim', VersionManagerPathType.Shim],
+    [/\/fnm_multishells\//, 'fnm shell link', VersionManagerPathType.Alias],
+    [/\/fnm\/aliases\//, 'fnm alias', VersionManagerPathType.Alias],
+    [/\/\.nvm\/current\//, 'nvm current link', VersionManagerPathType.Alias],
+    [/\/shims\//, 'version-manager shim', VersionManagerPathType.Shim],
   ];
-  for (const [re, kind] of kinds) {
-    if (re.test(p)) return kind;
+  for (const [re, kind, type] of kinds) {
+    if (re.test(p)) return { kind, type };
   }
   return null;
+}
+
+/** The words {@link versionManagerPath} uses for `binaryPath`, or null for a fixed runtime. */
+export function versionManagerPathKind(binaryPath: string): string | null {
+  return versionManagerPath(binaryPath)?.kind ?? null;
 }
 
 /** `realpath`, or null when the file does not exist. */
@@ -139,6 +156,11 @@ export interface CheckBinaryPathArgs {
   expectedVersion: string | null;
   /** True when the upgrade installs `expectedAgent` before it restarts. */
   willInstall: boolean;
+  /**
+   * The `kici-agent` of the runtime the service leaves, when the upgrade moves
+   * it to another Node.js runtime (`--node`); null otherwise.
+   */
+  previousAgent?: string | null;
   /** The scaler config file, for the remedy text. */
   scalerConfigPath: string;
 }
@@ -210,6 +232,21 @@ export function checkBinaryPath(args: CheckBinaryPathArgs): BinaryPathFinding[] 
     );
   }
 
+  if (expectedAgent && args.previousAgent) {
+    const previousReal = realpathOrNull(args.previousAgent) ?? args.previousAgent;
+    if (real === previousReal) {
+      findings.push(
+        finding(
+          BinaryPathIssue.PreviousRuntime,
+          `binaryPath ${binaryPath} is the kici-agent of the Node.js runtime this upgrade moves ` +
+            'the service away from, so each agent the scaler starts still runs on that runtime. ' +
+            `Set binaryPath to ${expectedAgent} in ${scalerConfigPath}.`,
+        ),
+      );
+      return findings;
+    }
+  }
+
   if (expectedAgent) {
     const expectedReal = realpathOrNull(expectedAgent) ?? expectedAgent;
     if (real !== expectedReal) {
@@ -258,6 +295,8 @@ export interface PreflightArgs {
   expectedAgent: string | null;
   expectedVersion: string | null;
   willInstall: boolean;
+  /** See {@link CheckBinaryPathArgs.previousAgent}. */
+  previousAgent?: string | null;
   /** `--skip-binary-path-check`: report a refusal as a warning and go on. */
   skip: boolean;
   warn: (line: string) => void;
@@ -300,6 +339,7 @@ export async function preflightBareMetalBinaryPaths(args: PreflightArgs): Promis
       expectedAgent: args.expectedAgent,
       expectedVersion: args.expectedVersion,
       willInstall: args.willInstall,
+      previousAgent: args.previousAgent ?? null,
       scalerConfigPath: location.configPath,
     }),
   );

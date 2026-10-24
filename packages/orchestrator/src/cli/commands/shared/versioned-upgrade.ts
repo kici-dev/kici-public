@@ -48,6 +48,25 @@ import { confirmPrompt } from './confirm.js';
 import { preflightBareMetalBinaryPaths } from './bare-metal-binary-check.js';
 import { warnAboutContainerAgentImages } from './container-agent-image-check.js';
 import { agentBinaryFromLaunch } from '../../../scaler/agent-binary-location.js';
+import {
+  checkInstalledEngines,
+  checkNodeFlagConflicts,
+  installedPackageJsonPath,
+  reRootLaunch,
+  reRootPath,
+  resolveNodeRuntime,
+  type NodeRuntime,
+  type RuntimeMove,
+  type SpawnRunner,
+} from './node-runtime.js';
+import {
+  defaultTimerIo,
+  readBackupTimer,
+  rewriteBackupTimerRuntime,
+  type TimerIo,
+} from '../../service/backup-timer.js';
+
+export type { SpawnRunner } from './node-runtime.js';
 
 export type UpgradeComponent = 'orchestrator' | 'agent';
 
@@ -84,6 +103,11 @@ export interface VersionedUpgradeOptions {
    * a version-manager shim. The check still prints what it found.
    */
   skipBinaryPathCheck?: boolean;
+  /**
+   * Move an npm-installed service to this Node.js executable: install the
+   * package with its npm, then register the service again to run it.
+   */
+  node?: string;
 }
 
 /**
@@ -94,13 +118,15 @@ export interface VersionedUpgradeOptions {
  * caller knows it. Throws when a `binaryPath` would stop the restarted service,
  * unless `skip` is set: then every finding is a warning. Then warns about each
  * container label set whose agent image stays behind `targetVersion`, the
- * release the service runs after the upgrade.
+ * release the service runs after the upgrade. `previousSpec` is the launch
+ * command a `--node` move replaces: a `binaryPath` naming its agent is warned.
  */
 async function checkScalersBeforeUpgrade(args: {
   component: UpgradeComponent;
   config: ServiceConfig;
   platform: ServicePlatform;
   spec: LaunchSpec | null;
+  previousSpec?: LaunchSpec | null;
   expectedVersion: string | null;
   targetVersion: string | null;
   willInstall: boolean;
@@ -119,6 +145,9 @@ async function checkScalersBeforeUpgrade(args: {
     expectedAgent,
     expectedVersion: expectedAgent ? args.expectedVersion : null,
     willInstall: args.willInstall && expectedAgent !== null,
+    previousAgent: args.previousSpec
+      ? agentBinaryFromLaunch(args.previousSpec, isWindows(args.platform))
+      : null,
     skip: args.skip,
     warn: (line) => console.warn(line),
   });
@@ -367,12 +396,18 @@ function assertWindowsLaunchReadsEnvFile(args: {
  * `install` rewrites it. A launch command naming a missing file was read back
  * wrong and is not registered: the service restarts as it was, with a warning.
  * systemd and launchd keep their unit.
+ *
+ * With `newRuntime` (a `--node` move), `spec` is the launch command on the new
+ * runtime, and every platform registers the service again from it, keeping
+ * the account it runs as. A launch command naming a missing file is refused
+ * then, before the service stops.
  */
 export async function restartOntoInstalledPackage(args: {
   manager: ServiceManager;
   config: ServiceConfig;
   platform: ServicePlatform;
   spec: LaunchSpec | null;
+  newRuntime?: boolean;
 }): Promise<void> {
   const { manager, config, platform, spec } = args;
   const component = config.component ?? 'orchestrator';
@@ -381,6 +416,10 @@ export async function restartOntoInstalledPackage(args: {
     read && fs.existsSync(read.executablePath) && fs.existsSync(launchedRelease(read))
       ? read
       : null;
+  if (args.newRuntime) {
+    await registerOntoNewRuntime({ manager, config, platform, spec, launch });
+    return;
+  }
   if (isWindows(platform) && launch) {
     assertWindowsLaunchReadsEnvFile({
       launch,
@@ -389,8 +428,7 @@ export async function restartOntoInstalledPackage(args: {
       config,
     });
   }
-  const status = await manager.status(config);
-  if (status.state === 'running') await manager.stop(config);
+  await stopIfRunning(manager, config);
   if (isWindows(platform)) {
     if (launch) {
       try {
@@ -411,6 +449,62 @@ export async function restartOntoInstalledPackage(args: {
     }
   }
   await manager.start(config);
+}
+
+/**
+ * The `--node` restart: stop, register the service again to launch `spec` on
+ * every platform, start. `launch` is `spec` when its files exist.
+ */
+async function registerOntoNewRuntime(args: {
+  manager: ServiceManager;
+  config: ServiceConfig;
+  platform: ServicePlatform;
+  spec: LaunchSpec | null;
+  launch: { executablePath: string; args: string[] } | null;
+}): Promise<void> {
+  const { manager, config, platform, spec, launch } = args;
+  const component = config.component ?? 'orchestrator';
+  if (!spec || !launch) {
+    throw new Error(
+      `refusing to register "${config.name}" on the new Node.js runtime: ` +
+        `${spec ? [spec.execPath, ...spec.args].join(' ') : 'its launch command'} names a file ` +
+        'that does not exist. The service was not changed.',
+    );
+  }
+  if (isWindows(platform)) {
+    assertWindowsLaunchReadsEnvFile({
+      launch,
+      release: launchedRelease(launch),
+      action: `register "${config.name}" on the new Node.js runtime`,
+      config,
+    });
+  }
+  const p = isWindows(platform) ? path.win32 : path.posix;
+  await stopIfRunning(manager, config);
+  try {
+    await manager.install({
+      ...config,
+      ...launch,
+      nodeBinDir: p.dirname(launch.executablePath),
+      ...(spec.user ? { user: spec.user } : {}),
+    });
+  } catch (err) {
+    throw new Error(
+      `could not register the service on the new Node.js runtime: ${toErrorMessage(err)}. ` +
+        `Run \`kici-admin ${component} install\` with ${launch.executablePath} for it.`,
+      { cause: err },
+    );
+  }
+  console.log(`Service registered again to run ${launch.executablePath}.`);
+  await manager.start(config);
+}
+
+/** Stop the service when it runs. True when it was running and is now stopped. */
+async function stopIfRunning(manager: ServiceManager, config: ServiceConfig): Promise<boolean> {
+  const status = await manager.status(config);
+  if (status.state !== 'running') return false;
+  await manager.stop(config);
+  return true;
 }
 
 function getLauncherName(component: UpgradeComponent, platform: ServicePlatform): string {
@@ -656,15 +750,47 @@ export function verifyNpmSourceLaunch(opts: {
 }
 
 export type NpmSourceUpgradeAction =
-  | { kind: 'restart-only'; verdict: NpmSourceLaunchVerdict }
-  | { kind: 'self-drive'; target: NpmInstallTarget; version: string }
+  | { kind: 'restart-only'; verdict: NpmSourceLaunchVerdict; move?: RuntimeMove }
+  | { kind: 'self-drive'; target: NpmInstallTarget; version: string; move?: RuntimeMove }
   | { kind: 'error'; reason: string };
+
+/**
+ * The `--node` move of a unit whose launch command resolves to a global npm
+ * install: the same package, launched by `node` from its own prefix.
+ */
+function planRuntimeMove(
+  spec: LaunchSpec,
+  current: NpmInstallTarget,
+  node: NodeRuntime,
+  windows: boolean,
+): RuntimeMove {
+  return {
+    from: spec,
+    to: reRootLaunch(spec, {
+      oldPrefix: current.globalPrefix,
+      newPrefix: node.globalPrefix,
+      nodeExecPath: node.nodeExecPath,
+      windows,
+    }),
+    oldPrefix: current.globalPrefix,
+    owningPackage: current.owningPackage,
+    packageJsonPath: installedPackageJsonPath(node.globalPrefix, current.owningPackage, windows),
+    node,
+  };
+}
+
+/** Why `--node` cannot move a unit whose launch command is not a global npm install. */
+const NODE_NEEDS_NPM_INSTALL =
+  '--node moves a service that runs from a global npm install, and this unit does not: its ' +
+  'launch target is a custom --binary install, an archive install, or a local node_modules ' +
+  'folder. An archive install takes its Node.js with the release.';
 
 /**
  * Decide how an npm-source upgrade proceeds. `restart-only` re-verifies and
  * restarts the installed package; the default self-drives, resolving the
- * global package and pinned node from the unit's launch spec. Operator-facing
- * refusals return an `error` action rather than throwing.
+ * global package and pinned node from the unit's launch spec. With `node`
+ * (`--node`), both target that runtime instead, and the action carries the
+ * move. Operator-facing refusals return an `error` action rather than throwing.
  */
 export function planNpmSourceUpgrade(opts: {
   component: UpgradeComponent;
@@ -674,19 +800,26 @@ export function planNpmSourceUpgrade(opts: {
   restartOnly: boolean;
   force: boolean;
   windows: boolean;
+  node?: NodeRuntime;
 }): NpmSourceUpgradeAction {
-  const { component, spec, invoked, requestedVersion, restartOnly, force, windows } = opts;
+  const { component, spec, invoked, requestedVersion, restartOnly, force, windows, node } = opts;
+
+  const current = spec ? resolveNpmInstallTarget(spec, component, { windows }) : null;
+  if (node && !current?.ok) return { kind: 'error', reason: NODE_NEEDS_NPM_INSTALL };
+  const move =
+    node && spec && current?.ok ? planRuntimeMove(spec, current.target, node, windows) : undefined;
 
   if (restartOnly) {
-    const launched = spec ? resolveVersionFromLaunchSpec(spec, component) : null;
+    const launch = move?.to ?? spec;
+    const launched = launch ? resolveVersionFromLaunchSpec(launch, component) : null;
     const verdict = verifyNpmSourceLaunch({
       component,
       invoked,
       launched,
-      launchedPath: spec?.execPath ?? null,
+      launchedPath: launch?.execPath ?? null,
       force,
     });
-    return { kind: 'restart-only', verdict };
+    return { kind: 'restart-only', verdict, ...(move ? { move } : {}) };
   }
 
   if (!requestedVersion) {
@@ -698,7 +831,7 @@ export function planNpmSourceUpgrade(opts: {
     };
   }
 
-  const resolution = spec ? resolveNpmInstallTarget(spec, component, { windows }) : null;
+  const resolution = current;
   if (resolution && !resolution.ok && resolution.reason === 'not-global') {
     return {
       kind: 'error',
@@ -720,15 +853,19 @@ export function planNpmSourceUpgrade(opts: {
         'package and re-run with --restart-only.',
     };
   }
+  if (move) {
+    // The new runtime's node runs its own npm-cli.js into its own prefix.
+    const target: NpmInstallTarget = {
+      nodeExecPath: move.node.nodeExecPath,
+      npmPath: move.node.npmPath,
+      owningPackage: move.owningPackage,
+      globalPrefix: move.node.globalPrefix,
+      npmInvocation: { cmd: move.node.nodeExecPath, preArgs: [move.node.npmCliPath] },
+    };
+    return { kind: 'self-drive', target, version: requestedVersion, move };
+  }
   return { kind: 'self-drive', target: resolution.target, version: requestedVersion };
 }
-
-/** Process runner for the npm calls; tests inject it. */
-export type SpawnRunner = (
-  cmd: string,
-  args: string[],
-  opts?: { env?: NodeJS.ProcessEnv },
-) => { status: number | null; stdout: string; stderr: string };
 
 /**
  * The cmd.exe command line for npm on Windows. npm is a batch file there, which
@@ -866,18 +1003,36 @@ export function installGlobalPackage(
   return { ok: res.status === 0, stderr: res.stderr };
 }
 
+interface PreStopArgs {
+  component: UpgradeComponent;
+  opts: VersionedUpgradeOptions;
+  hooks: UpgradeHooks;
+  resolvedInstance: ResolvedInstance;
+}
+
 /**
  * Take the pre-upgrade dump, quiesce the coordinator, and return the head the
  * CURRENT version runs at for the manifest. All of it runs while the service
  * is up: the dump needs a live database, the drain a live admin API, and the
  * head must come from the version about to be replaced.
  */
-async function runPreStopSafety(args: {
-  component: UpgradeComponent;
-  opts: VersionedUpgradeOptions;
-  hooks: UpgradeHooks;
-  resolvedInstance: ResolvedInstance;
-}): Promise<{ map: Record<string, string> | undefined }> {
+async function runPreStopSafety(
+  args: PreStopArgs,
+): Promise<{ map: Record<string, string> | undefined }> {
+  const heads = await runPreUpgradeDump(args);
+  await drainBeforeStop(args);
+  return heads;
+}
+
+/**
+ * The first half of {@link runPreStopSafety}: the head the current version
+ * runs at, then the dump. An npm-source upgrade runs it before `npm install`
+ * replaces the package the running service loads, so a refused dump leaves
+ * the install as it was.
+ */
+async function runPreUpgradeDump(
+  args: PreStopArgs,
+): Promise<{ map: Record<string, string> | undefined }> {
   const { component, opts, hooks, resolvedInstance } = args;
   const manifest = resolvedInstance.manifest;
 
@@ -915,6 +1070,18 @@ async function runPreStopSafety(args: {
       process.exit(1);
     }
   }
+  return { map };
+}
+
+/**
+ * The second half of {@link runPreStopSafety}: quiesce the coordinator. It
+ * runs just before the stop, so a step that fails after it cannot leave the
+ * running service drained for long.
+ */
+async function drainBeforeStop(args: PreStopArgs): Promise<void> {
+  const { component, opts, hooks } = args;
+  // An agent has no drain.
+  if (component !== 'orchestrator') return;
 
   // Drain is on by default.
   if (!opts.noDrain && hooks.drain) {
@@ -939,9 +1106,7 @@ async function runPreStopSafety(args: {
       console.log('');
     }
   }
-
   // The drain flag is in-memory, so the restarted process comes back accepting.
-  return { map };
 }
 
 /**
@@ -982,6 +1147,12 @@ export async function performVersionedUpgrade(
       process.exit(1);
     }
 
+    const nodeConflict = checkNodeFlagConflicts({ ...opts, platform });
+    if (nodeConflict) {
+      console.error(`Error: ${nodeConflict}`);
+      process.exit(1);
+    }
+
     if (opts.pick) {
       await handlePick(
         component,
@@ -1017,7 +1188,15 @@ export async function performVersionedUpgrade(
 
     if (!opts.from && !opts.url) {
       if (
-        await performNpmSourceUpgrade(component, config, resolvedInstance, manager, opts, platform)
+        await performNpmSourceUpgrade(
+          component,
+          config,
+          resolvedInstance,
+          manager,
+          opts,
+          platform,
+          hooks,
+        )
       ) {
         await runAfterStart(hooks);
       }
@@ -1114,11 +1293,7 @@ export async function performVersionedUpgrade(
     const preStopHeads = await runPreStopSafety({ component, opts, hooks, resolvedInstance });
 
     console.log('Stopping service...');
-    const status = await manager.status(config);
-    if (status.state === 'running') {
-      await manager.stop(config);
-      console.log('Service stopped.');
-    }
+    if (await stopIfRunning(manager, config)) console.log('Service stopped.');
 
     if (isWindows(platform)) {
       const launcherPath = path.join(versionedDirPath, getLauncherName(component, platform));
@@ -1190,6 +1365,7 @@ async function performNpmSourceUpgrade(
   manager: ServiceManager,
   opts: VersionedUpgradeOptions,
   platform: ServicePlatform,
+  hooks: UpgradeHooks,
 ): Promise<boolean> {
   const installed = await manager.isInstalled(config);
   if (!installed) {
@@ -1205,6 +1381,17 @@ async function performNpmSourceUpgrade(
     resolveNpmSourceVersion({ requested: opts.version, running: invoked });
   }
 
+  let node: NodeRuntime | undefined;
+  if (opts.node) {
+    const resolved = resolveNodeRuntime(opts.node, { windows: isWindows(platform) });
+    if (!resolved.ok) {
+      console.error(`Error: ${resolved.reason} The service was not changed.`);
+      process.exit(1);
+    }
+    for (const warning of resolved.warnings) console.warn(warning);
+    node = resolved;
+  }
+
   const action = planNpmSourceUpgrade({
     component,
     spec,
@@ -1213,6 +1400,7 @@ async function performNpmSourceUpgrade(
     restartOnly: opts.restartOnly ?? false,
     force: opts.force ?? false,
     windows: isWindows(platform),
+    node,
   });
 
   if (action.kind === 'error') {
@@ -1227,9 +1415,11 @@ async function performNpmSourceUpgrade(
       resolvedInstance,
       manager,
       verdict: action.verdict,
+      move: action.move,
       opts,
       platform,
       spec,
+      hooks,
     });
   }
 
@@ -1242,6 +1432,7 @@ async function performNpmSourceUpgrade(
     opts,
     platform,
     spec,
+    hooks,
   });
 }
 
@@ -1255,20 +1446,130 @@ export interface RestartOnlyArgs {
   platform: ServicePlatform;
   /** The launch command read from the registration before the upgrade. */
   spec: LaunchSpec | null;
+  /** Set by `--node`: the runtime the service moves to. */
+  move?: RuntimeMove;
+  /** The backup-timer seam a `--node` move rewrites through; tests inject it. */
+  timerIo?: TimerIo;
+  /**
+   * The orchestrator's pre-stop steps (dump, drain, migration head), run
+   * before the service stops as on the archive path. None for an agent.
+   */
+  hooks?: UpgradeHooks;
 }
 
-export interface SelfDriveArgs extends Omit<RestartOnlyArgs, 'verdict'> {
-  action: { target: NpmInstallTarget; version: string };
+export interface SelfDriveArgs extends Omit<RestartOnlyArgs, 'verdict' | 'move'> {
+  action: { target: NpmInstallTarget; version: string; move?: RuntimeMove };
   run?: SpawnRunner;
+}
+
+/**
+ * Refuse a `--node` move whose runtime the installed package does not accept
+ * in its `engines.node`. Runs after the install and before the restart, so the
+ * service still runs on its old runtime when it refuses.
+ */
+function assertRuntimeAcceptsPackage(move: RuntimeMove, config: ServiceConfig): void {
+  const verdict = checkInstalledEngines({
+    packageJsonPath: move.packageJsonPath,
+    nodeVersion: move.node.nodeVersion,
+    nodeExecPath: move.node.nodeExecPath,
+  });
+  if (!verdict.ok) {
+    throw new Error(
+      `refusing to move "${config.name}" to ${move.node.nodeExecPath}: ${verdict.reason} ` +
+        'The service was not changed.',
+    );
+  }
+  if (verdict.warning) console.warn(verdict.warning);
+}
+
+/** The confirmation line that names the runtime a `--node` move leaves and the one it takes. */
+function runtimeMoveLine(move: RuntimeMove, config: ServiceConfig): string {
+  return `register "${config.name}" again to run ${move.node.nodeExecPath} (Node.js ${move.node.nodeVersion}) instead of ${move.from.execPath}`;
+}
+
+/**
+ * Point the orchestrator's scheduled `db backup` at the runtime the service
+ * moved to: the node, and the CLI script re-rooted into the new prefix. No
+ * unit means nothing to do. Anything it cannot rewrite is a warning: the
+ * service already moved.
+ */
+function moveBackupTimer(args: {
+  component: UpgradeComponent;
+  config: ServiceConfig;
+  platform: ServicePlatform;
+  move: RuntimeMove;
+  io: TimerIo;
+}): void {
+  const { component, config, platform, move, io } = args;
+  if (component !== 'orchestrator' || (platform !== 'systemd' && platform !== 'launchd')) return;
+  const remedy =
+    'Run `kici-admin db backup --install-timer` with the kici-admin of the new runtime to ' +
+    'install it again.';
+  try {
+    const timer = readBackupTimer(platform, config.name, config.isUserLevel, io);
+    if (!timer) return;
+    const cliScriptPath = reRootPath(
+      timer.cliScriptPath,
+      move.oldPrefix,
+      move.node.globalPrefix,
+      false,
+    );
+    if (!cliScriptPath || !fs.existsSync(cliScriptPath)) {
+      console.warn(
+        `Warning: the scheduled backup of "${config.name}" runs ${timer.cliScriptPath}, which has ` +
+          `no copy under ${move.node.globalPrefix}, so it was not changed. ${remedy}`,
+      );
+      return;
+    }
+    const files = rewriteBackupTimerRuntime(
+      platform,
+      timer,
+      { nodeBinPath: move.node.nodeExecPath, cliScriptPath },
+      io,
+    );
+    console.log(`Scheduled backup moved to ${move.node.nodeExecPath}: ${files.join(', ')}`);
+  } catch (err) {
+    console.warn(
+      `Warning: the scheduled backup of "${config.name}" was not moved to the new runtime ` +
+        `(${toErrorMessage(err)}). ${remedy}`,
+    );
+  }
+}
+
+/**
+ * After a `--node` restart: the registration must launch the new node, else
+ * the move did not take; then the scheduled backup follows it.
+ */
+async function finishRuntimeMove(args: {
+  component: UpgradeComponent;
+  config: ServiceConfig;
+  platform: ServicePlatform;
+  manager: ServiceManager;
+  move: RuntimeMove;
+  timerIo?: TimerIo;
+  newSpec?: LaunchSpec | null;
+}): Promise<void> {
+  const { config, manager, move } = args;
+  const newSpec = args.newSpec === undefined ? await manager.readLaunchSpec(config) : args.newSpec;
+  if (newSpec?.execPath !== move.node.nodeExecPath) {
+    throw new Error(
+      `the service restarted, but the unit launches ${newSpec?.execPath ?? 'an unreadable command'}, ` +
+        `expected ${move.node.nodeExecPath}. The registration was not written again; run ` +
+        `\`kici-admin ${args.component} install\` with ${move.node.nodeExecPath}.`,
+    );
+  }
+  moveBackupTimer({ ...args, io: args.timerIo ?? defaultTimerIo });
 }
 
 /**
  * Restart-only path: the operator pre-installed the package. Verify the unit
  * launches the invoking CLI's version, restart onto it, persist the version.
+ * With `move` (`--node`), the package is the one under the new runtime, and
+ * the service is registered again to run it.
  * True once the service restarted; false when the operator cancelled.
  */
 export async function restartOnlyUpgrade(args: RestartOnlyArgs): Promise<boolean> {
-  const { config, resolvedInstance, manager, verdict, opts, platform, spec } = args;
+  const { config, resolvedInstance, manager, verdict, opts, platform, spec, move } = args;
   if (!verdict.ok) {
     console.error(`Error: ${verdict.reason}`);
     process.exit(1);
@@ -1278,16 +1579,21 @@ export async function restartOnlyUpgrade(args: RestartOnlyArgs): Promise<boolean
     component: args.component,
     config,
     platform,
-    spec,
+    spec: move?.to ?? spec,
+    previousSpec: move?.from,
     expectedVersion: null,
     targetVersion: verdict.version,
     willInstall: false,
     skip: opts.skipBinaryPathCheck ?? false,
   });
 
+  if (move) assertRuntimeAcceptsPackage(move, config);
+
   if (!opts.yes) {
     console.log(
-      `This will restart "${config.name}" onto the npm-installed version ${verdict.version}.`,
+      move
+        ? `This will ${runtimeMoveLine(move, config)}, onto the npm-installed version ${verdict.version}.`
+        : `This will restart "${config.name}" onto the npm-installed version ${verdict.version}.`,
     );
     console.log('  The service will be stopped briefly during the restart.');
     console.log('');
@@ -1298,13 +1604,39 @@ export async function restartOnlyUpgrade(args: RestartOnlyArgs): Promise<boolean
     }
   }
 
+  // Dump and quiesce BEFORE anything stops. The dump is named for the version
+  // the restart lands on, which `--restart-only` may leave out of `--version`.
+  const preStopHeads = await runPreStopSafety({
+    component: args.component,
+    opts: { ...opts, version: verdict.version },
+    hooks: args.hooks ?? {},
+    resolvedInstance,
+  });
+
   console.log('Restarting service onto the npm-installed package...');
-  await restartOntoInstalledPackage({ manager, config, platform, spec });
+  await restartOntoInstalledPackage({
+    manager,
+    config,
+    platform,
+    spec: move?.to ?? spec,
+    newRuntime: move !== undefined,
+  });
+  if (move) {
+    await finishRuntimeMove({
+      component: args.component,
+      config,
+      platform,
+      manager,
+      move,
+      timerIo: args.timerIo,
+    });
+  }
 
   if (verdict.manifestVersion !== null) {
     writeManifest(resolvedInstance.instanceDir, {
       ...resolvedInstance.manifest,
       kiciVersion: verdict.manifestVersion,
+      migrationHeads: preStopHeads.map,
     });
   } else {
     console.log('Note: manifest version left unchanged (verification was skipped via --force).');
@@ -1318,11 +1650,15 @@ export async function restartOnlyUpgrade(args: RestartOnlyArgs): Promise<boolean
 
 /**
  * Self-driving path: install under the unit's pinned node/npm, restart, verify the version.
+ * With `action.move` (`--node`), the install goes into the new runtime's prefix
+ * with its own npm, the engines check runs, and the service is registered
+ * again to run the new node.
  * True once the service restarted; false when the operator cancelled.
  */
 export async function performSelfDrivingInstall(args: SelfDriveArgs): Promise<boolean> {
   const { component, config, resolvedInstance, manager, action, opts, platform, spec } = args;
-  const { target, version } = action;
+  const { target, version, move } = action;
+  const runtimeNote = move ? '' : " (the unit's runtime)";
 
   // Before anything is installed: a bare-metal binaryPath that is missing or
   // a shim would stop the restarted service.
@@ -1330,7 +1666,8 @@ export async function performSelfDrivingInstall(args: SelfDriveArgs): Promise<bo
     component,
     config,
     platform,
-    spec,
+    spec: move?.to ?? spec,
+    previousSpec: move?.from,
     expectedVersion: `${target.owningPackage}@${version}`,
     targetVersion: version,
     willInstall: true,
@@ -1360,7 +1697,8 @@ export async function performSelfDrivingInstall(args: SelfDriveArgs): Promise<bo
   if (!opts.yes) {
     console.log(
       `This will install ${target.owningPackage}@${version} with ${target.nodeExecPath} into ` +
-        `${target.globalPrefix} (the unit's runtime), then restart "${config.name}".`,
+        `${target.globalPrefix}${runtimeNote}, then ` +
+        (move ? `${runtimeMoveLine(move, config)} and restart it.` : `restart "${config.name}".`),
     );
     console.log('');
     const ok = await confirm('Proceed with upgrade?');
@@ -1370,9 +1708,19 @@ export async function performSelfDrivingInstall(args: SelfDriveArgs): Promise<bo
     }
   }
 
+  // Dump BEFORE npm replaces the package the running service loads: a refused
+  // dump then leaves the install and the service as they were.
+  const preStop = {
+    component,
+    opts: { ...opts, version },
+    hooks: args.hooks ?? {},
+    resolvedInstance,
+  };
+  const preStopHeads = await runPreUpgradeDump(preStop);
+
   console.log(
     `Installing ${target.owningPackage}@${version} with ${target.nodeExecPath} into ` +
-      `${target.globalPrefix} (the unit's runtime)...`,
+      `${target.globalPrefix}${runtimeNote}...`,
   );
   const result = installGlobalPackage(target, version, args.run);
   if (!result.ok) {
@@ -1384,10 +1732,33 @@ export async function performSelfDrivingInstall(args: SelfDriveArgs): Promise<bo
     process.exit(1);
   }
 
+  // After the install, before the restart: the service still runs on its old runtime.
+  if (move) assertRuntimeAcceptsPackage(move, config);
+
+  // Quiesce just before the stop.
+  await drainBeforeStop(preStop);
+
   console.log('Restarting service onto the freshly-installed package...');
-  await restartOntoInstalledPackage({ manager, config, platform, spec });
+  await restartOntoInstalledPackage({
+    manager,
+    config,
+    platform,
+    spec: move?.to ?? spec,
+    newRuntime: move !== undefined,
+  });
 
   const newSpec = await manager.readLaunchSpec(config);
+  if (move) {
+    await finishRuntimeMove({
+      component,
+      config,
+      platform,
+      manager,
+      move,
+      newSpec,
+      timerIo: args.timerIo,
+    });
+  }
   const launched = newSpec ? resolveVersionFromLaunchSpec(newSpec, component) : null;
   if (launched !== version) {
     console.error(
@@ -1401,6 +1772,7 @@ export async function performSelfDrivingInstall(args: SelfDriveArgs): Promise<bo
   writeManifest(resolvedInstance.instanceDir, {
     ...resolvedInstance.manifest,
     kiciVersion: version,
+    migrationHeads: preStopHeads.map,
   });
   console.log(`Upgrade complete: service "${config.name}" is now running version ${version}.`);
   return true;
@@ -1608,11 +1980,7 @@ export async function switchToInstalledVersion(args: {
   }
 
   console.log('Stopping service...');
-  const status = await manager.status(config);
-  if (status.state === 'running') {
-    await manager.stop(config);
-    console.log('Service stopped.');
-  }
+  if (await stopIfRunning(manager, config)) console.log('Service stopped.');
 
   if (isWindows(platform)) {
     await reregisterWindowsService(manager, config, launcherPath);

@@ -9,7 +9,8 @@ import { planePaths, planePorts } from './paths.js';
 import { rotatePlaneLogIfOversized } from './plane-log.js';
 
 /** Podman fallback image. The container-pin tooling rewrites this pin in place. */
-export const PLANE_PG_IMAGE = 'docker.io/library/postgres:18.6-alpine';
+export const PLANE_PG_IMAGE =
+  'docker.io/library/postgres:18.6-alpine@sha256:83148c0bc09eac4d598b70a61e1404d0212b76c95c504bfd6c81a4c59ec91792';
 
 export const PLANE_PG_CONTAINER = 'kici-local-postgres';
 

@@ -44,6 +44,14 @@ import type {
   ServicePlatform,
 } from '../../service/index.js';
 import type { DiscoveredInstance } from '../../service/types.js';
+import { SystemdServiceManager } from '../../service/systemd.js';
+import { LaunchdServiceManager } from '../../service/launchd.js';
+import { serviceCommand as windowsServiceCommand } from '../../service/windows.js';
+import {
+  renderSystemdBackupService,
+  renderSystemdBackupTimer,
+  systemdUnitDir,
+} from '../../service/backup-timer.js';
 
 /** A bundle or an npm entry of a release that reads KICI_ENV_FILE. */
 const READS_ENV_FILE = 'import "@kici-dev/shared/load-service-env-file"; // KICI_ENV_FILE';
@@ -669,6 +677,30 @@ describe('switchToInstalledVersion — shared switch sequence', () => {
   });
 });
 
+/** A `.tar.gz` in `tmp` holding `orchestrator-0.9.0/` with the given launcher and bundle. */
+function releaseArchive(tmp: string, launcherName: string, bundle: string): string {
+  const src = path.join(tmp, 'src');
+  const release = path.join(src, 'orchestrator-0.9.0');
+  fs.mkdirSync(path.join(release, 'lib'), { recursive: true });
+  fs.writeFileSync(path.join(release, launcherName), '@echo off\r\n');
+  fs.writeFileSync(path.join(release, 'lib', `${launcherName.replace(/\.cmd$/, '')}.cjs`), bundle);
+  const out = path.join(tmp, 'orchestrator-0.9.0.tar.gz');
+  execSync(`tar -czf "${out}" -C "${src}" orchestrator-0.9.0`);
+  return out;
+}
+
+/** A system-level Windows orchestrator, as the archive-upgrade checks see it. */
+const WINDOWS_ORCH_CONFIG: ServiceConfig = {
+  name: 'kici-test',
+  ...SERVICE_TEXT.orchestrator,
+  executablePath: '',
+  envFilePath: 'C:\\ProgramData\\kici\\kici-test\\kici-test.env',
+  workingDirectory: 'C:\\ProgramData\\kici\\kici-test',
+  isUserLevel: false,
+  restartPolicy: { enabled: true, delays: [1], maxRetries: 1, windowSeconds: 1 },
+  component: 'orchestrator',
+};
+
 describe('extractRelease — the release an archive upgrade installs', () => {
   let tmp: string;
   beforeEach(() => {
@@ -676,31 +708,10 @@ describe('extractRelease — the release an archive upgrade installs', () => {
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-  /** A `.tar.gz` holding `orchestrator-0.9.0/` with the given launcher and bundle. */
-  function archive(launcherName: string, bundle: string): string {
-    const src = path.join(tmp, 'src');
-    const release = path.join(src, 'orchestrator-0.9.0');
-    fs.mkdirSync(path.join(release, 'lib'), { recursive: true });
-    fs.writeFileSync(path.join(release, launcherName), '@echo off\r\n');
-    fs.writeFileSync(
-      path.join(release, 'lib', `${launcherName.replace(/\.cmd$/, '')}.cjs`),
-      bundle,
-    );
-    const out = path.join(tmp, 'orchestrator-0.9.0.tar.gz');
-    execSync(`tar -czf "${out}" -C "${src}" orchestrator-0.9.0`);
-    return out;
-  }
+  const archive = (launcherName: string, bundle: string) =>
+    releaseArchive(tmp, launcherName, bundle);
 
-  const config: ServiceConfig = {
-    name: 'kici-test',
-    ...SERVICE_TEXT.orchestrator,
-    executablePath: '',
-    envFilePath: 'C:\\ProgramData\\kici\\kici-test\\kici-test.env',
-    workingDirectory: 'C:\\ProgramData\\kici\\kici-test',
-    isUserLevel: false,
-    restartPolicy: { enabled: true, delays: [1], maxRetries: 1, windowSeconds: 1 },
-    component: 'orchestrator',
-  };
+  const config = WINDOWS_ORCH_CONFIG;
 
   // fails-when: an archive upgrade accepts a release that cannot read
   // KICI_ENV_FILE and goes on to copy it and stop the service.
@@ -765,30 +776,10 @@ describe('installRelease — an archive upgrade with --force', () => {
   });
   afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-  function archive(launcherName: string, bundle: string): string {
-    const src = path.join(tmp, 'src');
-    const release = path.join(src, 'orchestrator-0.9.0');
-    fs.mkdirSync(path.join(release, 'lib'), { recursive: true });
-    fs.writeFileSync(path.join(release, launcherName), '@echo off\r\n');
-    fs.writeFileSync(
-      path.join(release, 'lib', `${launcherName.replace(/\.cmd$/, '')}.cjs`),
-      bundle,
-    );
-    const out = path.join(tmp, 'orchestrator-0.9.0.tar.gz');
-    execSync(`tar -czf "${out}" -C "${src}" orchestrator-0.9.0`);
-    return out;
-  }
+  const archive = (launcherName: string, bundle: string) =>
+    releaseArchive(tmp, launcherName, bundle);
 
-  const config: ServiceConfig = {
-    name: 'kici-test',
-    ...SERVICE_TEXT.orchestrator,
-    executablePath: '',
-    envFilePath: 'C:\\ProgramData\\kici\\kici-test\\kici-test.env',
-    workingDirectory: 'C:\\ProgramData\\kici\\kici-test',
-    isUserLevel: false,
-    restartPolicy: { enabled: true, delays: [1], maxRetries: 1, windowSeconds: 1 },
-    component: 'orchestrator',
-  };
+  const config = WINDOWS_ORCH_CONFIG;
 
   // fails-when: --force removes the existing version folder before the release
   // is checked, so a refused upgrade still deletes what the service may run.
@@ -1760,6 +1751,591 @@ describe('the bare-metal binaryPath check before an orchestrator upgrade', () =>
       } finally {
         warn.mockRestore();
       }
+    });
+  });
+});
+
+/**
+ * `--node <path>`: an npm-source upgrade that moves the service to another
+ * Node.js runtime. Every case runs on a real npm-style layout in a temp dir: an
+ * old prefix the unit runs from, and a new prefix with its own node and npm.
+ * The fake npm "installs" by writing the package into the prefix it was given.
+ */
+describe('--node moves an npm-installed service to another Node.js runtime', () => {
+  type Component = 'agent' | 'orchestrator';
+  let tmp: string;
+  let oldPrefix: string;
+  let newPrefix: string;
+  beforeEach(() => {
+    tmp = makeTempDir('kici-node-move-');
+    oldPrefix = path.join(tmp, 'old');
+    newPrefix = path.join(tmp, 'new');
+    for (const prefix of [oldPrefix, newPrefix]) {
+      fs.mkdirSync(path.join(prefix, 'bin'), { recursive: true });
+      fs.writeFileSync(path.join(prefix, 'bin', 'node'), '', { mode: 0o755 });
+      const npmCli = path.join(prefix, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+      fs.mkdirSync(path.dirname(npmCli), { recursive: true });
+      fs.writeFileSync(npmCli, '');
+    }
+  });
+  afterEach(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+  const adminDir = (prefix: string) => path.join(prefix, 'lib', 'node_modules', 'kici-admin');
+  const entryUnder = (prefix: string, component: Component = 'agent') =>
+    path.join(adminDir(prefix), 'node_modules', '@kici-dev', component, 'dist', 'server.js');
+
+  /** Write kici-admin@<version> with its nested component into `prefix`, as `npm install -g` does. */
+  function installPackage(
+    prefix: string,
+    version: string,
+    opts: { engines?: string; component?: Component } = {},
+  ): void {
+    const component = opts.component ?? 'agent';
+    const admin = adminDir(prefix);
+    const entry = entryUnder(prefix, component);
+    fs.mkdirSync(path.dirname(entry), { recursive: true });
+    fs.mkdirSync(path.join(admin, 'bin'), { recursive: true });
+    fs.writeFileSync(
+      path.join(admin, 'package.json'),
+      JSON.stringify({
+        name: 'kici-admin',
+        version,
+        engines: { node: opts.engines ?? '>=24.5.0' },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(path.dirname(path.dirname(entry)), 'package.json'),
+      JSON.stringify({ name: `@kici-dev/${component}`, version }),
+    );
+    fs.writeFileSync(entry, READS_ENV_FILE);
+    fs.writeFileSync(path.join(admin, 'bin', 'kici-admin.js'), '');
+    const bin = path.join(prefix, 'bin', 'kici-admin');
+    if (!fs.existsSync(bin)) fs.symlinkSync(path.join(admin, 'bin', 'kici-admin.js'), bin);
+  }
+
+  function fixture(
+    platform: ServicePlatform,
+    opts: { nodeVersion?: string; engines?: string; component?: Component } = {},
+  ) {
+    const component = opts.component ?? 'agent';
+    installPackage(oldPrefix, '0.26.0', { component });
+    const oldSpec: LaunchSpec = {
+      execPath: path.join(oldPrefix, 'bin', 'node'),
+      args: [entryUnder(oldPrefix, component)],
+      user: 'kici',
+    };
+    // The manager reads back whatever was last registered, as a real one does.
+    let registered: LaunchSpec = oldSpec;
+    const manager = makeManager([], platform);
+    manager.readLaunchSpec = vi.fn(async () => registered);
+    manager.install = vi.fn(async (c: ServiceConfig) => {
+      registered = { execPath: c.executablePath, args: c.args ?? [], user: c.user };
+    });
+    (manager.status as ReturnType<typeof vi.fn>).mockResolvedValue({ state: 'running' });
+    const name = component === 'agent' ? 'kici-agent-x' : 'kici-orch';
+    const envFilePath = path.join(tmp, 'svc.env');
+    fs.writeFileSync(envFilePath, 'KICI_LOG_LEVEL=info\n');
+    const manifest = makeManifest({ component, name, platform, envFilePath, configDir: tmp });
+    writeManifest(tmp, manifest);
+    const resolvedInstance = {
+      manifest,
+      manifestPath: path.join(tmp, `.kici-${component}.json`),
+      instanceDir: tmp,
+    };
+    const config: ServiceConfig = {
+      name,
+      ...SERVICE_TEXT[component],
+      executablePath: '',
+      envFilePath,
+      workingDirectory: tmp,
+      isUserLevel: false,
+      restartPolicy: { enabled: true, delays: [1], maxRetries: 1, windowSeconds: 1 },
+      component,
+      instanceDir: tmp,
+    };
+    const node = {
+      nodeExecPath: path.join(newPrefix, 'bin', 'node'),
+      nodeVersion: opts.nodeVersion ?? '24.22.1',
+      globalPrefix: newPrefix,
+      npmCliPath: path.join(newPrefix, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+      npmPath: path.join(newPrefix, 'bin', 'npm'),
+      warnings: [],
+    };
+    const plan = (restartOnly: boolean) =>
+      planNpmSourceUpgrade({
+        component,
+        spec: oldSpec,
+        invoked: '0.27.0',
+        requestedVersion: restartOnly ? undefined : '0.27.0',
+        restartOnly,
+        force: false,
+        windows: false,
+        node,
+      });
+    // `npm install -g` into the prefix it was handed; `npm view` answers the env-file check.
+    const run = vi.fn((_cmd: string, args: string[]) => {
+      if (args.includes('view')) {
+        return { status: 0, stdout: JSON.stringify({ './load-service-env-file': {} }), stderr: '' };
+      }
+      const prefix = args.find((a) => a.startsWith('--prefix='))!.slice('--prefix='.length);
+      installPackage(prefix, '0.27.0', { engines: opts.engines, component });
+      return { status: 0, stdout: '', stderr: '' };
+    });
+    const timerFiles: Record<string, string> = {};
+    const timerIo = {
+      mkdirp: vi.fn(),
+      writeFile: vi.fn(),
+      readFile: vi.fn((file: string): string => {
+        const content = timerFiles[file];
+        if (content === undefined) throw new Error(`ENOENT: ${file}`);
+        return content;
+      }),
+      removeFile: vi.fn(),
+      run: vi.fn(),
+    };
+    const selfDrive = () => {
+      const action = plan(false);
+      if (action.kind !== 'self-drive') throw new Error(`expected self-drive, got ${action.kind}`);
+      return {
+        component,
+        config,
+        resolvedInstance,
+        manager,
+        action,
+        opts: { yes: true },
+        platform,
+        spec: oldSpec,
+        run,
+        timerIo,
+      };
+    };
+    return {
+      manager,
+      oldSpec,
+      resolvedInstance,
+      config,
+      run,
+      node,
+      timerIo,
+      timerFiles,
+      plan,
+      selfDrive,
+    };
+  }
+
+  const manifestVersion = (component: Component = 'agent') =>
+    JSON.parse(fs.readFileSync(path.join(tmp, `.kici-${component}.json`), 'utf-8')).kiciVersion;
+
+  it('plans the install into the new prefix with its own node and npm-cli.js', () => {
+    const { selfDrive, node } = fixture('systemd');
+    const { action } = selfDrive();
+    expect(action.target).toMatchObject({
+      nodeExecPath: node.nodeExecPath,
+      globalPrefix: newPrefix,
+      owningPackage: 'kici-admin',
+      npmInvocation: { cmd: node.nodeExecPath, preArgs: [node.npmCliPath] },
+    });
+    expect(action.move?.to).toEqual({
+      execPath: node.nodeExecPath,
+      args: [entryUnder(newPrefix)],
+      user: 'kici',
+    });
+    expect(action.move?.oldPrefix).toBe(oldPrefix);
+  });
+
+  it('refuses --node for an opaque --binary launch', () => {
+    const { node } = fixture('systemd');
+    const action = planNpmSourceUpgrade({
+      component: 'agent',
+      spec: { execPath: '/opt/kici/agent', args: [] },
+      invoked: '0.27.0',
+      requestedVersion: '0.27.0',
+      restartOnly: false,
+      force: false,
+      windows: false,
+      node,
+    });
+    expect(action.kind).toBe('error');
+    if (action.kind === 'error') expect(action.reason).toMatch(/--node/);
+  });
+
+  it('restart-only with --node verifies the package already under the new runtime', () => {
+    const { plan, node } = fixture('systemd');
+    installPackage(newPrefix, '0.27.0');
+    const action = plan(true);
+    expect(action.kind).toBe('restart-only');
+    if (action.kind === 'restart-only') {
+      expect(action.verdict).toMatchObject({ ok: true, version: '0.27.0' });
+      expect(action.move?.to.execPath).toBe(node.nodeExecPath);
+    }
+  });
+
+  /** The registration a real renderer writes from the config `manager.install` got. */
+  function rendered(platform: ServicePlatform, config: ServiceConfig): string {
+    if (platform === 'systemd') return new SystemdServiceManager().generateUnitFile(config);
+    if (platform === 'launchd') return new LaunchdServiceManager().generatePlist(config);
+    return windowsServiceCommand(config).join(' ');
+  }
+
+  it.each<ServicePlatform>(['systemd', 'launchd', 'windows'])(
+    'self-drive with --node installs into the new prefix and re-registers onto it (%s)',
+    async (platform) => {
+      const { manager, run, node, selfDrive } = fixture(platform);
+      await performSelfDrivingInstall(selfDrive());
+      expect(run).toHaveBeenCalledWith(
+        node.nodeExecPath,
+        [node.npmCliPath, 'install', '-g', 'kici-admin@0.27.0', `--prefix=${newPrefix}`],
+        expect.anything(),
+      );
+      expect(manager.install).toHaveBeenCalledTimes(1);
+      const registeredConfig = (manager.install as ReturnType<typeof vi.fn>).mock
+        .calls[0]![0] as ServiceConfig;
+      expect(registeredConfig).toMatchObject({
+        executablePath: node.nodeExecPath,
+        args: [entryUnder(newPrefix)],
+        nodeBinDir: path.join(newPrefix, 'bin'),
+        user: 'kici',
+      });
+      const unit = rendered(platform, registeredConfig);
+      expect(unit).toContain(node.nodeExecPath);
+      expect(unit).toContain(entryUnder(newPrefix));
+      expect(unit).not.toContain(oldPrefix + path.sep);
+      if (platform === 'systemd') {
+        expect(unit).toContain(`ExecStart=${node.nodeExecPath} ${entryUnder(newPrefix)}`);
+        expect(unit).toContain(`Environment=PATH=${path.join(newPrefix, 'bin')}:`);
+        expect(unit).toContain('User=kici');
+      }
+      if (platform === 'launchd') {
+        expect(unit).toContain(`<string>${path.join(newPrefix, 'bin')}:`);
+        expect(unit).toContain('<key>UserName</key>');
+      }
+      expect(manager.stop).toHaveBeenCalledTimes(1);
+      expect(manager.start).toHaveBeenCalledTimes(1);
+      expect(manifestVersion()).toBe('0.27.0');
+      // The old runtime is left as it was.
+      const oldAdmin = path.join(adminDir(oldPrefix), 'package.json');
+      expect(JSON.parse(fs.readFileSync(oldAdmin, 'utf-8')).version).toBe('0.26.0');
+    },
+  );
+
+  // breaks-if-wrong for every refusal: the old registration stays untouched.
+  it('refuses a node below the installed package engines.node; the old registration is untouched', async () => {
+    const { manager, run, selfDrive } = fixture('systemd', { nodeVersion: '22.20.0' });
+    await expect(performSelfDrivingInstall(selfDrive())).rejects.toThrow(
+      /22\.20\.0.*>=24\.5\.0.*not changed/s,
+    );
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(manager.install).not.toHaveBeenCalled();
+    expect(manager.stop).not.toHaveBeenCalled();
+    expect(manager.restart).not.toHaveBeenCalled();
+    expect(manager.start).not.toHaveBeenCalled();
+    expect(manifestVersion()).toBe('0.1.13');
+  });
+
+  // breaks-if-wrong: a release whose engines.node the new runtime meets moves.
+  it('moves when the new node meets a stricter engines.node', async () => {
+    const { manager, selfDrive } = fixture('systemd', { engines: '>=24.22.0' });
+    await performSelfDrivingInstall(selfDrive());
+    expect(manager.install).toHaveBeenCalledTimes(1);
+  });
+
+  // fails-when: the unit still launches the old node; the version check alone
+  // would pass, because the package version is the same under both prefixes.
+  it('post-restart verification reads the new node from the launch spec', async () => {
+    const { manager, oldSpec, selfDrive } = fixture('systemd');
+    const args = selfDrive();
+    installPackage(oldPrefix, '0.27.0');
+    // A registration that did not take: the unit still names the old node.
+    manager.install = vi.fn().mockResolvedValue(undefined);
+    await expect(performSelfDrivingInstall(args)).rejects.toThrow(
+      `launches ${oldSpec.execPath}, expected ${path.join(newPrefix, 'bin', 'node')}`,
+    );
+    expect(manifestVersion()).toBe('0.1.13');
+  });
+
+  it('--node rewrites an installed backup unit with the new node and CLI script path', async () => {
+    const { oldSpec, config, node, timerIo, timerFiles, selfDrive } = fixture('systemd', {
+      component: 'orchestrator',
+    });
+    const timerConfig = {
+      serviceName: 'kici-orch',
+      schedule: 'daily',
+      outputDir: path.join(tmp, 'backups'),
+      keep: 7,
+      nodeBinPath: oldSpec.execPath,
+      cliScriptPath: path.join(oldPrefix, 'bin', 'kici-admin'),
+      envFilePath: config.envFilePath,
+      isUserLevel: false,
+      user: 'kici',
+    };
+    const unitDir = systemdUnitDir(false);
+    const servicePath = path.join(unitDir, 'kici-orch-db-backup.service');
+    timerFiles[servicePath] = renderSystemdBackupService(timerConfig);
+    timerFiles[path.join(unitDir, 'kici-orch-db-backup.timer')] =
+      renderSystemdBackupTimer(timerConfig);
+    await performSelfDrivingInstall(selfDrive());
+    expect(timerIo.writeFile).toHaveBeenCalledWith(
+      servicePath,
+      renderSystemdBackupService({
+        ...timerConfig,
+        nodeBinPath: node.nodeExecPath,
+        cliScriptPath: path.join(newPrefix, 'bin', 'kici-admin'),
+      }),
+    );
+    expect(timerIo.run).toHaveBeenCalledWith('systemctl', ['daemon-reload']);
+    expect(manifestVersion('orchestrator')).toBe('0.27.0');
+  });
+
+  it('a --node move with no backup unit installed writes no timer file', async () => {
+    const { timerIo, selfDrive } = fixture('systemd', { component: 'orchestrator' });
+    await performSelfDrivingInstall(selfDrive());
+    expect(timerIo.readFile).toHaveBeenCalled();
+    expect(timerIo.writeFile).not.toHaveBeenCalled();
+    expect(timerIo.run).not.toHaveBeenCalled();
+  });
+
+  it('--restart-only with --node re-registers onto the new runtime', async () => {
+    const { manager, oldSpec, resolvedInstance, config, node, timerIo, plan } = fixture('systemd');
+    installPackage(newPrefix, '0.27.0');
+    const action = plan(true);
+    if (action.kind !== 'restart-only') throw new Error('expected restart-only');
+    await restartOnlyUpgrade({
+      component: 'agent',
+      config,
+      resolvedInstance,
+      manager,
+      verdict: action.verdict,
+      move: action.move,
+      opts: { yes: true },
+      platform: 'systemd',
+      spec: oldSpec,
+      timerIo,
+    });
+    expect(manager.install).toHaveBeenCalledWith(
+      expect.objectContaining({ executablePath: node.nodeExecPath, args: [entryUnder(newPrefix)] }),
+    );
+    expect(manifestVersion()).toBe('0.27.0');
+  });
+
+  it('warns about a bare-metal binaryPath on the runtime the orchestrator leaves', async () => {
+    const { config, selfDrive } = fixture('systemd', { component: 'orchestrator' });
+    const scalers = path.join(tmp, 'scalers.yaml');
+    const oldAgent = path.join(oldPrefix, 'bin', 'kici-agent');
+    fs.writeFileSync(oldAgent, '', { mode: 0o755 });
+    const labelSets = [{ labels: ['linux', 'bare-metal'], binaryPath: oldAgent }];
+    const bm = { name: 'bm', type: 'bare-metal', maxAgents: 1, labelSets };
+    fs.writeFileSync(scalers, JSON.stringify({ version: 1, scalers: [bm] }));
+    fs.writeFileSync(config.envFilePath, `KICI_SCALER_CONFIG_PATH=${scalers}\n`);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      await performSelfDrivingInstall(selfDrive());
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining(`Set binaryPath to ${path.join(newPrefix, 'bin', 'kici-agent')}`),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  /**
+   * The pre-stop safety every orchestrator upgrade runs (dump, drain, the
+   * replaced version's migration head), on the npm-source paths. `order`
+   * records each hook and each manager call, so the test reads the sequence.
+   */
+  describe('the pre-upgrade dump and drain on an npm-source orchestrator upgrade', () => {
+    function recordingHooks(order: string[], opts: { backupFails?: boolean } = {}) {
+      return {
+        migrationStatus: vi.fn(async () => {
+          order.push('migrationStatus');
+          return { migrations: [{ name: '2026_10_01_head', status: 'applied' }] };
+        }),
+        backup: vi.fn(async (a: { outputPath: string; envFilePath: string }) => {
+          order.push('backup');
+          if (opts.backupFails) throw new Error('pg_dump: connection refused');
+          return { outputPath: a.outputPath, byteSize: 42 };
+        }),
+        drain: vi.fn(async () => {
+          order.push('drain');
+          return { quiesced: true, jobsRunning: 0 };
+        }),
+      };
+    }
+
+    function recordManager(manager: ServiceManager, order: string[]): void {
+      for (const verb of ['stop', 'start', 'install'] as const) {
+        const inner = manager[verb] as (c: ServiceConfig) => Promise<void>;
+        manager[verb] = vi.fn(async (c: ServiceConfig) => {
+          order.push(verb);
+          await inner(c);
+        });
+      }
+    }
+
+    const heads = () =>
+      JSON.parse(fs.readFileSync(path.join(tmp, '.kici-orchestrator.json'), 'utf-8'))
+        .migrationHeads as Record<string, string> | undefined;
+
+    // fails-when: the npm-source path restarts with no dump and no drain, as
+    // only the archive path called the pre-stop safety.
+    it.each([
+      ['a plain self-drive', false],
+      ['a --node move', true],
+    ])('%s dumps and drains before the service stops', async (_label, withNode) => {
+      const order: string[] = [];
+      const { manager, selfDrive, oldSpec, run } = fixture('systemd', {
+        component: 'orchestrator',
+      });
+      recordManager(manager, order);
+      const args = selfDrive();
+      const action = withNode
+        ? args.action
+        : {
+            target: {
+              nodeExecPath: oldSpec.execPath,
+              npmPath: path.join(oldPrefix, 'bin', 'npm'),
+              owningPackage: 'kici-admin',
+              globalPrefix: oldPrefix,
+              npmInvocation: {
+                cmd: oldSpec.execPath,
+                preArgs: [path.join(oldPrefix, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js')],
+              },
+            },
+            version: '0.27.0',
+          };
+      const hooks = recordingHooks(order);
+      const recordingRun = vi.fn((cmd: string, a: string[]) => {
+        order.push('npm');
+        return run(cmd, a);
+      });
+      await performSelfDrivingInstall({ ...args, action, hooks, run: recordingRun });
+      // The dump comes before npm replaces anything; the drain right before the stop.
+      expect(order.slice(0, 5)).toEqual(['migrationStatus', 'backup', 'npm', 'drain', 'stop']);
+      expect(hooks.backup.mock.calls[0]![0].outputPath).toMatch(
+        /pre-upgrade-0\.1\.13-0\.27\.0-.*\.dump$/,
+      );
+      // The replaced version's head is recorded for a later rollback check.
+      expect(heads()).toEqual({ '0.1.13': '2026_10_01_head' });
+    });
+
+    it('--restart-only of an orchestrator dumps and drains before the service stops', async () => {
+      const order: string[] = [];
+      const { manager, resolvedInstance, config, oldSpec, timerIo } = fixture('systemd', {
+        component: 'orchestrator',
+      });
+      recordManager(manager, order);
+      const hooks = recordingHooks(order);
+      await restartOnlyUpgrade({
+        component: 'orchestrator',
+        config,
+        resolvedInstance,
+        manager,
+        verdict: { ok: true, version: '0.26.0', manifestVersion: '0.26.0' },
+        opts: { yes: true },
+        platform: 'systemd',
+        spec: oldSpec,
+        timerIo,
+        hooks,
+      });
+      expect(order.slice(0, 4)).toEqual(['migrationStatus', 'backup', 'drain', 'stop']);
+      // fails-when: the dump is named from --version, which --restart-only
+      // leaves out, so it reads `-next-` instead of the version restarted onto.
+      expect(hooks.backup.mock.calls[0]![0].outputPath).toMatch(
+        /pre-upgrade-0\.1\.13-0\.26\.0-.*\.dump$/,
+      );
+      expect(heads()).toEqual({ '0.1.13': '2026_10_01_head' });
+    });
+
+    // fails-when: the drain moves before `npm install`, so a failed install
+    // exits with the running coordinator left draining and accepting no work.
+    it('a failed npm install after the dump leaves the coordinator undrained', async () => {
+      const order: string[] = [];
+      const { manager, selfDrive } = fixture('systemd', { component: 'orchestrator' });
+      recordManager(manager, order);
+      const hooks = recordingHooks(order);
+      const failingRun = vi.fn((_cmd: string, _a: string[]) => {
+        order.push('npm');
+        return { status: 1, stdout: '', stderr: 'npm error code E404' };
+      });
+      const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+        throw new Error(`process.exit(${code})`);
+      }) as never);
+      const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        await expect(
+          performSelfDrivingInstall({ ...selfDrive(), hooks, run: failingRun }),
+        ).rejects.toThrow('process.exit(1)');
+      } finally {
+        exit.mockRestore();
+        err.mockRestore();
+      }
+      expect(order).toEqual(['migrationStatus', 'backup', 'npm']);
+      expect(hooks.drain).not.toHaveBeenCalled();
+      expect(manager.stop).not.toHaveBeenCalled();
+      expect(manifestVersion('orchestrator')).toBe('0.1.13');
+    });
+
+    // breaks-if-wrong: a failed dump refuses before anything is touched, as on
+    // the archive path; the old registration stays.
+    it('a failed dump leaves the old registration untouched', async () => {
+      const order: string[] = [];
+      const { manager, selfDrive, run } = fixture('systemd', { component: 'orchestrator' });
+      recordManager(manager, order);
+      const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+        throw new Error(`process.exit(${code})`);
+      }) as never);
+      const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        await expect(
+          performSelfDrivingInstall({
+            ...selfDrive(),
+            hooks: recordingHooks(order, { backupFails: true }),
+          }),
+        ).rejects.toThrow('process.exit(1)');
+      } finally {
+        exit.mockRestore();
+        err.mockRestore();
+      }
+      expect(order).toEqual(['migrationStatus', 'backup']);
+      // Nothing was installed: neither into the new runtime nor in place.
+      expect(run).not.toHaveBeenCalled();
+      expect(manager.install).not.toHaveBeenCalled();
+      expect(manager.stop).not.toHaveBeenCalled();
+      expect(manager.start).not.toHaveBeenCalled();
+      expect(manifestVersion('orchestrator')).toBe('0.1.13');
+    });
+
+    it('--skip-backup and --no-drain opt out on the npm path as on the archive path', async () => {
+      const order: string[] = [];
+      const { manager, selfDrive } = fixture('systemd', { component: 'orchestrator' });
+      recordManager(manager, order);
+      const args = selfDrive();
+      const hooks = recordingHooks(order);
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+      try {
+        await performSelfDrivingInstall({
+          ...args,
+          opts: { yes: true, skipBackup: true, noDrain: true },
+          hooks,
+        });
+      } finally {
+        log.mockRestore();
+      }
+      expect(hooks.backup).not.toHaveBeenCalled();
+      expect(hooks.drain).not.toHaveBeenCalled();
+      expect(order[0]).toBe('migrationStatus');
+    });
+
+    // breaks-if-wrong: an agent has no database and no drain, as on the archive path.
+    it('an agent npm-source upgrade calls no pre-stop hook', async () => {
+      const order: string[] = [];
+      const { manager, selfDrive } = fixture('systemd');
+      recordManager(manager, order);
+      const hooks = recordingHooks(order);
+      await performSelfDrivingInstall({ ...selfDrive(), hooks });
+      expect(hooks.migrationStatus).not.toHaveBeenCalled();
+      expect(hooks.backup).not.toHaveBeenCalled();
+      expect(hooks.drain).not.toHaveBeenCalled();
+      expect(order[0]).toBe('stop');
     });
   });
 });

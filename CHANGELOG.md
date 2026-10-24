@@ -2,6 +2,16 @@
 
 Release notes for the public KiCI packages.
 
+## v0.27.0 — 2026-10-24
+
+### Features
+
+- `kici-admin orchestrator upgrade` and `kici-admin agent upgrade` accept `--node <path>`. It moves a service that runs from an npm install to another Node.js runtime: the command installs the package with that runtime's npm, registers the service again, and restarts it. Use it to move a service to Node.js 24.22.1.
+
+### Fixes
+
+- An npm-source `kici-admin orchestrator upgrade` (with `--version`, `--restart-only` or `--node`) now takes the pre-upgrade database dump and drains the coordinator before it stops the service, as an archive upgrade does. Before, it restarted the orchestrator with no dump and no drain. `--skip-backup`, `--backup-dir`, `--no-drain` and `--drain-timeout` apply as on an archive upgrade.
+
 ## v0.26.1 — 2026-10-22
 
 ### Fixes

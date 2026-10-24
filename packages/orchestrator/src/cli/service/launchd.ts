@@ -598,6 +598,8 @@ export class LaunchdServiceManager implements ServiceManager {
       this.unescapeXml(s[1]!),
     );
     if (strings.length === 0) return null;
-    return { execPath: strings[0]!, args: strings.slice(1) };
+    const userMatch = content.match(/<key>UserName<\/key>\s*<string>([\s\S]*?)<\/string>/);
+    const user = userMatch ? this.unescapeXml(userMatch[1]!) : undefined;
+    return { execPath: strings[0]!, args: strings.slice(1), ...(user ? { user } : {}) };
   }
 }

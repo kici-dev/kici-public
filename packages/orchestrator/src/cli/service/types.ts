@@ -97,6 +97,11 @@ export interface ServiceConfig {
 export interface LaunchSpec {
   execPath: string;
   args: string[];
+  /**
+   * The account a system-level unit runs as (systemd `User=`, launchd
+   * `UserName`), when it names one. A registration written again keeps it.
+   */
+  user?: string;
 }
 
 export type ServiceState = 'running' | 'stopped' | 'failed' | 'unknown';

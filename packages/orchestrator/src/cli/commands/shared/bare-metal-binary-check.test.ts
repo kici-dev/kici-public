@@ -15,7 +15,9 @@ import {
   preflightBareMetalBinaryPaths,
   scalerConfigLocation,
   SKIP_BINARY_PATH_CHECK_FLAG,
+  versionManagerPath,
   versionManagerPathKind,
+  VersionManagerPathType,
 } from './bare-metal-binary-check.js';
 
 let tmp: string;
@@ -338,5 +340,54 @@ describe('preflightBareMetalBinaryPaths', () => {
     expect(a.warn).toHaveBeenCalledWith(
       expect.stringContaining('binaryPath values were not checked'),
     );
+  });
+});
+
+describe('versionManagerPath — shim or alias', () => {
+  it.each([
+    ['/h/.local/share/mise/shims/node', VersionManagerPathType.Shim],
+    ['/h/.asdf/shims/node', VersionManagerPathType.Shim],
+    ['/h/.volta/bin/node', VersionManagerPathType.Shim],
+    ['/h/.nodenv/shims/node', VersionManagerPathType.Shim],
+    ['/h/.local/share/mise/installs/node/24/bin/node', VersionManagerPathType.Alias],
+    ['/h/.local/share/fnm/aliases/default/bin/node', VersionManagerPathType.Alias],
+    ['/h/.nvm/current/bin/node', VersionManagerPathType.Alias],
+    ['/run/user/1000/fnm_multishells/1_2/bin/node', VersionManagerPathType.Alias],
+  ])('classifies %s as %s', (p, type) => {
+    expect(versionManagerPath(p)?.type).toBe(type);
+  });
+
+  it('returns null for a fixed runtime path', () => {
+    expect(versionManagerPath('/opt/node-24.22.1/bin/node')).toBeNull();
+  });
+});
+
+describe('checkBinaryPath — moving the service to another Node.js runtime', () => {
+  // fails-when: a binaryPath on the runtime the service leaves passes silently,
+  // and every agent the scaler starts keeps the old Node.js.
+  it('warns about the kici-agent of the runtime the service leaves, naming the new path and the config', () => {
+    const oldRt = runtime('24.15.0', '0.27.0');
+    const newRt = runtime('24.22.1', '0.27.0');
+    const findings = checkBinaryPath({
+      ...base(oldRt.agent, newRt.agent),
+      willInstall: true,
+      previousAgent: oldRt.agent,
+    });
+    expect(findings.map((f) => f.issue)).toEqual([BinaryPathIssue.PreviousRuntime]);
+    expect(findings[0]!.message).toContain(`Set binaryPath to ${newRt.agent}`);
+    expect(findings[0]!.message).toContain('/etc/kici/scalers.yaml');
+  });
+
+  // breaks-if-wrong: a binaryPath already on the new runtime stays silent.
+  it('is silent when binaryPath already names the new runtime agent', () => {
+    const oldRt = runtime('24.15.0', '0.27.0');
+    const newRt = runtime('24.22.1', '0.27.0');
+    expect(
+      checkBinaryPath({
+        ...base(newRt.agent, newRt.agent),
+        willInstall: true,
+        previousAgent: oldRt.agent,
+      }),
+    ).toEqual([]);
   });
 });

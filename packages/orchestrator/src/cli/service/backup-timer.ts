@@ -375,3 +375,174 @@ export function uninstallBackupTimer(
   io.removeFile(plistPath);
   return { unitName: name, files: [plistPath] };
 }
+
+/**
+ * An installed backup timer, read back from its unit files. launchd keeps no
+ * env file path (install copies the database URL into the plist), so
+ * `envFilePath` is null there and `env` holds the copied variables.
+ */
+export interface InstalledBackupTimer extends Omit<BackupTimerConfig, 'envFilePath'> {
+  envFilePath: string | null;
+  /** The variables the launchd plist carries besides `PATH`. Empty on systemd. */
+  env: Record<string, string>;
+}
+
+/** Read the file, or null when it does not exist. */
+function readIfPresent(io: TimerIo, file: string): string | null {
+  try {
+    return io.readFile(file);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The node, CLI script and `db backup` flags of a backup command line, as
+ * {@link backupCommandArgs} lays it out. Throws on anything else: it was not
+ * written by `--install-timer`, and rewriting it would change what it runs.
+ */
+function parseBackupCommand(
+  argv: string[],
+  file: string,
+): Pick<BackupTimerConfig, 'nodeBinPath' | 'cliScriptPath' | 'outputDir' | 'keep'> {
+  const [nodeBinPath, cliScriptPath, db, backup, outFlag, outputDir, keepFlag, keep] = argv;
+  const shaped =
+    argv.length === 8 &&
+    db === 'db' &&
+    backup === 'backup' &&
+    outFlag === '--output-dir' &&
+    keepFlag === '--keep' &&
+    /^\d+$/.test(keep ?? '');
+  if (!shaped) {
+    throw new Error(
+      `${file}: the ExecStart is not a \`kici-admin db backup --output-dir <dir> --keep <n>\` command`,
+    );
+  }
+  return {
+    nodeBinPath: nodeBinPath!,
+    cliScriptPath: cliScriptPath!,
+    outputDir: outputDir!,
+    keep: Number(keep),
+  };
+}
+
+function readSystemdBackupTimer(
+  serviceName: string,
+  isUserLevel: boolean,
+  io: TimerIo,
+): InstalledBackupTimer | null {
+  const dir = systemdUnitDir(isUserLevel);
+  const name = backupTimerName(serviceName);
+  const servicePath = path.join(dir, `${name}.service`);
+  const service = readIfPresent(io, servicePath);
+  if (service === null) return null;
+  const timer = readIfPresent(io, path.join(dir, `${name}.timer`)) ?? '';
+  const value = (content: string, key: string) =>
+    content.match(new RegExp(`^${key}=(.+?)\\s*$`, 'm'))?.[1];
+  const exec = value(service, 'ExecStart');
+  if (!exec) throw new Error(`${servicePath}: the ExecStart is not a backup command`);
+  const user = value(service, 'User');
+  return {
+    serviceName,
+    schedule: value(timer, 'OnCalendar') ?? BACKUP_TIMER_DEFAULT_SCHEDULE,
+    ...parseBackupCommand(exec.split(/\s+/), servicePath),
+    envFilePath: value(service, 'EnvironmentFile') ?? null,
+    env: {},
+    isUserLevel,
+    ...(user ? { user } : {}),
+  };
+}
+
+function unescapeXml(s: string): string {
+  return s
+    .replace(/&quot;/g, '"')
+    .replace(/&gt;/g, '>')
+    .replace(/&lt;/g, '<')
+    .replace(/&amp;/g, '&');
+}
+
+function readLaunchdBackupTimer(
+  serviceName: string,
+  isUserLevel: boolean,
+  io: TimerIo,
+): InstalledBackupTimer | null {
+  const plistPath = launchdPlistPath(backupTimerName(serviceName), isUserLevel);
+  const plist = readIfPresent(io, plistPath);
+  if (plist === null) return null;
+  const strings = (block: string | undefined) =>
+    [...(block ?? '').matchAll(/<string>([\s\S]*?)<\/string>/g)].map((m) => unescapeXml(m[1]!));
+  const args = strings(
+    plist.match(/<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/)?.[1],
+  );
+  const integer = (key: string) =>
+    Number(plist.match(new RegExp(`<key>${key}</key>\\s*<integer>(\\d+)</integer>`))?.[1] ?? 0);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const env: Record<string, string> = {};
+  const envBlock = plist.match(/<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/)?.[1];
+  for (const m of (envBlock ?? '').matchAll(
+    /<key>([\s\S]*?)<\/key>\s*<string>([\s\S]*?)<\/string>/g,
+  )) {
+    const key = unescapeXml(m[1]!);
+    if (key !== 'PATH') env[key] = unescapeXml(m[2]!);
+  }
+  const user = plist.match(/<key>UserName<\/key>\s*<string>([\s\S]*?)<\/string>/)?.[1];
+  return {
+    serviceName,
+    schedule: `${pad(integer('Hour'))}:${pad(integer('Minute'))}`,
+    ...parseBackupCommand(args, plistPath),
+    envFilePath: null,
+    env,
+    isUserLevel,
+    ...(user ? { user: unescapeXml(user) } : {}),
+  };
+}
+
+/**
+ * Read the backup timer installed for `serviceName`: the inverse of
+ * {@link renderSystemdBackupService} / {@link renderSystemdBackupTimer} and of
+ * {@link renderLaunchdBackupPlist}. Null when none is installed, or on a
+ * platform that carries no timer.
+ */
+export function readBackupTimer(
+  platform: ServicePlatform,
+  serviceName: string,
+  isUserLevel: boolean,
+  io: TimerIo = defaultTimerIo,
+): InstalledBackupTimer | null {
+  if (platform === 'systemd') return readSystemdBackupTimer(serviceName, isUserLevel, io);
+  if (platform === 'launchd') return readLaunchdBackupTimer(serviceName, isUserLevel, io);
+  return null;
+}
+
+/**
+ * Point an installed backup timer at another Node.js runtime: the same
+ * schedule, retention, env and account, run by `runtime`. systemd rewrites
+ * the `.service` unit only; launchd rewrites the plist and loads it again.
+ * Returns the files written.
+ */
+export function rewriteBackupTimerRuntime(
+  platform: ServicePlatform,
+  timer: InstalledBackupTimer,
+  runtime: Pick<BackupTimerConfig, 'nodeBinPath' | 'cliScriptPath'>,
+  io: TimerIo = defaultTimerIo,
+): string[] {
+  const name = backupTimerName(timer.serviceName);
+  const config: BackupTimerConfig = { ...timer, envFilePath: timer.envFilePath ?? '', ...runtime };
+  if (platform === 'systemd') {
+    const servicePath = path.join(systemdUnitDir(timer.isUserLevel), `${name}.service`);
+    io.writeFile(servicePath, renderSystemdBackupService(config));
+    io.run('systemctl', systemctlArgs(timer.isUserLevel, ['daemon-reload']));
+    return [servicePath];
+  }
+  assertTimerPlatformSupported(platform, timer.outputDir, timer.keep);
+  const plistPath = launchdPlistPath(name, timer.isUserLevel);
+  io.writeFile(plistPath, renderLaunchdBackupPlist(config, timer.env));
+  const domain = timer.isUserLevel ? `gui/${os.userInfo().uid}` : 'system';
+  try {
+    io.run('launchctl', ['bootout', `${domain}/${LABEL_PREFIX}.${name}`]);
+  } catch {
+    // Not loaded: bootstrap loads it.
+  }
+  io.run('launchctl', ['bootstrap', domain, plistPath]);
+  return [plistPath];
+}

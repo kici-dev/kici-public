@@ -1476,6 +1476,22 @@ describe('launchd service manager', () => {
       });
     });
 
+    it('reads the UserName a system daemon runs as, from what generatePlist writes', async () => {
+      const system = makeConfig({
+        isUserLevel: false,
+        user: 'kici',
+        executablePath: '/n/bin/node',
+        args: ['/n/lib/node_modules/kici-admin/dist/server.js'],
+      });
+      const plist = manager.generatePlist(system);
+      mockedReadFileSync.mockReturnValueOnce(plist);
+      expect(await manager.readLaunchSpec(system)).toEqual({
+        execPath: '/n/bin/node',
+        args: ['/n/lib/node_modules/kici-admin/dist/server.js'],
+        user: 'kici',
+      });
+    });
+
     it('returns null when there is no ProgramArguments array', async () => {
       mockedReadFileSync.mockReturnValueOnce('<plist><dict></dict></plist>');
       expect(await manager.readLaunchSpec(config)).toBeNull();

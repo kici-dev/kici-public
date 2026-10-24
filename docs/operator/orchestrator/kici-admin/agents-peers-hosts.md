@@ -33,7 +33,7 @@ kici-admin agent stop [--platform <type>] [--instance-dir <path>] [--name <name>
 kici-admin agent restart [--platform <type>] [--instance-dir <path>] [--name <name>] [--system|--user-level]
 kici-admin agent status [--platform <type>] [--instance-dir <path>] [--name <name>] [--system|--user-level] [--json]
 kici-admin agent logs [--platform <type>] [--instance-dir <path>] [--name <name>] [--system|--user-level] [--since <duration>] [--level <level>] [--json] [--no-follow]
-kici-admin agent upgrade [--from <path>] [--url <url>] [--version <version>] [--cleanup] [--rollback] [--pick] [--restart-only] [--yes] [--force] [--platform <type>] [--instance-dir <path>] [--name <name>]
+kici-admin agent upgrade [--from <path>] [--url <url>] [--version <version>] [--cleanup] [--rollback] [--pick] [--restart-only] [--node <path>] [--yes] [--force] [--platform <type>] [--instance-dir <path>] [--name <name>]
 ```
 
 These commands manage the agent as a native system service. `--system` targets a system-level service (requires root) and `--user-level` a user-level one. The `install --wizard` flow walks through orchestrator URL, agent token, and labels configuration. Lifecycle targeting is folder-anchored — see [Service installation guide](../../distribution/service-installation.md) for platform-specific details and the full description of the manifest, the instance index, and the name-scoped on-disk layout.
@@ -329,20 +329,21 @@ Synopsis: `kici-admin agent upgrade [options]`
 
 **Options**
 
-| Option                  | Default | Description                                                                                                    |
-| ----------------------- | ------- | -------------------------------------------------------------------------------------------------------------- |
-| `--platform <type>`     |         | Force the service platform (systemd, launchd, windows, compose). Default: the platform in the install manifest |
-| `--instance-dir <path>` |         | Deploy folder of the instance to upgrade                                                                       |
-| `--name <name>`         |         | Service name (no default — must resolve via flag/CWD)                                                          |
-| `--from <path>`         |         | Path to package archive (.tar.gz or .zip)                                                                      |
-| `--url <url>`           |         | URL to download package archive from                                                                           |
-| `--version <version>`   |         | Target version string (e.g., 0.3.0)                                                                            |
-| `--yes`                 |         | Skip confirmation prompt                                                                                       |
-| `--force`               |         | Overwrite existing versioned directory                                                                         |
-| `--cleanup`             |         | Remove old versions (keeps current and previous)                                                               |
-| `--rollback`            |         | Roll back to the previous version                                                                              |
-| `--pick`                |         | Interactively pick an installed version to activate                                                            |
-| `--restart-only`        |         | Restart the already-installed package without installing (skip self-drive)                                     |
+| Option                  | Default | Description                                                                                                                 |
+| ----------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `--platform <type>`     |         | Force the service platform (systemd, launchd, windows, compose). Default: the platform in the install manifest              |
+| `--instance-dir <path>` |         | Deploy folder of the instance to upgrade                                                                                    |
+| `--name <name>`         |         | Service name (no default — must resolve via flag/CWD)                                                                       |
+| `--from <path>`         |         | Path to package archive (.tar.gz or .zip)                                                                                   |
+| `--url <url>`           |         | URL to download package archive from                                                                                        |
+| `--version <version>`   |         | Target version string (e.g., 0.3.0)                                                                                         |
+| `--yes`                 |         | Skip confirmation prompt                                                                                                    |
+| `--force`               |         | Overwrite existing versioned directory                                                                                      |
+| `--cleanup`             |         | Remove old versions (keeps current and previous)                                                                            |
+| `--rollback`            |         | Roll back to the previous version                                                                                           |
+| `--pick`                |         | Interactively pick an installed version to activate                                                                         |
+| `--restart-only`        |         | Restart the already-installed package without installing (skip self-drive)                                                  |
+| `--node <path>`         |         | Move an npm-installed service to this Node.js executable (installs the package with its npm, then re-registers the service) |
 
 ### `kici-admin host`
 
