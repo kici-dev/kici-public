@@ -69,6 +69,7 @@ import { HostStatus, type MatchedHost, type HostRosterStore } from '../agent/hos
 import { resolveSandboxGrant } from './resolve-sandbox-grant.js';
 import type { SandboxAllowList } from './sandbox-allowlist-reader.js';
 import { flattenLockSteps } from './flatten-lock-steps.js';
+import { checkoutJobConfigFields } from './checkout-job-config.js';
 import { storeWebhookPayload } from './webhook-payload-store.js';
 import type { Database, HeldRun } from '../db/types.js';
 import { jobsOfWorkflow } from '../reporting/execution-tracker.js';
@@ -3283,6 +3284,9 @@ function makeBuildJobConfig(args: {
       // it against `execution_jobs.git_credentials`. Without it `credential: 'x'`
       // throws and `default` silently falls back to the source credential.
       ...(lockJob.gitCredentials && { gitCredentials: lockJob.gitCredentials }),
+      // Read by the agent's clone: `checkout: false` skips it, `checkoutOptions`
+      // sets its depth and tags.
+      ...checkoutJobConfigFields(lockJob),
       // Absent ⇒ default hardened posture.
       ...(resolvedSandboxGrants.get(lockJob.name) && {
         sandboxGrant: resolvedSandboxGrants.get(lockJob.name),
@@ -5803,6 +5807,8 @@ async function buildGeneratedJobConfig(args: {
         jobEnv: genJob.env as Record<string, string>,
       }),
     ...(inheritedGitCredentials && { gitCredentials: inheritedGitCredentials }),
+    // Validated here: `genJob` is agent JSON and these keys reach the clone argv.
+    ...checkoutJobConfigFields(genJob),
     dynamicSource: {
       index: dynamicEntry.source.index,
       event,
@@ -5814,6 +5820,11 @@ async function buildGeneratedJobConfig(args: {
       }),
     },
     ...globalJobConfigFor(ctx),
+    // Baked in, as for static jobs: a needs-gated, held or coordinator-routed
+    // generated job re-dispatches through the base dispatcher, which skips the
+    // wrapper's extraJobConfig merge, so a test run's job would lose fullRepo
+    // and the overlay keys and clone an empty repoUrl.
+    ...ctx.extraJobConfig,
   };
   const genSel = runsOnSelectorsForLockJob(genJob);
   const pin = await resolveRosterAgentPin({

@@ -81,10 +81,11 @@ export async function restoreSource(
     const src = (await fsPromises.stat(extracted).catch(() => null))?.isDirectory()
       ? extracted
       : scratch;
-    // Every call path restores deps into `.kici/node_modules` BEFORE this, and
-    // the tarball omits it (`KICI_SOURCE_EXCLUDED_PREFIX`): dropping it would
-    // leave no `@kici-dev/sdk`, and the repairing inline install runs only when
-    // that restore failed.
+    // Every call path restores deps into `.kici/node_modules` before its last
+    // restore, and the tarball omits it (`KICI_SOURCE_EXCLUDED_PREFIX`): dropping
+    // it would leave no `@kici-dev/sdk`, and the repairing inline install runs
+    // only when that restore failed. A `checkout: false` job also restores once
+    // before deps, when there is no `node_modules` to keep yet.
     const installedDeps = path.join(kiciDir, 'node_modules');
     if (await fsPromises.stat(installedDeps).catch(() => null)) {
       await rename(installedDeps, path.join(src, 'node_modules'));

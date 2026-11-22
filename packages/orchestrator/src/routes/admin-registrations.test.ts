@@ -662,4 +662,118 @@ describe('admin registration routes', () => {
       expect(deps.registrationStore.replaceAll).toHaveBeenCalled();
     });
   });
+
+  describe('POST /registrations/register-manual with a routing-key-scoped token', () => {
+    const SCOPED = 'github:42';
+
+    /** A scoped app: the source of github:42 belongs to cust-1, its App is installed on owner/repo as 7. */
+    function scopedApp(over: Partial<AdminRegistrationRoutesDeps> = {}) {
+      deps = createMockDeps({
+        registrationStore: {
+          ...(createMockDeps().registrationStore as any),
+          replaceAll: vi.fn(),
+        },
+        resolveOrgId: vi.fn(async () => 'cust-1'),
+        resolveRepoInstallation: vi.fn(async () => 7),
+        contextStore: { matchContext: vi.fn(async () => null) } as any,
+        ...over,
+      });
+      app = createAdminRegistrationRoutes(deps);
+      (deps.tokenManager.validate as any).mockResolvedValue({
+        id: 'u',
+        role: 'admin',
+        label: 't',
+        routingKey: SCOPED,
+      });
+    }
+
+    const register = (body: Record<string, unknown>) =>
+      request(app, 'POST', '/registrations/register-manual', {
+        token: validToken,
+        body: {
+          lockFileContents: JSON.stringify({ workflows: [{ name: 'ci', jobs: [] }] }),
+          repoIdentifier: 'owner/repo',
+          routingKey: SCOPED,
+          customerId: 'cust-1',
+          ...body,
+        },
+      });
+
+    /** The provider context the store received. */
+    const storedContext = () => (deps.registrationStore.replaceAll as any).mock.calls[0][3];
+
+    it("refuses a customerId other than the org of the token's routing key", async () => {
+      scopedApp();
+      const res = await register({ customerId: 'cust-other' });
+      // fails-when: a scoped token places a registration in another org's lookups
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toContain('(cust-1)');
+      expect(deps.registrationStore.replaceAll).not.toHaveBeenCalled();
+      expect(deps.resolveOrgId).toHaveBeenCalledWith(SCOPED);
+      // fails-when: the foreign org's contexts are probed (their existence leaks) before the refusal
+      expect(deps.contextStore!.matchContext).not.toHaveBeenCalled();
+    });
+
+    it("refuses an installationId that is not the App's installation on the repository", async () => {
+      scopedApp();
+      const res = await register({ providerContext: { installationId: 999 } });
+      // fails-when: a scoped token picks another account's installation of its App
+      expect(res.status).toBe(403);
+      expect(deps.registrationStore.replaceAll).not.toHaveBeenCalled();
+      expect(deps.resolveRepoInstallation).toHaveBeenCalledWith(SCOPED, 'owner/repo');
+    });
+
+    it("stores the repository's installation, with or without the request naming it", async () => {
+      scopedApp();
+      // breaks-if-wrong: the scoped token still registers into its own org and installation
+      expect((await register({ providerContext: { note: 'x' } })).status).toBe(200);
+      expect(storedContext()).toEqual({ note: 'x', installationId: 7 });
+      expect((await register({ providerContext: { installationId: 7 } })).status).toBe(200);
+    });
+
+    it("refuses, naming the server's error, when the installation cannot be read", async () => {
+      scopedApp({
+        resolveRepoInstallation: vi.fn(async () => {
+          throw new Error("the App's server did not answer the installation lookup: 502");
+        }),
+      });
+      const res = await register({ providerContext: { installationId: 7 } });
+      // fails-when: a failed lookup stores the request's installation unchecked
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toContain('could not verify');
+      expect(deps.registrationStore.replaceAll).not.toHaveBeenCalled();
+    });
+
+    it('refuses a repository the App is not installed on', async () => {
+      scopedApp({ resolveRepoInstallation: vi.fn(async () => null) });
+      expect((await register({})).status).toBe(403);
+      expect(deps.registrationStore.replaceAll).not.toHaveBeenCalled();
+    });
+
+    it('stores the context as given for a source that is not a GitHub App', async () => {
+      scopedApp({ resolveRepoInstallation: vi.fn(async () => undefined) });
+      expect((await register({ providerContext: { a: 1 } })).status).toBe(200);
+      expect(storedContext()).toEqual({ a: 1 });
+    });
+
+    it('refuses when the orchestrator cannot verify a scoped registration', async () => {
+      scopedApp({ resolveOrgId: undefined, resolveRepoInstallation: undefined });
+      // fails-when: a missing check is read as a pass
+      expect((await register({})).status).toBe(403);
+      expect(deps.registrationStore.replaceAll).not.toHaveBeenCalled();
+    });
+
+    it('leaves an unscoped token free to name any org and context', async () => {
+      scopedApp();
+      (deps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'owner', label: 't' });
+      // breaks-if-wrong: the operator's own seeding keeps working unchanged
+      const res = await register({
+        customerId: 'cust-other',
+        providerContext: { installationId: 9 },
+      });
+      expect(res.status).toBe(200);
+      expect(storedContext()).toEqual({ installationId: 9 });
+      expect(deps.resolveOrgId).not.toHaveBeenCalled();
+    });
+  });
 });

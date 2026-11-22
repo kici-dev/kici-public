@@ -12,8 +12,9 @@ signal is explicit.
 ## Peer heartbeat is O(peers × agents)
 
 Every orchestrator peer broadcasts its full local agent inventory to every other peer on a fixed
-interval. The inventory is assembled by `getLocalInventory()` in `cluster/peer-client.ts` and sent as
-the `PeerHeartbeat` payload every `heartbeatIntervalMs` (default 30 seconds). With N peers each
+interval. The inventory is assembled by `getLocalInventory()` in `orchestrator-core.ts`, and
+`cluster/peer-client.ts` sends it as the `PeerHeartbeat` payload every `heartbeatIntervalMs` (default
+30 seconds). With N peers each
 advertising M agents, a single heartbeat round is O(N²) messages across the mesh and O(N × M) payload
 per broadcast.
 

@@ -1,5 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
-import { followRun, resolveAcceptanceTimeoutMs, type RunFollowClient } from './run-follow.js';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { AdminApiHttpError } from '@kici-dev/orchestrator';
+import {
+  followRun,
+  resolveAcceptanceTimeoutMs,
+  type FollowRunOptions,
+  type RunFollowClient,
+} from './run-follow.js';
 
 describe('resolveAcceptanceTimeoutMs', () => {
   const DEFAULT_MS = 120_000;
@@ -336,5 +344,226 @@ describe('followRun', () => {
       acceptanceTimeoutMs: -1, // already elapsed on the first poll
     });
     expect(outcome.status).toBe('cancelled');
+  });
+});
+
+/**
+ * A fake plane over real HTTP, so the follower's own AdminApiClient produces the
+ * errors (status, connection reset) the retry classifies: an injected client
+ * throwing hand-made errors would bypass that seam.
+ */
+interface FakePlane {
+  url: string;
+  headerRequests: () => number;
+  close: () => Promise<void>;
+}
+
+type FakePlaneHandler = (
+  path: string,
+  headerHit: number,
+  req: IncomingMessage,
+  res: ServerResponse,
+) => void;
+
+async function startFakePlane(runId: string, onHeader: FakePlaneHandler): Promise<FakePlane> {
+  let headerHits = 0;
+  const server = createServer((req, res) => {
+    const path = req.url ?? '';
+    if (path === `/api/v1/admin/runs/${runId}`) {
+      headerHits++;
+      onHeader(path, headerHits, req, res);
+      return;
+    }
+    if (path === `/api/v1/admin/runs/${runId}/jobs`) {
+      answer(res, 200, {
+        jobs: [{ jobId: 'j1', jobName: 'deploy', status: 'success', durationMs: 10 }],
+      });
+      return;
+    }
+    answer(res, 404, { error: `unexpected ${path}` });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `http://127.0.0.1:${port}`,
+    headerRequests: () => headerHits,
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+function answer(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { 'content-type': 'application/json' });
+  res.end(JSON.stringify(body));
+}
+
+const FAST_RETRY = { budgetMs: 5_000, baseDelayMs: 5, maxDelayMs: 20 };
+
+/** The first status read gets `first`; the follow retries it and ends in success. */
+async function expectRecovers(
+  first: (req: IncomingMessage, res: ServerResponse) => void,
+  follow: FollowRunOptions = {},
+): Promise<void> {
+  const plane = await startFakePlane('run-r', (_p, hit, req, res) =>
+    hit === 1 ? first(req, res) : answer(res, 200, { run: { status: 'success' } }),
+  );
+  try {
+    const outcome = await followRun(plane.url, 'tok', 'run-r', {
+      quiet: true,
+      pollIntervalMs: 1,
+      readRetry: FAST_RETRY,
+      ...follow,
+    });
+    expect(outcome.status).toBe('success');
+    expect(plane.headerRequests()).toBe(2);
+  } finally {
+    await plane.close();
+  }
+}
+
+describe('followRun against a plane whose status reads fail', () => {
+  // fails-when: one failed status read ends the follow (and the caller cancels a healthy run)
+  it('retries a 500 from the run status read and follows the run to completion', async () => {
+    await expectRecovers((_req, res) => answer(res, 500, { error: 'Internal server error' }));
+  });
+
+  // fails-when: a dropped connection is not retried
+  it('retries a connection the plane resets', async () => {
+    await expectRecovers((req) => req.socket.destroy());
+  });
+
+  // fails-when: a 200 whose body is cut off mid-read ends the follow instead of retrying
+  it('retries an answer the plane cuts off mid-body', async () => {
+    await expectRecovers((req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': '1000' });
+      res.write('{"run":');
+      setTimeout(() => req.socket.destroy(), 10);
+    });
+  });
+
+  // fails-when: a read the plane accepts and never answers hangs the follow
+  it('retries a status read the plane never answers once its deadline passes', async () => {
+    await expectRecovers(() => undefined, { readTimeoutMs: 100 });
+  });
+
+  // fails-when: Ctrl-C waits out a stalled read; the deadline here is the 30 s default
+  it('returns cancelled within moments of Ctrl-C during a stalled read', async () => {
+    const plane = await startFakePlane('run-c', () => undefined);
+    try {
+      const ctrlC = new AbortController();
+      setTimeout(() => ctrlC.abort(), 100);
+      const started = Date.now();
+      const outcome = await followRun(plane.url, 'tok', 'run-c', {
+        quiet: true,
+        pollIntervalMs: 1,
+        readRetry: FAST_RETRY,
+        signal: ctrlC.signal,
+      });
+      expect(outcome.status).toBe('cancelled');
+      expect(Date.now() - started).toBeLessThan(1_500);
+      expect(plane.headerRequests()).toBe(1);
+    } finally {
+      await plane.close();
+    }
+  });
+
+  // fails-when: a log read the plane never answers hangs the follow (logs are not retried)
+  it('bounds a log read by the deadline too', async () => {
+    const stalled = (signal?: AbortSignal) =>
+      new Promise((_resolve, reject) =>
+        signal?.addEventListener('abort', () => reject(new Error('no answer'))),
+      );
+    const get = vi.fn(async (path: string, opts?: { signal?: AbortSignal }) => {
+      if (path === '/api/v1/admin/runs/run-l') return { run: { status: 'success' } };
+      if (path.includes('includeSteps=true')) {
+        return {
+          jobs: [{ jobId: 'j1', jobName: 'b', status: 'success', steps: [{ stepIndex: 0 }] }],
+        };
+      }
+      if (path.includes('/steps/0/logs')) return stalled(opts?.signal);
+      return { jobs: [{ jobId: 'j1', jobName: 'b', status: 'success', durationMs: 1 }] };
+    });
+    const outcome = await followRun('http://127.0.0.1:4319', 'tok', 'run-l', {
+      client: { get: get as RunFollowClient['get'] },
+      onLine: () => undefined,
+      pollIntervalMs: 1,
+      readTimeoutMs: 50,
+    });
+    expect(outcome.status).toBe('success');
+  });
+
+  // fails-when: a plane that keeps failing is retried forever, or the error hides the run's state
+  it('fails with the last error and the last seen status once the plane keeps failing', async () => {
+    const plane = await startFakePlane('run-down', (_p, hit, _req, res) =>
+      hit === 1
+        ? answer(res, 200, { run: { status: 'running' } })
+        : answer(res, 500, { error: 'Internal server error' }),
+    );
+    try {
+      const err = (await followRun(plane.url, 'tok', 'run-down', {
+        quiet: true,
+        pollIntervalMs: 1,
+        acceptanceTimeoutMs: 60_000,
+        readRetry: { budgetMs: 60, baseDelayMs: 5, maxDelayMs: 10 },
+        hintLogPath: '/tmp/plane.log',
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      )) as Error;
+      expect(err).toBeInstanceOf(Error);
+      expect(err.message).toContain('run-down');
+      expect(err.message).toContain('HTTP 500: Internal server error');
+      expect(err.message).toContain('last seen as "running"');
+      expect(err.message).toContain('/tmp/plane.log');
+      expect(plane.headerRequests()).toBeGreaterThan(2);
+    } finally {
+      await plane.close();
+    }
+  });
+
+  // breaks-if-wrong: a run the plane does not know fails at once instead of waiting out the budget
+  it('fails at once on a 404', async () => {
+    const plane = await startFakePlane('run-gone', (_p, _hit, _req, res) =>
+      answer(res, 404, { error: 'Run not found' }),
+    );
+    try {
+      const started = Date.now();
+      await expect(
+        followRun(plane.url, 'tok', 'run-gone', {
+          quiet: true,
+          pollIntervalMs: 1,
+          readRetry: { budgetMs: 60_000, baseDelayMs: 1_000 },
+        }),
+      ).rejects.toThrow('HTTP 404: Run not found');
+      expect(plane.headerRequests()).toBe(1);
+      expect(Date.now() - started).toBeLessThan(1_000);
+    } finally {
+      await plane.close();
+    }
+  });
+
+  // fails-when: the jobs read behind the terminal check is not retried
+  it('retries a failed jobs read at the terminal check', async () => {
+    let jobsHits = 0;
+    const get = vi.fn(async (path: string) => {
+      if (path === '/api/v1/admin/runs/run-j') return { run: { status: 'success' } };
+      if (path === '/api/v1/admin/runs/run-j/jobs') {
+        jobsHits++;
+        if (jobsHits === 1) throw new AdminApiHttpError(503, 'Service unavailable');
+        return { jobs: [{ jobId: 'j1', jobName: 'build', status: 'success', durationMs: 1 }] };
+      }
+      throw new Error(`unexpected path ${path}`);
+    });
+    const outcome = await followRun('http://127.0.0.1:4319', 'tok', 'run-j', {
+      client: { get: get as RunFollowClient['get'] },
+      quiet: true,
+      pollIntervalMs: 1,
+      readRetry: FAST_RETRY,
+    });
+    expect(outcome.status).toBe('success');
+    expect(jobsHits).toBe(2);
   });
 });

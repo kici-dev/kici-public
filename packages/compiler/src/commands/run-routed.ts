@@ -267,9 +267,12 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
         )
       ).every(Boolean);
     const abandonRun = abandon;
-    removeSignalHandlers = cancelOnSignal(async () => {
-      await abandonRun();
-      await finalize();
+    const interrupt = new AbortController();
+    let interrupted: Promise<void> | undefined;
+    removeSignalHandlers = cancelOnSignal(() => {
+      interrupt.abort();
+      interrupted = abandonRun().then(() => finalize());
+      return interrupted;
     });
 
     const outcomes = await Promise.all(
@@ -279,10 +282,16 @@ async function runRouted(options: RunRoutedOptions & { event: string }): Promise
           quiet,
           onLine: (line) => process.stdout.write(prefix + line + '\n'),
           hintLogPath: planeLogPath(),
+          signal: interrupt.signal,
         });
         return { run, outcome };
       }),
     );
+    // Ctrl-C ended the follow; the signal handler cancels the runs, then exits.
+    if (interrupted) {
+      await interrupted;
+      return false;
+    }
     abandon = undefined;
 
     // fails-when: the command passes on the first run while a later workflow failed

@@ -22,7 +22,7 @@ kici-admin cold-store peek-chunk <chunkId> --table <table> --tenant <rk> --parti
 
 Inspects and operates the orchestrator-side cold-storage archival. Every subcommand talks **directly** to the orchestrator Postgres + the same S3 bucket the running process uses — there is no HTTP path because each verb is a break-glass inspection of bytes that don't belong to the running process. Pass `--database-url` or set `KICI_DATABASE_URL`.
 
-- `archive-now <table>` runs one archive cycle synchronously for a single registered adapter.
+- `archive-now <table>` runs one archive cycle synchronously for a single registered adapter. It exits 2 when any row fails to archive; those rows stay in Postgres, and the log names each failed chunk and its error.
 - `dry-run-archive <table>` shows what would be archived without writing to S3 or PG. `--tenant` scopes to a single routing key; `--from` / `--to` bound the partition column.
 - `list-chunks <table>` lists archived chunks (one JSON object per line). `--missing-data` / `--missing-manifest` filter to chunks whose data file or manifest is gone from object storage.
 - `verify-chunk <chunkId>` recomputes the gzipped `contentHash` and compares to the manifest. Exit 1 on mismatch, 0 on match.
@@ -131,7 +131,7 @@ Operator-facing read access to the orchestrator's `access_log` table — every r
 
 Output includes actor (type + id + optional metadata), action, source, outcome, target (if any), request ID, and timestamps.
 
-`list --agent-only` keeps only agent-attributed rows, and `--agent-label <label>` filters by an exact agent label. `show --org <orgId>` names the tenant to scan in cold storage when the row is archived. A row moves to cold storage after 30, 180 or 365 days, depending on its action. Without it, `show` scans only the synthetic `__orchestrator__` tenant, so it cannot find an archived row that carries an org id.
+`list --agent-only` keeps only agent-attributed rows, and `--agent-label <label>` filters by an exact agent label. `show --org <orgId>` names the tenant to scan in cold storage when the row is archived. A row moves to cold storage after 30, 180 or 365 days, depending on its action, its outcome and its actor type. Without it, `show` scans only the synthetic `__orchestrator__` tenant, so it cannot find an archived row that carries an org id.
 
 ### event-log -- inbound webhook delivery log
 
@@ -179,7 +179,7 @@ The **Workflow lock compile schema** row compares each enabled workflow registra
 kici-admin debug-bundle [-o <path>] [--log-dir <path>] [--log-window <hours>]
 ```
 
-Generates a ZIP bundle containing sanitized diagnostics, config (redacted), system info, cluster health, Prometheus metrics, and recent log files. Default output filename: `kici-debug-<ISO-timestamp>.zip`.
+Generates a ZIP bundle containing sanitized diagnostics, config (redacted), cluster health, Prometheus metrics, and recent log files. Default output filename: `kici-debug-<ISO-timestamp>.zip`.
 
 - `--log-dir` defaults to `$KICI_LOG_DIR`. When set, every `*.log` file in that directory newer than the window is added under `logs/` in the ZIP along with a `logs/summary.json`. Run the command from the same environment as the orchestrator (same unit / container / env file) so `$KICI_LOG_DIR` resolves to the right path automatically.
 - `--log-window` controls how many hours of rotated files to include (default 4). Total log payload is capped at 50 MB — excess files are dropped, most recent first.
@@ -194,7 +194,7 @@ kici-admin debug-bundle --fleet [-o <path>] [--log-window <hours>]
 kici-admin debug-bundle --fleet --list [--json]
 ```
 
-Plain `debug-bundle` assembles a bundle for the single orchestrator the CLI talks to. Add `--fleet` to collect logs and diagnostics from **every node in the cluster** — the orchestrator you hit, every coordinator-mesh peer, every worker, and every connected agent — in one pass. The orchestrator drives the collection over the existing authenticated WebSocket channels and streams a single nested ZIP back; the CLI writes it to `-o`. No SSH into each host required, and it works on any topology (a single-node deployment collapses to just `local/` + `agents/`).
+Plain `debug-bundle` assembles a bundle for the single orchestrator the CLI talks to. Add `--fleet` to collect logs and diagnostics from **every node in the cluster** — the orchestrator you hit, every coordinator-mesh peer, every worker, and every connected agent — in one pass. The orchestrator drives the collection over the existing authenticated WebSocket channels and streams a single nested ZIP back; the CLI writes it to `-o`. No SSH into each host required, and it works on any topology (a single-node deployment collapses to `local/` + `agents/` only).
 
 The bundle is a tree of self-contained ZIPs, one per node:
 

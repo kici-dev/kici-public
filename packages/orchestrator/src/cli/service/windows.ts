@@ -18,7 +18,7 @@ import type {
   LaunchSpec,
 } from './types.js';
 import { ensureDep } from '../lazy-deps/downloader.js';
-import { getDepMetadata } from '../lazy-deps/registry.js';
+import { getDepMetadata } from '@kici-dev/shared/lazy-deps';
 import { getCacheDir } from './platform-detect.js';
 import { shutdownGraceSeconds, stopWaitSeconds } from './shutdown-grace.js';
 import { restrictEnvFileAccess } from './windows-acl.js';

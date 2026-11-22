@@ -1,6 +1,5 @@
 /**
- * Agent-side SSH helper for bootstrap bring-up, with the same discipline as
- * `infra/prod/hw/ssh.sh` and the deploy-prod `runOnBox` helper: the bring-up
+ * Agent-side SSH helper for bootstrap bring-up: the bring-up
  * private key is piped into an **ephemeral ssh-agent** (`ssh-add -` reads
  * stdin) that is torn down in a `finally`, so the key never lands on disk or in
  * a long-lived process environment, and lives only for one `ssh` / `scp`

@@ -60,6 +60,21 @@ describe('StaticAgentTokenStore', () => {
     expect(revoked).toBe(false);
   });
 
+  it('revokeEphemeralForAgent revokes only that agent’s ephemeral tokens', async () => {
+    const store = new StaticAgentTokenStore();
+    const failed = await store.createEphemeral('agent-failed', ['linux'], 60_000);
+    const other = await store.createEphemeral('agent-ok', ['linux'], 60_000);
+    const { token: staticToken } = await store.createStatic({ createdBy: 'agent-failed' });
+
+    // fails-when: nothing is revoked, so the failed spawn's token still validates
+    expect(await store.revokeEphemeralForAgent('agent-failed')).toBe(1);
+    expect(await store.validate(failed)).toBeNull();
+    // breaks-if-wrong: another agent's token and a static token stay valid
+    expect(await store.validate(other)).not.toBeNull();
+    expect(await store.validate(staticToken)).not.toBeNull();
+    expect(await store.revokeEphemeralForAgent('agent-failed')).toBe(0);
+  });
+
   it('each generated token is unique', async () => {
     const store = new StaticAgentTokenStore();
     const tokens = new Set<string>();

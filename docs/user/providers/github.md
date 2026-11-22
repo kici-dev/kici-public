@@ -321,6 +321,217 @@ webhook delivery": KiCI adds **no** ingress at this URL and does **not** receive
 events there — your own infrastructure is responsible for accepting GitHub's
 deliveries and routing them onward.
 
+## GitHub Enterprise Server
+
+A GitHub App can live on a GitHub Enterprise Server instead of github.com. Give
+the server's web URL with `--github-url` when you add the source. The
+orchestrator stores the server with the source and sends every call for that
+App to it. The routing key stays `github:<appId>`, and runs, check runs and
+clones work as they do on github.com. The dashboard links the
+commits, branches, pull requests and workflow files of these runs to the server,
+not to github.com.
+
+### Add an App on the server
+
+The one-click setup creates the App on the server:
+
+```bash
+kici-admin --url http://<orchestrator-host>:4000 --token $KICI_BOOTSTRAP_ADMIN_TOKEN \
+  source add github --manifest --name my-org --github-org my-org \
+  --github-url https://ghe.example.com
+```
+
+The browser opens the server's App creation page,
+`https://ghe.example.com/organizations/my-org/settings/apps/new` (or
+`https://ghe.example.com/settings/apps/new` without `--github-org`). With
+`--no-browser`, the page you open names the server (`Create the App on
+ghe.example.com`), and it sends the manifest only when you click **Continue**.
+kici-admin then exchanges the setup code at the server's API, stores the
+server with the source, and prints the server's install page:
+
+```
+→ Install the App on your repos: https://ghe.example.com/github-apps/my-org/installations/new
+```
+
+kici-admin itself connects to the server in this flow. Run it on a host that
+reaches the server and trusts its certificate (see
+[Trust a private CA](#trust-a-private-ca)).
+
+For an App that you created on the server by hand, add `--github-url` to the
+manual command:
+
+```bash
+kici-admin --url http://<orchestrator-host>:4000 --token $KICI_BOOTSTRAP_ADMIN_TOKEN \
+  source add github --name my-org --app-id 12 \
+  --private-key @/path/to/private-key.pem \
+  --webhook-secret <secret> \
+  --github-url https://ghe.example.com
+```
+
+The orchestrator checks the App at the server before it stores the source.
+Without `--github-url`, it checks the App at api.github.com, and the command
+fails with `GitHub API validation failed`.
+
+`--github-url` takes the server's `https://` web URL, with no path. A port is
+kept, and one trailing slash is removed. The value can have at most 128
+characters. kici-admin refuses `api.github.com` and `www.github.com` with a
+hint (use `https://github.com`), and refuses a GHE.com host (see
+[Limits](#limits)).
+
+`kici-admin source list` prints the server under the source:
+
+```
+GitHub sources:
+  github:12            my-org                         (github)  org: <orgId>
+    server: https://ghe.example.com
+```
+
+With `--json`, the source's `githubUrl` holds the server. A github.com source
+has no `server:` line and no `githubUrl`. The orchestrator stores the server
+apart from the source's `config`. It ignores a `githubUrl` key in the
+`config`, and `source list` does not show one.
+
+To move a source to another server, run
+`kici-admin source update github:<appId> --github-url <url>`. The orchestrator
+checks the App at the new server first, and keeps the old server when that
+check fails. `--github-url https://github.com` moves the source back to
+github.com. A token scoped to the source with `--routing-key` cannot change the
+server: the command is refused with `403`.
+
+The orchestrator does not load a source whose stored server is not an
+`https://` GitHub web URL. It logs an error that names the routing key, and
+refuses the source's App credentials. The dashboard shows the source's
+registered workflows with no link. To repair the source, run
+`kici-admin source update github:<appId> --github-url <url>`.
+
+### What connects to the server
+
+- **The orchestrator** calls the server's REST API at `<url>/api/v3`. It
+  checks the App, mints installation tokens, reads the lock file, and creates
+  and updates check runs. `source refresh` and `source redeliver` read the App,
+  its installations and its webhook deliveries there. A token that a workflow
+  mints from its own GitHub App credential
+  (`ctx.kici.git.github.getToken`) comes from the server of the run's source.
+- **Agents** clone over HTTPS from `<url>/<owner>/<repo>.git`, with an
+  installation token.
+- **Your browser** opens the App creation page and the install page,
+  `<url>/github-apps/<slug>/installations/new`.
+
+### Webhook delivery
+
+The server must reach the webhook URL of the App:
+
+- In `platform` and `hybrid` mode, the server sends events to the hosted
+  Platform, `https://<platform-host>/webhook/<orgId>/github`. Let the server
+  connect out to that host over HTTPS.
+- In `observed` and `independent` mode, the server sends events to the
+  orchestrator's own ingress, `<KICI_WEBHOOK_PUBLIC_URL>/webhook/<orgId>/github`.
+  See [Direct GitHub ingress](../../operator/orchestrator/github-ingress.md).
+
+### Trust a private CA
+
+When a private CA signs the server's certificate, make each component that
+connects to the server trust that CA.
+
+**The orchestrator** and **kici-admin**: set `NODE_EXTRA_CA_CERTS` to the path
+of the CA's PEM file. Node.js adds it to its built-in roots. Node.js reads the
+variable only when the process starts, so restart the orchestrator after you
+set it. An installed orchestrator reads its environment from its env file,
+`<config-dir>/<service-name>.env` (`kici-admin orchestrator status` prints the
+path).
+
+**Agents** clone with git, which reads `GIT_SSL_CAINFO`. That variable
+**replaces** git's CA bundle; it does not add to it. Point it at a bundle that
+holds the public roots and your private CA, or clones from github.com and other
+public hosts fail. For example, on a Debian or Ubuntu host:
+
+```bash
+cat /etc/ssl/certs/ca-certificates.crt ghe-ca.pem > /etc/kici/ca-bundle.pem
+```
+
+Set the variable in the scaler label set's `env`, and mount the bundle into
+container agents read-only:
+
+```yaml
+scalers:
+  - name: container-default
+    type: container
+    labelSets:
+      - labels: [linux, container]
+        image: quay.io/kici-dev/kici-agent:<version>
+        env:
+          GIT_SSL_CAINFO: /etc/kici/ca-bundle.pem
+        volumes:
+          - /etc/kici/ca-bundle.pem:/etc/kici/ca-bundle.pem:ro
+```
+
+A bare-metal agent reads the file from its host, so it needs only the `env`
+entry. The bare-metal scaler also gives each agent it starts the TLS trust
+settings set on the orchestrator.
+
+Jobs receive the TLS trust settings that the agent has: `GIT_SSL_CAINFO`,
+`GIT_SSL_CAPATH`, `SSL_CERT_FILE`, `SSL_CERT_DIR` and `NODE_EXTRA_CA_CERTS`. A
+step that clones from the server therefore trusts the same CA. For steps that
+call the server with Node.js, also add `NODE_EXTRA_CA_CERTS` to the label
+set's `env`.
+
+These settings are paths on the agent host. A job that runs in its own image
+(`container:`) gets them in one of two ways:
+
+- **On the container scaler**, the job's image runs as the agent. It receives
+  the label set's `env` and `volumes` as given. Mount the bundle through
+  `volumes` at the path that `env` names, as in the example above.
+- **On an agent that starts the job in a container of its own**, such as a
+  bare-metal agent, the agent mounts each file or directory read-only under
+  `/run/kici/trust/` and points the setting at that mount. The image keeps its
+  own CA store, such as `/etc/ssl/certs`. Each path must be a regular file on
+  the agent host, or a directory for `SSL_CERT_DIR` and `GIT_SSL_CAPATH`.
+  Otherwise the job does not receive the setting, and the image's own CA
+  bundle stays in use.
+
+A job that sets one of these variables in its own `env` keeps its value, and
+the agent mounts nothing for it.
+
+**Network policy**: container and Firecracker agents cannot reach private
+address ranges by default. When the server has a private address, add its range
+to the label set's `networkPolicy.allowlist`. See
+[Network policy](../../operator/orchestrator/auto-scaler/common-config.md#network-policy).
+
+### Approvals from server users
+
+User ids are numbered per server, so KiCI keeps the users of each server in a
+separate identity namespace, `github:<host>` (for example
+`github:ghe.example.com`). A user of the server never matches an identity that
+is linked on github.com, even when the numeric ids are equal. A `/kici approve`
+or `/kici reject` comment from a server user therefore does not act on a hold
+through a github.com identity.
+
+Release or reject the hold from the dashboard, or with `kici approve` /
+`kici reject`. On an `independent` orchestrator, which keeps its own approval
+directory, you can register a server user as an approver:
+
+```bash
+kici-admin trust-policy directory-set --org __default__ --user-id <kici-user-id> \
+  --provider github:ghe.example.com \
+  --provider-username <login> --provider-user-id <numeric-user-id> \
+  --ci-trust write
+```
+
+`--provider` is `github:` followed by the server's host, with its port when
+the URL names one. Comments from that user then act on holds like a linked
+github.com user's comments do.
+
+### Limits
+
+- **One source per App id.** An orchestrator holds one source for each numeric
+  App id, whatever server the App lives on. App ids are numbered per server, so
+  an App on the server can have the same id as an App on github.com. Two such
+  Apps cannot both be sources in one organization: put the second one on
+  another orchestrator, in another organization.
+- **GHE.com is not supported.** kici-admin refuses a `*.ghe.com` URL, because
+  GHE.com does not serve its API at `<url>/api/v3`.
+- **`--github-url` length.** The URL can have at most 128 characters.
+
 ## Global workflows
 
 A GitHub App source opts in to org-wide global workflows using the
@@ -525,7 +736,9 @@ If the delivery is there, the commenter needs a linked GitHub identity and
 `ci_trust:write` (see
 [Identity linking](../../operator/security/security.md#identity-linking)). A
 comment acts only on security holds; release a reviewer hold from the
-dashboard or with `kici approve`.
+dashboard or with `kici approve`. A comment from a GitHub Enterprise Server
+user is matched only in that server's identity namespace; see
+[Approvals from server users](#approvals-from-server-users).
 
 ## See also
 

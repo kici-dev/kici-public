@@ -3,7 +3,7 @@ title: Role-based access control (RBAC)
 description: Permission model, custom roles, enforcement, and member lifecycle
 ---
 
-KiCI uses an in-house RBAC system for all authorization decisions. The OIDC issuer handles authentication only (login, user creation, email invites). All permission data lives in the KiCI database, giving operators full control over access policies without external dependencies.
+KiCI uses an in-house RBAC system for all authorization decisions. The OIDC issuer handles authentication only (login and user creation); KiCI sends invitation emails itself. All permission data lives in the KiCI database, giving operators full control over access policies without external dependencies.
 
 ## Overview
 
@@ -108,7 +108,7 @@ be refused.
 
 The widened rule applies only to a run whose two repositories genuinely differ.
 An ordinary run records no separate workflow repository, so it is matched on its
-own repository exactly as before, and a member scoped to neither repository is
+own repository alone, and a member scoped to neither repository is
 refused in every case.
 
 **Secrets are NOT repo-scoped.** Scoped secrets are keyed by context /
@@ -277,12 +277,12 @@ The dashboard API authenticates callers via OIDC and resolves the calling user's
 
 Several different credentials reach `/api/v1/*`, and each one resolves to a `userId` on the request context. The context records **which** credential it was:
 
-| Kind              | Credential                                              | Set by                                            |
-| ----------------- | ------------------------------------------------------- | ------------------------------------------------- |
-| `jwt`             | An OIDC browser session — a JWT or an opaque OIDC token | Signing in to the dashboard                       |
-| `pat`             | A `kici_pat_` personal access token                     | `kici login`, `kici pat create`, or the dashboard |
-| `org_key`         | A `kici_sk_` organization API key                       | Dashboard → Settings → API keys                   |
-| `service_account` | A `kici_sa_` service account key                        | Dashboard → Settings → Service accounts           |
+| Kind              | Credential                          | Set by                                            |
+| ----------------- | ----------------------------------- | ------------------------------------------------- |
+| `jwt`             | An OIDC browser session — a JWT     | Signing in to the dashboard                       |
+| `pat`             | A `kici_pat_` personal access token | `kici login`, `kici pat create`, or the dashboard |
+| `org_key`         | A `kici_sk_` organization API key   | Dashboard → Settings → API keys                   |
+| `service_account` | A `kici_sa_` service account key    | Dashboard → Settings → Service accounts           |
 
 Permissions answer "may this user do this". The kind answers a different question: "may this credential do it at all". A route may accept a subset of the kinds, and a request whose kind is absent is **denied**. So an authentication path that sets a user without recording its credential fails closed, and adding a credential type cannot silently widen a restricted route.
 
@@ -294,12 +294,13 @@ These routes accept `jwt` only, and answer **403** with `This endpoint requires 
 | --------------------------------- | --------------------------------------------------------- |
 | `POST /cli/exchange-token`        | Exchanges the browser session for a personal access token |
 | `POST /orgs`                      | Creates an organization, with the caller as its Owner     |
+| `POST /invites/token-preview`     | Looks up the invitation an emailed link names             |
 | `POST /invites/:inviteId/accept`  | Joins an organization                                     |
 | `POST /invites/:inviteId/decline` | Declines an invitation                                    |
 | `DELETE /identity-links/:id`      | Unlinks a provider identity from the account              |
 | `POST /auth/github/link`          | Starts a GitHub account link                              |
 
-Each one either mints a credential wider than the credential presenting it, or changes which organizations and provider identities the account reaches. An organization API key and a service account key are bound to one organization and one permission matrix. If either could call these routes, it could exchange itself for an unscoped cross-organization user token, or add its own user to a second organization. That is access the key was never granted. An interactive login is the only credential whose holder is the person the change belongs to.
+Each one either mints a credential wider than the credential presenting it, or changes which organizations and provider identities the account reaches. An organization API key and a service account key are bound to one organization and one permission matrix. If either could call these routes, it could exchange itself for an unscoped cross-organization user token, or add its own user to a second organization. That is access the key was never granted. An interactive login is the only credential whose holder is the person the change belongs to. `POST /invites/token-preview` changes nothing, but it answers only for the signed-in person's own verified email address, which a machine credential does not stand for.
 
 Reads that list what the caller already reaches — `GET /orgs`, `GET /invites/pending`, `GET /identity-links` — stay open to every kind.
 

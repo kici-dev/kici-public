@@ -8,7 +8,11 @@
  * container path: a second implementation would be two subtly different clones.
  */
 
-import { mkdir } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { cp, mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
+import { makeTempDir } from '@kici-dev/core/tmp';
+import type { LockCheckoutOptions } from '@kici-dev/engine';
 import { gitClone, type GitAuth } from './git-clone.js';
 
 /** The clone-relevant slice of a job execution request. */
@@ -22,6 +26,10 @@ export interface CloneJobReposRequest {
   workflowRef?: string | undefined;
   workflowSha?: string | undefined;
   checkout?: boolean | undefined;
+  /** Clone depth and tag policy for the job's repo; unset clones at depth 1 with git's default tags. */
+  checkoutOptions?: LockCheckoutOptions | undefined;
+  /** The orchestrator dispatched a cached `.kici/` source tarball. */
+  sourceCached?: boolean | undefined;
   fullRepo?: boolean | undefined;
   credentialHelperPath?: string | undefined;
 }
@@ -42,16 +50,68 @@ export interface CloneJobReposDeps {
 }
 
 /**
- * Clone whatever this job needs: nothing (full-repo overlay), a global
- * dual-clone, or the ordinary single-repo clone.
+ * A `checkout: false` job gets no clone, but the runner still loads its workflow
+ * from `.kici/`. Nothing is fetched when the tree is already there (in-place,
+ * host checkout), when the overlay provides it (full-repo), or when the
+ * orchestrator dispatched the cached source. Otherwise only `.kici/` is copied
+ * out of a throwaway depth-1 clone of the repo that carries it.
+ */
+async function prepareWithoutCheckout(
+  request: CloneJobReposRequest,
+  dirs: CloneJobReposDirs,
+  deps: CloneJobReposDeps,
+): Promise<void> {
+  await mkdir(dirs.workDir, { recursive: true });
+  if (request.fullRepo || existsSync(join(dirs.workflowDir, '.kici'))) return;
+  if (request.sourceCached) {
+    deps.log(
+      'checkout: false — skipping the clone; .kici/ restores from the cached workflow source',
+    );
+    return;
+  }
+
+  const workflowRepo = deps.isGlobal
+    ? {
+        repoUrl: request.workflowRepoUrl!,
+        ref: request.workflowRef ?? '',
+        sha: request.workflowSha ?? '',
+        gitAuth: request.workflowAuth ?? request.sourceAuth,
+      }
+    : { repoUrl: request.repoUrl, ref: request.ref, sha: request.sha, gitAuth: request.sourceAuth };
+  const tmp = await makeTempDir('src');
+  try {
+    const cloneDir = join(tmp.path, 'repo');
+    await gitClone({ ...workflowRepo, workDir: cloneDir, depth: 1 });
+    await mkdir(dirs.workflowDir, { recursive: true });
+    await cp(join(cloneDir, '.kici'), join(dirs.workflowDir, '.kici'), { recursive: true });
+  } finally {
+    await tmp.cleanup().catch(() => {});
+  }
+  deps.log(
+    'checkout: false — this orchestrator caches no workflow source, so only .kici/ was fetched',
+  );
+}
+
+/**
+ * Clone whatever this job needs: nothing (full-repo overlay), at most `.kici/`
+ * (`checkout: false`), a global dual-clone, or the ordinary single-repo clone.
+ * The job's checkout options set the depth and tags of the job's own repo: the
+ * single repo, or a global workflow's source repo.
  */
 export async function cloneJobRepos(
   request: CloneJobReposRequest,
   dirs: CloneJobReposDirs,
   deps: CloneJobReposDeps,
 ): Promise<void> {
-  if (request.checkout === false) return;
+  if (request.checkout === false) {
+    await prepareWithoutCheckout(request, dirs, deps);
+    return;
+  }
 
+  const jobCheckout = {
+    depth: request.checkoutOptions?.fetchDepth ?? 1,
+    fetchTags: request.checkoutOptions?.fetchTags,
+  };
   const helper = request.credentialHelperPath
     ? { credentialHelperPath: request.credentialHelperPath }
     : {};
@@ -95,6 +155,7 @@ export async function cloneJobRepos(
       sha: request.sha,
       workDir: dirs.sourceDir,
       gitAuth: sourceAuth,
+      ...jobCheckout,
       ...helper,
     });
     deps.log('Dual-clone complete');
@@ -108,6 +169,7 @@ export async function cloneJobRepos(
     sha: request.sha,
     workDir: dirs.workDir,
     gitAuth: request.sourceAuth,
+    ...jobCheckout,
     ...helper,
   });
   await deps.excludeScratchFromGit(dirs.workDir);

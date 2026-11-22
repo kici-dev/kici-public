@@ -203,10 +203,11 @@ describe('explicit fields over the ambient request context', () => {
 });
 
 describe('file rotation transport', () => {
-  it('adds file rotation transport when KICI_LOG_DIR is set', () => {
+  it('adds file rotation transport when KICI_LOG_DIR is set', async () => {
+    const tmp = await makeTempDir('rotate-test');
     const origLogDir = process.env.KICI_LOG_DIR;
     try {
-      process.env.KICI_LOG_DIR = '/tmp/test-logs';
+      process.env.KICI_LOG_DIR = tmp.path;
       setServiceName('platform');
 
       const logger = createLogger({ json: true });
@@ -221,6 +222,9 @@ describe('file rotation transport', () => {
       // reads it. Delete instead of assigning when the original was unset.
       if (origLogDir === undefined) delete process.env.KICI_LOG_DIR;
       else process.env.KICI_LOG_DIR = origLogDir;
+      // Close the file stream before its directory goes.
+      await flushLogFiles();
+      await tmp.cleanup();
     }
   });
 
@@ -240,10 +244,11 @@ describe('file rotation transport', () => {
     }
   });
 
-  it('defers file transport when KICI_LOG_DIR is set but service name is not', () => {
+  it('defers file transport when KICI_LOG_DIR is set but service name is not', async () => {
+    const tmp = await makeTempDir('rotate-test');
     const origLogDir = process.env.KICI_LOG_DIR;
     try {
-      process.env.KICI_LOG_DIR = '/tmp/test-logs';
+      process.env.KICI_LOG_DIR = tmp.path;
       (setServiceName as (name: string | undefined) => void)(undefined as unknown as string);
 
       const logger = createLogger({ json: true });
@@ -257,6 +262,8 @@ describe('file rotation transport', () => {
     } finally {
       if (origLogDir === undefined) delete process.env.KICI_LOG_DIR;
       else process.env.KICI_LOG_DIR = origLogDir;
+      await flushLogFiles();
+      await tmp.cleanup();
     }
   });
 });

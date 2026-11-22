@@ -2,16 +2,18 @@ import { describe, it, expect } from 'vitest';
 import { checkScalerProvisioning, SCALER_FAILURE_WINDOW_MS } from './scaler.js';
 import { DIAGNOSE_TABLE_MESSAGE_WIDTH } from '../../cli/commands/diagnose.js';
 import type { DiagnosticDeps } from '../types.js';
-import type { ScalerManager } from '../../scaler/manager.js';
+import type { ProvisionBackoffStatus, ScalerManager } from '../../scaler/manager.js';
 import type { BackendFailureSummary } from '../../scaler/failure-tracker.js';
 
 function makeDeps(
   backends: Array<{ name: string; type: string; retiring?: boolean; activeCount?: number }>,
   failures: Record<string, BackendFailureSummary>,
+  backoffs: Record<string, ProvisionBackoffStatus> = {},
 ): DiagnosticDeps {
   const fake = {
     getStatus: () => ({ backends }),
     recentSpawnFailures: () => new Map(Object.entries(failures)),
+    provisionBackoffStatus: () => new Map(Object.entries(backoffs)),
   } as unknown as ScalerManager;
   return { config: {}, scalerManager: fake };
 }
@@ -86,6 +88,81 @@ describe('checkScalerProvisioning', () => {
       unboundCount: 1,
       lastError: 'spawn ENOENT',
     });
+  });
+});
+
+describe('checkScalerProvisioning backoff', () => {
+  it('warns for a scaler still backing off after its failures left the window', async () => {
+    const results = await checkScalerProvisioning(
+      makeDeps(
+        [{ name: 'container-1', type: 'container' }],
+        {},
+        { 'container-1': { consecutiveFailures: 7, deferUntilMs: Date.now() + 600_000 } },
+      ),
+    );
+
+    // fails-when: the row reads only the 5-minute window, so a 15-minute deferral looks healthy
+    expect(results[0]).toMatchObject({ name: 'scaler:container-1', status: 'warn' });
+    const visible = results[0].message.substring(0, DIAGNOSE_TABLE_MESSAGE_WIDTH);
+    expect(visible).toContain('failing (7 in a row');
+    expect(results[0].details).toMatchObject({ consecutiveFailures: 7 });
+  });
+
+  it('keeps a job-bound failure a FAIL while backing off', async () => {
+    const results = await checkScalerProvisioning(
+      makeDeps(
+        [{ name: 'container-1', type: 'container' }],
+        {
+          'container-1': {
+            backendType: 'container',
+            boundCount: 2,
+            unboundCount: 0,
+            lastError: 'no such image',
+            lastAtMs: Date.now(),
+          },
+        },
+        { 'container-1': { consecutiveFailures: 2, deferUntilMs: Date.now() + 30_000 } },
+      ),
+    );
+
+    expect(results[0].status).toBe('fail');
+    expect(results[0].message).toMatch(/^failing \(2 in a row, next try in 30s\) — 2 spawn/);
+  });
+
+  it('drops the marker once nothing is deferred', async () => {
+    const now = Date.now();
+    const results = await checkScalerProvisioning(
+      makeDeps(
+        [
+          { name: 'blip', type: 'container' },
+          { name: 'expired', type: 'container' },
+        ],
+        {},
+        {
+          // One transient failure: retried at once, so its deferral ends where it starts.
+          blip: { consecutiveFailures: 1, deferUntilMs: now },
+          // A deferral that ran out, with no spawn since (its job was cancelled).
+          expired: { consecutiveFailures: 3, deferUntilMs: now - 60_000 },
+        },
+      ),
+    );
+
+    // fails-when: the row marks every scaler with a failure count, and reads
+    // `failing (1 in a row, next try in 0s)` for hours after a single blip
+    for (const row of results) {
+      expect(row.status).toBe('pass');
+      expect(row.message).toBe('0 spawn failures in last 5m');
+      expect(row.details).not.toHaveProperty('consecutiveFailures');
+    }
+  });
+
+  it('passes a scaler with no failures and no backoff', async () => {
+    const results = await checkScalerProvisioning(
+      makeDeps([{ name: 'container-1', type: 'container' }], {}, {}),
+    );
+    // breaks-if-wrong: a healthy scaler must still read PASS with no marker
+    expect(results[0].status).toBe('pass');
+    expect(results[0].message).toBe('0 spawn failures in last 5m');
   });
 });
 

@@ -3,9 +3,15 @@ import { z } from 'zod';
 /**
  * Structured `error` codes in Platform dashboard API JSON bodies that the
  * dashboard special-cases; shared so the Platform emit sites and the dashboard
- * match site never drift.
+ * match site never drift. A route whose `error` already holds a message for
+ * older clients sends the code in a separate `code` field instead.
  */
 export const DashboardApiErrorCode = z.enum([
+  /**
+   * The named orchestrator cluster has no connected orchestrator. Returned with
+   * 404. The cluster may be reconnecting, so a client polling a run it already
+   * started retries it.
+   */
   'orchestrator_not_found',
   'session_max_age_exceeded',
   /**
@@ -24,5 +30,24 @@ export const DashboardApiErrorCode = z.enum([
    * start: a client says so and points at the run list, never "retry".
    */
   'run_start_unconfirmed',
+  /**
+   * The Platform has no organization for a first sign-in to join yet. Returned
+   * with 403.
+   */
+  'install_not_initialized',
+  /** This Platform does not allow creating organizations. Returned with 403. */
+  'org_creation_disabled',
+  /** The installation is at its organization limit. Returned with 403. */
+  'org_limit_reached',
+  /** Only administrators of this installation can create organizations. Returned with 403. */
+  'org_creation_owner_only',
+  /** The invite is for another email address than the signed-in account's. 403. */
+  'invite_email_mismatch',
+  /** Members plus pending invites fill the plan (403, with `upgradeUrl`; legacy spelling). */
+  'PLAN_LIMIT_MEMBER',
+  /** The organization reached its invite emails for the last 24 hours. 429. */
+  'invite_budget_spent',
+  /** The CLI is a later release than the Platform. 409, with a `message` the CLI prints. */
+  'client_newer_than_platform',
 ]);
 export type DashboardApiErrorCode = z.infer<typeof DashboardApiErrorCode>;

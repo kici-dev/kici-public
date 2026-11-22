@@ -2,7 +2,7 @@
  * Source-create gate tripwires: two invariants stop the orchestrator
  * registering arbitrary GitHub Apps as sources without proof of ownership.
  *
- *  1. The handler calls `validateGitHubSource(appId, privateKey)` BEFORE
+ *  1. The handler calls `validateGitHubSource({ appId, privateKey, githubUrl })` BEFORE
  *     `sourceStore.addSource(...)`. If the pair fails GitHub's `GET /app` JWT
  *     auth (the caller lacks the App's private key), it returns 400 and
  *     persists nothing. Without this gate an external attacker, or one holding
@@ -212,7 +212,9 @@ describe('GitHub-App source creation in observed mode', () => {
       }),
     });
     expect(res.status).toBe(201);
-    expect(sourceValidator.validateGitHubSource).toHaveBeenCalledWith('42', expect.any(String));
+    expect(sourceValidator.validateGitHubSource).toHaveBeenCalledWith(
+      expect.objectContaining({ appId: '42', privateKey: expect.any(String) }),
+    );
     expect(addSource).toHaveBeenCalledTimes(1);
   });
 });

@@ -52,6 +52,7 @@ import {
   incScalerSpawnRefusals,
   scalerCapLockFailuresTotal,
   ScalerCapLockFailureReason,
+  setScalerUsageBreakdown,
   setWarmPoolGauges,
 } from '../metrics/prometheus.js';
 
@@ -78,6 +79,7 @@ vi.mock('../metrics/prometheus.js', async (importOriginal) => ({
   incScalerExternalProvisionTimeout: vi.fn(),
   incScalerSpawnRefusals: vi.fn(),
   scalerCapLockFailuresTotal: { add: vi.fn() },
+  setScalerUsageBreakdown: vi.fn(),
   setWarmPoolGauges: vi.fn(),
 }));
 
@@ -3396,6 +3398,52 @@ describe('ScalerManager', () => {
       expect((await peer.recoverState()).reservationsRehydrated).toBe(0);
     });
 
+    it('publishes zeroed usage gauges at boot, before any reservation', async () => {
+      const manager = makeManagerWithEventBackend({
+        stateStore: fakeStateStore(),
+        instanceId: 'orch-a',
+      });
+      vi.mocked(setScalerUsageBreakdown).mockClear();
+
+      await manager.recoverState();
+
+      // fails-when: recovery does not publish, so a restarted orchestrator exposes no
+      // kici_orch_scaler_* usage series until its first reservation.
+      expect(vi.mocked(setScalerUsageBreakdown).mock.lastCall?.[0]).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ scaler: '__global__', cpus: 0, memBytes: 0 }),
+        ]),
+      );
+    });
+
+    it('publishes rehydrated reservations in the usage gauges', async () => {
+      const reservations = new Map<string, { agentId: string; cpus: number }>();
+      const { overrides } = spawningRowTable();
+      const stateStore = fakeStateStore({
+        ...overrides,
+        upsertReservation: vi.fn(async (snapshot: { agentId: string; cpus: number }) => {
+          reservations.set(snapshot.agentId, snapshot);
+        }),
+        listReservationsForOwner: vi.fn(async () => [...reservations.values()]),
+      });
+      const manager = makeManagerWithEventBackend({ stateStore, instanceId: 'orch-a' });
+      await manager.requestScale(['github-actions', 'kici:os:linux'], 'job-1', 'run-1');
+      await vi.advanceTimersByTimeAsync(0);
+      // This fixture's scaler requests no resources; recovery reads the stored row.
+      const [reservation] = [...reservations.values()];
+      reservation!.cpus = 2;
+
+      const restarted = makeManagerWithEventBackend({ stateStore, instanceId: 'orch-a' });
+      vi.mocked(setScalerUsageBreakdown).mockClear();
+      await restarted.recoverState();
+
+      // fails-when: the gauges are published before hydration adds the reservation, or never,
+      // so a restart under load reports no capacity in use.
+      expect(vi.mocked(setScalerUsageBreakdown).mock.lastCall?.[0]).toEqual(
+        expect.arrayContaining([expect.objectContaining({ scaler: '__global__', cpus: 2 })]),
+      );
+    });
+
     it('drops a reservation row no spawn backs, instead of billing it forever', async () => {
       // A reservation is released by its spawn's lifecycle — spawn failure, disconnect, or the
       // `pruneStaleSpawningEntries` reap — and all three read `spawningAgents`. A reservation
@@ -4335,6 +4383,297 @@ describe('ScalerManager', () => {
         'spawning',
       );
       expect(onCapacityFreed).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('a spawn that keeps failing', () => {
+    const SCALER = {
+      name: 'container-a',
+      type: 'container' as const,
+      maxAgents: 5,
+      maxConcurrentSpawns: DEFAULT_MAX_CONCURRENT_SPAWNS,
+      labelSets: [{ labels: ['linux', 'docker'], image: 'ghcr.io/org/agent:latest' }],
+    };
+    const OTHER = {
+      name: 'container-b',
+      type: 'container' as const,
+      maxAgents: 5,
+      maxConcurrentSpawns: DEFAULT_MAX_CONCURRENT_SPAWNS,
+      labelSets: [{ labels: ['linux', 'node20'], image: 'ghcr.io/org/agent:latest' }],
+    };
+    const MISSING_IMAGE = new Error(
+      '(HTTP code 404) no such image - ghcr.io/org/agent:latest: image not known',
+    );
+
+    /** A container backend whose spawn throws while `failing.value` is true. */
+    function flakyBackend(failing: { value: boolean }, labelSets = SCALER.labelSets) {
+      return createMockBackend({
+        type: 'container',
+        labelSets,
+        maxAgents: 5,
+        spawn: vi.fn(async (labelSet: string[], agentId: string): Promise<ManagedAgent> => {
+          if (failing.value) throw MISSING_IMAGE;
+          return {
+            id: agentId,
+            labelSet,
+            backendRef: `ref-${agentId}`,
+            spawnedAt: Date.now(),
+            state: 'running',
+          };
+        }),
+      });
+    }
+
+    function managerWith(
+      backends: NamedBackend[],
+      revokeAgentTokens = vi.fn(async () => 1),
+    ): ScalerManager {
+      return new ScalerManager({
+        instanceId: 'orch-test',
+        config: { ...createDefaultConfig(), scalers: [SCALER, OTHER] },
+        backends,
+        spawnTimeoutMs: 300_000,
+        revokeAgentTokens,
+        resolveProvisionBackoff: async () => ({
+          baseMs: 1000,
+          maxMs: 4000,
+          maxConsecutiveFailures: 5,
+        }),
+      });
+    }
+
+    /** One request for `job` that spawns and fails; resolves the deferral it armed. */
+    async function failOnce(manager: ScalerManager, job: string): Promise<number | undefined> {
+      expect((await manager.requestScale(['linux', 'docker'], job, 'run-1')).action).toBe(
+        'spawning',
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      const status = manager.provisionBackoffStatus().get('container-a');
+      return status ? status.deferUntilMs - Date.now() : undefined;
+    }
+
+    it('spaces repeated failures out, caps the spacing, and one registration resets it', async () => {
+      const failing = { value: true };
+      const backend = flakyBackend(failing);
+      const manager = managerWith([{ name: 'container-a', backend }]);
+
+      // The first failure is retried at once: a single blip costs no job the base delay.
+      expect(await failOnce(manager, 'job-1')).toBe(0);
+      // fails-when: a non-deterministic rejection frees the capacity with no backoff, so the
+      // re-drive spawns (and mints a token) every 250 ms
+      expect(await failOnce(manager, 'job-1')).toBe(1000);
+      const deferred = await manager.requestScale(['linux', 'docker'], 'job-1', 'run-1');
+      expect(deferred).toMatchObject({ action: 'skipped', retryAfterMs: 1000 });
+
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(await failOnce(manager, 'job-1')).toBe(2000);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(await failOnce(manager, 'job-1')).toBe(4000);
+      await vi.advanceTimersByTimeAsync(4000);
+      // Capped: the fifth consecutive failure waits the ceiling, not 8 s.
+      expect(await failOnce(manager, 'job-1')).toBe(4000);
+      expect(manager.provisionBackoffStatus().get('container-a')?.consecutiveFailures).toBe(5);
+      expect(backend.spawn).toHaveBeenCalledTimes(5);
+
+      // The image is back: the next spawn registers, and the backoff clears.
+      await vi.advanceTimersByTimeAsync(4000);
+      failing.value = false;
+      await manager.requestScale(['linux', 'docker'], 'job-1', 'run-1');
+      await vi.advanceTimersByTimeAsync(0);
+      const agentId = (backend.spawn as ReturnType<typeof vi.fn>).mock.calls[5][1] as string;
+      await manager.onAgentRegistered(agentId, ['linux', 'docker']);
+      expect(manager.provisionBackoffStatus().has('container-a')).toBe(false);
+
+      // breaks-if-wrong: after a success the next failure is again retried at once
+      failing.value = true;
+      expect(await failOnce(manager, 'job-2')).toBe(0);
+    });
+
+    describe('spawns that fail together', () => {
+      const BURST = 8;
+      const WIDE = { ...SCALER, maxAgents: BURST * 2, maxConcurrentSpawns: BURST };
+
+      /**
+       * A backend whose spawns all wait on one gate, then reject with `error`: a runtime
+       * blip that every in-flight spawn sees at once.
+       */
+      function gatedBackend(error: Error) {
+        let open!: () => void;
+        let gate = new Promise<void>((resolve) => (open = resolve));
+        const backend = createMockBackend({
+          type: 'container',
+          labelSets: SCALER.labelSets,
+          maxAgents: WIDE.maxAgents,
+          spawn: vi.fn(async (): Promise<ManagedAgent> => {
+            await gate;
+            throw error;
+          }),
+        });
+        const failAll = async (): Promise<void> => {
+          open();
+          await vi.advanceTimersByTimeAsync(0);
+          gate = new Promise<void>((resolve) => (open = resolve));
+        };
+        return { backend, failAll };
+      }
+
+      function burstManager(backend: ScalerBackend): ScalerManager {
+        return new ScalerManager({
+          instanceId: 'orch-test',
+          config: { ...createDefaultConfig(), scalers: [WIDE] },
+          backends: [{ name: 'container-a', backend }],
+          spawnTimeoutMs: 300_000,
+          revokeAgentTokens: vi.fn(async () => 1),
+          resolveProvisionBackoff: async () => ({
+            baseMs: 1000,
+            maxMs: 64_000,
+            maxConsecutiveFailures: 5,
+          }),
+        });
+      }
+
+      async function startBurst(manager: ScalerManager, round: number): Promise<void> {
+        for (let i = 0; i < BURST; i += 1) {
+          const result = await manager.requestScale(['linux', 'docker'], `job-${round}-${i}`, 'r');
+          expect(result.action).toBe('spawning');
+        }
+        await vi.advanceTimersByTimeAsync(0);
+      }
+
+      it('count as one failure, however many were in flight', async () => {
+        const { backend, failAll } = gatedBackend(MISSING_IMAGE);
+        const manager = burstManager(backend);
+
+        await startBurst(manager, 1);
+        expect(backend.spawn).toHaveBeenCalledTimes(BURST);
+        await failAll();
+
+        // fails-when: each in-flight rejection adds a step — 8 at once would read 8 here and
+        // defer the scaler by 64 s (the cap) after a blip the runtime recovered from at once
+        const status = manager.provisionBackoffStatus().get('container-a');
+        expect(status?.consecutiveFailures).toBe(1);
+        // One transient failure is retried at once.
+        expect(status!.deferUntilMs - Date.now()).toBe(0);
+
+        // breaks-if-wrong: the retries start after that failure was counted, so when they fail
+        // together too, that is the next step — the outage still escalates, one step per round
+        await startBurst(manager, 2);
+        await failAll();
+        const second = manager.provisionBackoffStatus().get('container-a');
+        expect(second?.consecutiveFailures).toBe(2);
+        expect(second!.deferUntilMs - Date.now()).toBe(1000);
+      });
+
+      it('defer a refused launch by the base delay, not the cap', async () => {
+        const { backend, failAll } = gatedBackend(new DeterministicSpawnError('refused'));
+        const manager = burstManager(backend);
+
+        await startBurst(manager, 1);
+        await failAll();
+
+        // fails-when: per-claim counting reaches 8 and defers by min(1 s · 2^7, 64 s)
+        const deferred = await manager.requestScale(['linux', 'docker'], 'job-late', 'r');
+        expect(deferred).toMatchObject({ action: 'skipped', retryAfterMs: 1000 });
+        expect(manager.provisionBackoffStatus().get('container-a')?.consecutiveFailures).toBe(1);
+      });
+    });
+
+    it('does not delay a healthy scaler, or another scaler while one is deferred', async () => {
+      const failing = { value: true };
+      const healthy = { value: false };
+      const manager = managerWith([
+        { name: 'container-a', backend: flakyBackend(failing) },
+        { name: 'container-b', backend: flakyBackend(healthy, OTHER.labelSets) },
+      ]);
+
+      // breaks-if-wrong: a healthy scaler's first spawn is never deferred
+      expect((await manager.requestScale(['linux', 'node20'], 'job-b0', 'run-1')).action).toBe(
+        'spawning',
+      );
+      await failOnce(manager, 'job-a');
+      await failOnce(manager, 'job-a');
+      expect((await manager.requestScale(['linux', 'docker'], 'job-a', 'run-1')).action).toBe(
+        'skipped',
+      );
+
+      // The failing scaler holds no reservation and no deferral of the other one.
+      expect((await manager.requestScale(['linux', 'node20'], 'job-b1', 'run-1')).action).toBe(
+        'spawning',
+      );
+      expect(manager.provisionBackoffStatus().has('container-b')).toBe(false);
+    });
+
+    it('revokes the token of every spawn that threw, and keeps a registered agent’s', async () => {
+      const failing = { value: true };
+      const revoke = vi.fn(async () => 1);
+      const backend = flakyBackend(failing);
+      const manager = managerWith([{ name: 'container-a', backend }], revoke);
+
+      await failOnce(manager, 'job-1');
+      await vi.advanceTimersByTimeAsync(0);
+      const failedId = (backend.spawn as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      // fails-when: the failure branch only frees the reservation, leaving the minted token live
+      expect(revoke).toHaveBeenCalledWith(failedId);
+
+      failing.value = false;
+      await manager.requestScale(['linux', 'docker'], 'job-2', 'run-1');
+      await vi.advanceTimersByTimeAsync(0);
+      const okId = (backend.spawn as ReturnType<typeof vi.fn>).mock.calls[1][1] as string;
+      await manager.onAgentRegistered(okId, ['linux', 'docker']);
+      // breaks-if-wrong: a spawn that succeeded keeps the token its agent connects with
+      expect(revoke).not.toHaveBeenCalledWith(okId);
+      expect(revoke).toHaveBeenCalledTimes(1);
+    });
+
+    it('treats a rejection after the agent registered as no failure', async () => {
+      // The agent registered, ran and left while spawn() still awaited the runtime; the
+      // container backend then rejects with "torn down while … provisioned".
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const revoke = vi.fn(async () => 1);
+      const backend = createMockBackend({
+        type: 'container',
+        labelSets: SCALER.labelSets,
+        maxAgents: 5,
+        spawn: vi.fn(async (_labels: string[], agentId: string): Promise<ManagedAgent> => {
+          await gate;
+          throw new Error(
+            `Agent ${agentId} was torn down while its container was being provisioned`,
+          );
+        }),
+      });
+      const manager = managerWith([{ name: 'container-a', backend }], revoke);
+
+      await manager.requestScale(['linux', 'docker'], 'job-1', 'run-1');
+      await vi.advanceTimersByTimeAsync(0);
+      const agentId = (backend.spawn as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      await manager.onAgentRegistered(agentId, ['linux', 'docker']);
+      manager.onAgentDisconnected(agentId);
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+
+      // breaks-if-wrong: a job that ran is not a failed launch — no backoff, no revoke
+      expect(manager.provisionBackoffStatus().has('container-a')).toBe(false);
+      expect(revoke).not.toHaveBeenCalled();
+    });
+
+    it('defers the warm pool of a deferred scaler', async () => {
+      const failing = { value: true };
+      const backend = flakyBackend(failing);
+      const manager = managerWith([{ name: 'container-a', backend }]);
+      await failOnce(manager, 'job-1');
+      await failOnce(manager, 'job-1');
+
+      const spawnWarm = (
+        manager as unknown as {
+          spawnWarmAgent: (labels: string[], name: string) => Promise<void>;
+        }
+      ).spawnWarmAgent.bind(manager);
+      // fails-when: the warm fill ignores the deferral and spawns into the same failure each tick
+      await spawnWarm(['linux', 'docker'], 'container-a');
+      expect(backend.spawn).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -6868,13 +7207,16 @@ describe('external-provision backoff', () => {
     manager: ScalerManager,
     scalerName = 'github-actions',
     agentId = 'agent-77',
+    // Started now, so a series of calls is a series of rounds: each provision began after
+    // the previous verdict. A shared earlier start makes them one round (tested below).
+    spawnedAt = new Date(),
   ): Promise<void> {
     await manager.emitOrphanScaleDown(
       {
         agentId,
         scalerName,
         provisioningTargets: ['e2e/provision'],
-        spawnedAt: new Date('2026-08-26T11:00:00Z'),
+        spawnedAt,
       },
       ScaleDownReason.enum['spawn-timeout'],
     );
@@ -6942,6 +7284,27 @@ describe('external-provision backoff', () => {
     expect(await waitAfter(1)).toBe(2);
     expect(await waitAfter(1)).toBe(4);
     expect(await waitAfter(1)).toBe(4);
+  });
+
+  it('counts provisions that were in flight together as one failure', async () => {
+    const manager = makeManagerWithEventBackend({
+      instanceId: 'orch-leader',
+      resolveProvisionBackoff: backoff({ baseMs: 1000, maxMs: 64_000 }),
+    });
+    // A peer's burst: eight provisions requested together, condemned by this leader's reaper.
+    // Only the durable spawn time places them, and all of them predate the first verdict.
+    const requestedAt = new Date(Date.now() - 400_000);
+    for (let i = 0; i < 8; i += 1) {
+      await failProvision(manager, 'github-actions', `peer-${i}`, requestedAt);
+    }
+    // fails-when: each condemned provision escalates — the deferral reads 64 s, not 1 s
+    const result = await manager.requestScale(['github-actions', 'kici:os:linux'], 'job-x', 'r');
+    expect(Number(/deferring for (\d+)s/.exec((result as { reason: string }).reason)![1])).toBe(1);
+
+    // breaks-if-wrong: a provision requested after that verdict is the next round
+    await failProvision(manager, 'github-actions', 'peer-late');
+    const next = await manager.requestScale(['github-actions', 'kici:os:linux'], 'job-y', 'r');
+    expect(Number(/deferring for (\d+)s/.exec((next as { reason: string }).reason)![1])).toBe(2);
   });
 
   it('names repeated failure once the configured limit is reached', async () => {

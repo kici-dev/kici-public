@@ -791,7 +791,7 @@ The orchestrator process lacks `CAP_NET_ADMIN`. Check your deployment mode:
 
 ### "ENOENT: nft not found"
 
-Install nftables: `apt install nftables`. The `nft` binary must be in the orchestrator's `PATH`.
+Install nftables: `apt install nftables`. The orchestrator looks for `nft`, `sysctl` and `iptables` on its `PATH` and then in `/usr/local/sbin`, `/usr/sbin` and `/sbin`, so a `PATH` without those directories does not hide them.
 
 ### VM won't boot
 

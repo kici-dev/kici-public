@@ -5,15 +5,20 @@
  * run loop treats both alike. It also reads the admin routes a developer token
  * may use: context secret key names, and held runs on an independent orchestrator.
  */
-import { toErrorMessage } from '@kici-dev/core';
 import type { ApprovalDecision, HeldRunSummary, OrchestratorMode } from '@kici-dev/engine';
 import {
   AuthenticationError,
-  ConnectionError,
+  HttpStatusError,
   NotFoundError,
+  READ_REQUEST_TIMEOUT_MS,
   readError,
   readJson,
+  readJsonBody,
+  readRequestSignal,
+  sendAuthenticated,
   throwForAccessStatus,
+  type ReadRequestOptions,
+  type RemoteServer,
   type PlatformCancelResponse,
   type PlatformRunLogsResponse,
   type PlatformRunStatusResponse,
@@ -74,12 +79,19 @@ export interface ContextSecretKeys {
 export class DirectRunClient {
   readonly url: string;
   private readonly token: string;
+  private readonly readTimeoutMs: number;
   /** The server's reason for the most recent refused `decideHold`. */
   lastDecisionError: string | undefined;
 
-  constructor(opts: { url: string; token: string }) {
+  /** `readTimeoutMs` bounds a status or log read; defaults to {@link READ_REQUEST_TIMEOUT_MS}. */
+  constructor(opts: { url: string; token: string; readTimeoutMs?: number }) {
     this.url = normalizeOrchestratorUrl(opts.url);
     this.token = opts.token;
+    this.readTimeoutMs = opts.readTimeoutMs ?? READ_REQUEST_TIMEOUT_MS;
+  }
+
+  private get server(): RemoteServer {
+    return { label: `the orchestrator at ${this.url}`, endpoint: this.url };
   }
 
   async whoami(): Promise<DirectWhoami> {
@@ -99,15 +111,23 @@ export class DirectRunClient {
     return this.json('/api/v1/test/trigger', { method: 'POST', body: JSON.stringify(body) });
   }
 
-  runStatus(runId: string): Promise<PlatformRunStatusResponse> {
-    return this.json(`/api/v1/test/runs/${encodeURIComponent(runId)}`, { method: 'GET' });
+  runStatus(runId: string, opts: ReadRequestOptions = {}): Promise<PlatformRunStatusResponse> {
+    return this.json(`/api/v1/test/runs/${encodeURIComponent(runId)}`, {
+      method: 'GET',
+      signal: readRequestSignal(this.readTimeoutMs, opts.signal),
+    });
   }
 
-  runLogs(runId: string, position: RunLogPosition): Promise<PlatformRunLogsResponse> {
+  runLogs(
+    runId: string,
+    position: RunLogPosition,
+    opts: ReadRequestOptions = {},
+  ): Promise<PlatformRunLogsResponse> {
     const params = new URLSearchParams({ cursor: String(position.cursor) });
     if (position.logCursor !== undefined) params.set('logCursor', position.logCursor);
     return this.json(`/api/v1/test/runs/${encodeURIComponent(runId)}/logs?${params.toString()}`, {
       method: 'GET',
+      signal: readRequestSignal(this.readTimeoutMs, opts.signal),
     });
   }
 
@@ -136,8 +156,7 @@ export class DirectRunClient {
         response.status,
       );
     }
-    const ok = await this.checked(response);
-    const data = (await ok.json()) as { heldRuns?: HeldRunSummary[] };
+    const data = await this.body<{ heldRuns?: HeldRunSummary[] }>(await this.checked(response));
     return data.heldRuns ?? [];
   }
 
@@ -173,27 +192,16 @@ export class DirectRunClient {
   }
 
   private async json<T>(path: string, init: RequestInit): Promise<T> {
-    const response = await this.checked(await this.send(path, init));
-    return (await response.json()) as T;
+    return this.body<T>(await this.checked(await this.send(path, init)));
   }
 
-  /** A transport failure becomes a `ConnectionError`. */
-  private async send(path: string, init: RequestInit): Promise<Response> {
-    try {
-      return await fetch(`${this.url}${path}`, {
-        ...init,
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.token}`,
-          ...(init.headers as Record<string, string>),
-        },
-      });
-    } catch (err) {
-      throw new ConnectionError(
-        `Failed to connect to the orchestrator at ${this.url}: ${toErrorMessage(err)}`,
-        this.url,
-      );
-    }
+  private body<T>(response: Response): Promise<T> {
+    return readJsonBody<T>(response, this.server);
+  }
+
+  /** A transport failure, or a read past its deadline, becomes a `ConnectionError`. */
+  private send(path: string, init: RequestInit): Promise<Response> {
+    return sendAuthenticated(`${this.url}${path}`, init, this.token, this.server);
   }
 
   private async checked(response: Response): Promise<Response> {
@@ -204,8 +212,9 @@ export class DirectRunClient {
       const body = (await readJson(response)) as { reason?: string; error?: string };
       throw new Error(body.reason ?? body.error ?? 'Request rejected (422)');
     }
-    throw new Error(
+    throw new HttpStatusError(
       `Request to the orchestrator failed with status ${response.status}: ${await readError(response, '')}`,
+      response.status,
     );
   }
 }

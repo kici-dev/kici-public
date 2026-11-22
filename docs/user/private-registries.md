@@ -7,10 +7,10 @@ A workflow's `.kici/package.json` may depend on packages published to a private 
 
 ## Choose a path
 
-| Path                                                    | When to pick it                                                                                                                                                                                               |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Option A — `registries:` block in the workflow**      | The token is a long-lived secret you rotate manually (GH Packages PAT, CodeArtifact IAM access key, Verdaccio service token). KiCI manages the `.npmrc` for you.                                              |
-| **Option C — Committed `.kici/.npmrc` + `installEnv:`** | You already have an `.npmrc` you want to keep verbatim (e.g. it carries an `audit=false` line, a custom CA, or a complex multi-scope mapping). KiCI just supplies the env vars your `${VAR}` references need. |
+| Path                                                    | When to pick it                                                                                                                                                                                          |
+| ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Option A — `registries:` block in the workflow**      | The token is a long-lived secret you rotate manually (GH Packages PAT, CodeArtifact IAM access key, Verdaccio service token). KiCI manages the `.npmrc` for you.                                         |
+| **Option C — Committed `.kici/.npmrc` + `installEnv:`** | You already have an `.npmrc` you want to keep verbatim (e.g. it carries an `audit=false` line, a custom CA, or a complex multi-scope mapping). KiCI supplies the env vars your `${VAR}` references need. |
 
 The two channels (Option A and Option C) compose. If you declare both, the agent's auto-generated lines come **after** your committed `.npmrc`, so npm's last-wins semantics let agent-managed registries override committed ones — never the other way around.
 

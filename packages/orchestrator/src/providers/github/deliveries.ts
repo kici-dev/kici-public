@@ -37,7 +37,8 @@ export type RedeliverOutcome = z.infer<typeof RedeliverOutcome>;
 
 /** One delivery as `GET /app/hook/deliveries` returns it (the fields used here). */
 export interface GithubWebhookDelivery {
-  id: number;
+  /** GitHub's ids pass `Number.MAX_SAFE_INTEGER`; Octokit parses such a value as a bigint. */
+  id: number | bigint;
   guid: string;
   /** ISO-8601 timestamp GitHub attempted the delivery. */
   delivered_at: string;
@@ -52,7 +53,8 @@ export interface GithubWebhookDelivery {
 
 /** Per-delivery result of a replay. */
 export interface RedeliverResult {
-  deliveryId: number;
+  /** A number while it is a safe integer, otherwise its decimal string: JSON has no bigint. */
+  deliveryId: number | string;
   guid: string;
   deliveredAt: string;
   event: string;
@@ -158,9 +160,13 @@ export async function listDeliveriesInWindow(
 }
 
 /** Ask GitHub to send one delivery again. Resolves once GitHub accepts (202). */
-export async function redeliverDelivery(octokit: GithubRequest, deliveryId: number): Promise<void> {
+export async function redeliverDelivery(
+  octokit: GithubRequest,
+  deliveryId: number | string,
+): Promise<void> {
   await octokit.request('POST /app/hook/deliveries/{delivery_id}/attempts', {
-    delivery_id: deliveryId,
+    // The route types the id as a number; a decimal string expands to the same URL.
+    delivery_id: deliveryId as number,
   });
 }
 
@@ -187,8 +193,9 @@ export async function redeliverWindow(
   let failed = 0;
 
   for (const delivery of deliveries) {
+    const deliveryId = typeof delivery.id === 'bigint' ? delivery.id.toString() : delivery.id;
     const base = {
-      deliveryId: delivery.id,
+      deliveryId,
       guid: delivery.guid,
       deliveredAt: delivery.delivered_at,
       event: delivery.event,
@@ -200,7 +207,7 @@ export async function redeliverWindow(
       continue;
     }
     try {
-      await redeliverDelivery(octokit, delivery.id);
+      await redeliverDelivery(octokit, deliveryId);
       redelivered++;
       results.push({ ...base, outcome: RedeliverOutcome.enum.redelivered });
     } catch (err) {

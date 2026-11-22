@@ -169,8 +169,8 @@ export function getAccessLogWarmDays(args: {
 
 /**
  * Platform `audit_log.action` is a free-form string (no enum), so we classify
- * by prefix / set membership. Compliance-class actions (billing, RBAC,
- * platform-admin break-glass, system events) get 365 days; everything else
+ * by prefix / set membership. Compliance-class actions (billing and licensing,
+ * RBAC, platform-admin break-glass, system events) get 365 days; everything else
  * defaults to 180 days (tenant-plane mutations).
  *
  * The Platform `audit_log` has no `outcome` column — every row is a "happened"
@@ -179,6 +179,7 @@ export function getAccessLogWarmDays(args: {
 const COMPLIANCE_AUDIT_PREFIXES = [
   'plan.',
   'plan_config.',
+  'license.',
   'org.',
   'member.',
   'invite.',

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 import {
   ExecutionTracker,
   type ExecutionTrackerDeps,
@@ -87,6 +87,8 @@ function createMockDb() {
       // the status generation a reopen raises.
       failure_reason?: string | null;
       status_epoch?: number;
+      // The JSON the insert wrote, read back by the rehydration path.
+      provider_context?: string;
     }
   >();
   /**
@@ -94,6 +96,20 @@ function createMockDb() {
    * reads liveness here, so a test declares which sibling coordinators are alive.
    */
   const liveInstances = new Set<string>();
+
+  /** The run row an insert writes, as the rehydration path reads it back. */
+  const insertedRunRow = (v: Record<string, unknown>) => ({
+    status: v.status as string | undefined,
+    // Carried so rehydration returns the name the row was written with:
+    // the round-job guard in `recoverRunFromDb` reads exactly this column.
+    workflow_name: v.workflow_name as string | undefined,
+    // Same reason, and more so: the cross-repo marker MEANS "differs from
+    // repo_identifier", so echoing one and hardcoding the other hides it.
+    repo_identifier: v.repo_identifier as string | undefined,
+    workflow_repo_identifier: v.workflow_repo_identifier as string | undefined,
+    failure_reason: v.failure_reason as string | null | undefined,
+    provider_context: v.provider_context as string | undefined,
+  });
 
   const db = {
     insertInto: vi.fn((table: string) => {
@@ -118,17 +134,7 @@ function createMockDb() {
                 });
               }
               if (table === 'execution_runs') {
-                runRows.set(String(v.run_id), {
-                  status: v.status as string | undefined,
-                  // Carried so rehydration returns the name the row was written with:
-                  // the round-job guard in `recoverRunFromDb` reads exactly this column.
-                  workflow_name: v.workflow_name as string | undefined,
-                  // Same reason, and more so: the cross-repo marker MEANS "differs from
-                  // repo_identifier", so echoing one and hardcoding the other hides it.
-                  repo_identifier: v.repo_identifier as string | undefined,
-                  workflow_repo_identifier: v.workflow_repo_identifier as string | undefined,
-                  failure_reason: v.failure_reason as string | null | undefined,
-                });
+                runRows.set(String(v.run_id), insertedRunRow(v));
               }
             }
             return [];
@@ -261,16 +267,12 @@ function createMockDb() {
                           (v.failure_reason as string | null | undefined) ??
                           existing.failure_reason,
                         status_epoch: existing.status_epoch,
+                        provider_context:
+                          (v.provider_context as string | undefined) ?? existing.provider_context,
                       });
                     } else {
                       inserts.push({ table, values: v });
-                      runRows.set(key, {
-                        status: v.status as string | undefined,
-                        workflow_name: v.workflow_name as string | undefined,
-                        repo_identifier: v.repo_identifier as string | undefined,
-                        workflow_repo_identifier: v.workflow_repo_identifier as string | undefined,
-                        failure_reason: v.failure_reason as string | null | undefined,
-                      });
+                      runRows.set(key, insertedRunRow(v));
                     }
                   } else {
                     inserts.push({ table, values: v });
@@ -480,7 +482,7 @@ function createMockDb() {
                     sha: 'deadbeef',
                     ref: 'refs/heads/main',
                     routing_key: 'github:1',
-                    provider_context: {},
+                    provider_context: row.provider_context ?? {},
                     started_at: new Date(),
                     parent_run_id: null,
                     original_run_id: null,
@@ -545,6 +547,18 @@ function createMockDb() {
     liveInstances,
   };
 }
+
+/** A GitHub Enterprise Server source's routing key, and the live server lookup naming it. */
+const GHES_SOURCE = 'github:7';
+/** The live sources: github:7 on GHES, github:1 on github.com; any other github: key is gone. */
+const githubSourceOf = (routingKey: string) =>
+  routingKey === GHES_SOURCE
+    ? { githubUrl: 'https://ghe.corp.example' }
+    : routingKey === 'github:1'
+      ? {}
+      : undefined;
+/** A provider context a routing-key-scoped token wrote through a manual registration. */
+const INJECTED_CONTEXT = { installationId: 7, githubUrl: 'https://evil.example' };
 
 // ── Tests ────────────────────────────────────────────────────────
 
@@ -695,7 +709,8 @@ describe('ExecutionTracker', () => {
     });
 
     it('onExecutionStarted persists the trigger actor into the run insert + context', async () => {
-      const onExecutionStatusChange = vi.fn();
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
       const t = new ExecutionTracker({ db: mockDb.db as any, onExecutionStatusChange });
       await startRun(t, {
         runId: 'run-actor',
@@ -1273,6 +1288,27 @@ describe('ExecutionTracker', () => {
       );
     });
 
+    it('recordRunHeld forwards the server of a run from a GitHub Enterprise Server source', async () => {
+      const onStatusChange = vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
+      const t = new ExecutionTracker({
+        db: mockDb.db,
+        onExecutionStatusChange: onStatusChange,
+        githubSourceOf,
+      });
+      await t.recordRunHeld({
+        ...heldArgs('run-held-ghes'),
+        routingKey: GHES_SOURCE,
+        providerContext: INJECTED_CONTEXT,
+      });
+      await t.recordRunHeld({ ...heldArgs('run-held-dotcom'), providerContext: INJECTED_CONTEXT });
+      const ctxOf = (runId: string) =>
+        onStatusChange.mock.calls.find((call) => call[0] === runId)![2] as ExecutionContext;
+      // fails-when: a held GHES run's frame names no server
+      expect(ctxOf('run-held-ghes').githubUrl).toBe('https://ghe.corp.example');
+      // breaks-if-wrong: a github.com hold's context gains no key
+      expect(ctxOf('run-held-dotcom')).not.toHaveProperty('githubUrl');
+    });
+
     it('recordRunHeld marks a held test run so the test-run routes can read it', async () => {
       const { t } = epochTracker();
       await t.recordRunHeld({ ...heldArgs('run-held-test'), testRun: { fixtureId: 'push-main' } });
@@ -1481,7 +1517,8 @@ describe('ExecutionTracker', () => {
 
     it('forwards logBytes to onJobStatusChange + onExecutionStatusChange on terminal states', async () => {
       const onJobStatusChange = vi.fn();
-      const onExecutionStatusChange = vi.fn();
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
       const t = new ExecutionTracker({
         db: mockDb.db,
         onJobStatusChange,
@@ -2878,6 +2915,51 @@ describe('ExecutionTracker', () => {
       expect(tracker.getExecutionContext('run-gone')).toBeUndefined();
     });
 
+    /** Start run-1 with `providerContext`; the status-change context it forwarded last. */
+    /** Start run-1 from `routingKey`'s source, its provider context naming another server. */
+    async function startedWith(routingKey: string) {
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
+      const t = new ExecutionTracker({ db: mockDb.db, onExecutionStatusChange, githubSourceOf });
+      await startRun(t, {
+        ref: 'main',
+        deliveryId: null,
+        providerContext: INJECTED_CONTEXT,
+        routingKey,
+        jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      });
+      return {
+        run: t.getExecutionContext('run-1'),
+        forwarded: onExecutionStatusChange.mock.calls.at(-1)![2],
+      };
+    }
+
+    it("registerRun names the server from its source's live config", async () => {
+      const { run, forwarded } = await startedWith(GHES_SOURCE);
+      // fails-when: a server a registration's provider context names reaches the run
+      expect(run?.githubUrl).toBe('https://ghe.corp.example');
+      expect(forwarded.githubUrl).toBe('https://ghe.corp.example');
+    });
+
+    it('a run whose GitHub source is gone is marked, and another provider is not', async () => {
+      // fails-when: a removed GHES source reads as a github.com source
+      expect((await startedWith('github:99')).forwarded.githubSourceMissing).toBe(true);
+      // breaks-if-wrong: a generic source has no GitHub server to miss
+      expect((await startedWith('generic:org:src')).forwarded).not.toHaveProperty(
+        'githubSourceMissing',
+      );
+    });
+
+    it('a run of a github.com source names no server, whatever its provider context says', async () => {
+      const { run, forwarded } = await startedWith('github:1');
+      // breaks-if-wrong: a github.com run's context gains no key
+      expect(run).not.toHaveProperty('githubUrl');
+      expect(forwarded).not.toHaveProperty('githubUrl');
+      // fails-when: a live github.com source reads as missing, and 'github' vanishes
+      //   from the triggerActorProvider of every github.com frame
+      expect(forwarded).not.toHaveProperty('githubSourceMissing');
+    });
+
     it('returns context without installationId when not provided', async () => {
       await startRun(tracker, {
         ref: 'main',
@@ -3674,7 +3756,8 @@ describe('ExecutionTracker', () => {
       // `failed`. The DB guard keeps the recorded `success`, and the Platform forward must
       // be suppressed with it: the mirror reconciler revisits only NON-terminal rows, so the
       // Platform would read `failed` for a `success` run forever.
-      const onExecutionStatusChange = vi.fn();
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
       const t = new ExecutionTracker({ db: mockDb.db, onExecutionStatusChange });
       await requestContext.run({ requestId: 'req-late', runId: 'run-late-stale' }, async () => {
         await startRun(t, {
@@ -3883,7 +3966,8 @@ describe('ExecutionTracker', () => {
       // normal completion can turn the row terminal in between. The guard then
       // rejects the write — and the Platform forward must go with it, or the
       // mirror is left holding a `failed` this orchestrator never recorded.
-      const onExecutionStatusChange = vi.fn();
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
       const { db, updates } = createDbFallbackMockDb(
         failedJobs,
         runningRunRow,
@@ -3909,7 +3993,8 @@ describe('ExecutionTracker', () => {
         repo_identifier: 'owner/source-repo',
         workflow_repo_identifier: 'owner/org-workflows',
       });
-      const onExecutionStatusChange = vi.fn();
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
       const onExecutionComplete = vi.fn();
       const fallbackTracker = new ExecutionTracker({
         db,
@@ -3931,7 +4016,8 @@ describe('ExecutionTracker', () => {
       // Positive control: the same path over a NULL marker must stay silent, so
       // the assertion above cannot pass on a mock echoing the field regardless.
       const { db } = createDbFallbackMockDb(failedJobs, runningRunRow);
-      const onExecutionStatusChange = vi.fn();
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
       const fallbackTracker = new ExecutionTracker({ db, onExecutionStatusChange });
 
       await fallbackTracker.completeRunIfAllJobsTerminal('run-fallback-plain');
@@ -4313,7 +4399,8 @@ describe('ExecutionTracker', () => {
     });
 
     it('also fires onExecutionStatusChange with initFailure', async () => {
-      const onExecutionStatusChange = vi.fn();
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
       const initFailTracker = new ExecutionTracker({
         db: mockDb.db,
         onExecutionStatusChange,
@@ -4441,7 +4528,8 @@ describe('ExecutionTracker', () => {
       // so forwarding a write this orchestrator's own guard refused would leave it reading
       // `failed` for a run this orchestrator reads as `success`, permanently.
       const runId = 'run-init-fail-no-forward';
-      const onExecutionStatusChange = vi.fn();
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
       const t = new ExecutionTracker({ db: mockDb.db, onExecutionStatusChange });
       await startRun(t, {
         runId,
@@ -4554,7 +4642,8 @@ describe('ExecutionTracker', () => {
     });
 
     it('forwards the lineage and who triggered the run', async () => {
-      const onExecutionStatusChange = vi.fn();
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
       const t = new ExecutionTracker({ db: mockDb.db, onExecutionStatusChange });
 
       await t.recordAcceptedDispatchFailure(failureArgs('run-accepted-forward'));
@@ -4740,7 +4829,8 @@ describe('ExecutionTracker', () => {
     };
 
     it('settles a released round only while its release holds the claim, and forwards the outcome', async () => {
-      const onExecutionStatusChange = vi.fn();
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
       const { db, where, set } = settleDb(ROUND_ROW);
       const t = new ExecutionTracker({ db, onExecutionStatusChange });
 
@@ -4763,7 +4853,8 @@ describe('ExecutionTracker', () => {
     it('counts no execution for a settled success, and marks its frame as a round', async () => {
       // A round is not an execution: its success frame must not reach the
       // Platform as an ordinary terminal run, which notifies and fires webhooks.
-      const onExecutionStatusChange = vi.fn();
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
       const { db } = settleDb(ROUND_ROW);
       const t = new ExecutionTracker({ db, onExecutionStatusChange });
       const counted = vi.mocked(executionsTotal.add);
@@ -4778,7 +4869,8 @@ describe('ExecutionTracker', () => {
     });
 
     it('marks the held frame of a round as a round', async () => {
-      const onExecutionStatusChange = vi.fn();
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
       const t = new ExecutionTracker({ db: mockDb.db as any, onExecutionStatusChange });
       await t.recordRunHeld({
         runId: 'run-held-frame',
@@ -4848,7 +4940,8 @@ describe('ExecutionTracker', () => {
     });
 
     it('cancels a jobless run that is neither terminal nor held and forwards the frame', async () => {
-      const onExecutionStatusChange = vi.fn();
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
       const { db, where, set } = settleDb({
         ...ROUND_ROW,
         workflow_name: 'ci',
@@ -4879,7 +4972,8 @@ describe('ExecutionTracker', () => {
     });
 
     it('forwards nothing when the jobless cancel matched no row', async () => {
-      const onExecutionStatusChange = vi.fn();
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
       const { db } = settleDb(undefined);
       const t = new ExecutionTracker({ db, onExecutionStatusChange });
 
@@ -4888,7 +4982,8 @@ describe('ExecutionTracker', () => {
     });
 
     it('forwards nothing when no held round matched', async () => {
-      const onExecutionStatusChange = vi.fn();
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
       const { db } = settleDb(undefined);
       const t = new ExecutionTracker({ db, onExecutionStatusChange });
 
@@ -4900,7 +4995,8 @@ describe('ExecutionTracker', () => {
 
   describe('failRun with initFailure', () => {
     it('persists init_failure on the run row and forwards it', async () => {
-      const onExecutionStatusChange = vi.fn();
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
       const initFailTracker = new ExecutionTracker({
         db: mockDb.db,
         onExecutionStatusChange,
@@ -4944,7 +5040,8 @@ describe('ExecutionTracker', () => {
     });
 
     it('failRun emits onWorkflowComplete for a never-started run (Plane B parity)', async () => {
-      const onExecutionStatusChange = vi.fn();
+      const onExecutionStatusChange =
+        vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
       const onWorkflowComplete = vi.fn();
       const tracker = new ExecutionTracker({
         db: mockDb.db,
@@ -5901,12 +5998,12 @@ describe('ExecutionTracker cross-repo attribution survives DB rehydration', () =
   const WORKFLOW_REPO = 'owner/org-workflows';
 
   let mockDb: ReturnType<typeof createMockDb>;
-  let onExecutionStatusChange: ReturnType<typeof vi.fn>;
+  let onExecutionStatusChange: Mock<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>;
 
   beforeEach(() => {
     vi.useFakeTimers();
     mockDb = createMockDb();
-    onExecutionStatusChange = vi.fn();
+    onExecutionStatusChange = vi.fn<NonNullable<ExecutionTrackerDeps['onExecutionStatusChange']>>();
   });
 
   afterEach(() => {
@@ -5944,6 +6041,67 @@ describe('ExecutionTracker cross-repo attribution survives DB rehydration', () =
     expect(ctx.repoIdentifier).toBe(SOURCE_REPO);
   });
 
+  it("crash recovery names the server from the run's source, not its provider context", async () => {
+    const writer = new ExecutionTracker({ db: mockDb.db });
+    await startRun(writer, {
+      runId: 'run-recover-ghes',
+      repoIdentifier: SOURCE_REPO,
+      providerContext: INJECTED_CONTEXT,
+      jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      routingKey: 'github:1',
+    });
+    // The rehydrated row reads routing_key github:1; here that source is a GHES one.
+    const restarted = new ExecutionTracker({
+      db: mockDb.db,
+      onExecutionStatusChange,
+      githubSourceOf: (rk) =>
+        rk === 'github:1' ? { githubUrl: 'https://ghe.corp.example' } : undefined,
+    });
+
+    await restarted.onJobStatus(
+      'run-recover-ghes',
+      'job-1',
+      ExecutionJobStatus.enum.running,
+      Date.now(),
+    );
+
+    const ctx = onExecutionStatusChange.mock.calls.at(-1)![2] as ExecutionContext;
+    // fails-when: a restarted orchestrator forgets the run's server
+    expect(ctx.githubUrl).toBe('https://ghe.corp.example');
+    expect(restarted.getExecutionContext('run-recover-ghes')?.githubUrl).toBe(
+      'https://ghe.corp.example',
+    );
+  });
+
+  it('a recovered run whose GitHub source is gone is marked, not named github.com', async () => {
+    const writer = new ExecutionTracker({ db: mockDb.db });
+    await startRun(writer, {
+      runId: 'run-recover-gone',
+      repoIdentifier: SOURCE_REPO,
+      providerContext: INJECTED_CONTEXT,
+      jobs: [{ jobId: 'job-1', jobName: 'test' }],
+      routingKey: 'github:1',
+    });
+    // The rehydrated row reads routing_key github:1, whose source is now gone.
+    const restarted = new ExecutionTracker({
+      db: mockDb.db,
+      onExecutionStatusChange,
+      githubSourceOf: () => undefined,
+    });
+
+    await restarted.onJobStatus(
+      'run-recover-gone',
+      'job-1',
+      ExecutionJobStatus.enum.running,
+      Date.now(),
+    );
+
+    const ctx = onExecutionStatusChange.mock.calls.at(-1)![2] as ExecutionContext;
+    // fails-when: the recovered run's frames name its GHES actor in the github.com namespace
+    expect(ctx.githubSourceMissing).toBe(true);
+    expect(ctx).not.toHaveProperty('githubUrl');
+  });
+
   it('a rehydrated per-repository run still forwards no workflow repo', async () => {
     // Positive control for the assertion above: the SAME rehydration path over a
     // row with a NULL marker must forward nothing, so the test cannot be passing
@@ -5966,6 +6124,8 @@ describe('ExecutionTracker cross-repo attribution survives DB rehydration', () =
 
     const ctx = onExecutionStatusChange.mock.calls.at(-1)![2] as ExecutionContext;
     expect(ctx.workflowRepoIdentifier).toBeUndefined();
+    // breaks-if-wrong: a rehydrated github.com run names no server
+    expect(ctx).not.toHaveProperty('githubUrl');
   });
 
   it('rehydrates the trust posture, so a late job keeps its reduced-privilege note', async () => {

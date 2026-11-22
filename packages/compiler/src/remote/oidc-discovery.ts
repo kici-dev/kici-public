@@ -11,8 +11,8 @@ export interface OidcDiscoveryEndpoints {
   authorization_endpoint: string;
   /** RFC 6749 token endpoint (PKCE code exchange + device-flow polling). */
   token_endpoint: string;
-  /** RFC 8628 device authorization endpoint. */
-  device_authorization_endpoint: string;
+  /** RFC 8628 device authorization endpoint; absent when the IdP has no device flow. */
+  device_authorization_endpoint?: string;
 }
 
 const cache = new Map<string, OidcDiscoveryEndpoints>();
@@ -69,24 +69,20 @@ function parseEndpoints(body: unknown, url: string): OidcDiscoveryEndpoints {
     throw new Error(`IdP discovery at ${url} returned a non-object payload.`);
   }
   const obj = body as Record<string, unknown>;
-  const required: Array<keyof OidcDiscoveryEndpoints> = [
-    'issuer',
-    'authorization_endpoint',
-    'token_endpoint',
-    'device_authorization_endpoint',
-  ];
+  const required = ['issuer', 'authorization_endpoint', 'token_endpoint'] as const;
   const missing = required.filter((k) => typeof obj[k] !== 'string' || !obj[k]);
   if (missing.length > 0) {
     throw new Error(
       `IdP discovery at ${url} is missing required field(s): ${missing.join(', ')}. ` +
-        `The OIDC IdP must advertise authorization_endpoint, token_endpoint, and ` +
-        `device_authorization_endpoint via /.well-known/openid-configuration.`,
+        `The OIDC IdP must advertise issuer, authorization_endpoint and token_endpoint ` +
+        `via /.well-known/openid-configuration.`,
     );
   }
+  const device = obj.device_authorization_endpoint;
   return {
     issuer: String(obj.issuer),
     authorization_endpoint: String(obj.authorization_endpoint),
     token_endpoint: String(obj.token_endpoint),
-    device_authorization_endpoint: String(obj.device_authorization_endpoint),
+    ...(typeof device === 'string' && device !== '' && { device_authorization_endpoint: device }),
   };
 }

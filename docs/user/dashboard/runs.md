@@ -19,13 +19,13 @@ Each run is displayed in a table row (desktop) or card (mobile) with:
 - **Workflow** -- the workflow name from your `.kici/workflows/` directory, preceded by an icon for the trigger event. The first line of the commit message shows beneath it. A run that spans several workflows (the shared fixture run a `kici` older than 0.21.0 starts) shows its first workflow and a `+N` badge; hover the badge to see every workflow
 - **Event** -- the trigger event type (push, pull request, tag, dispatch, etc.)
 - **Branch** -- the git ref that triggered the run
-- **Commit** -- the first 7 characters of the commit SHA, linked to the provider (GitHub)
+- **Commit** -- the first 7 characters of the commit SHA, linked to the commit page on the run's repository host: GitHub, a GitHub Enterprise Server, GitLab or Bitbucket. A run whose host is not known shows the SHA as plain text
 - **Duration** -- how long the run took (e.g. "2m 30s")
 - **Time** -- relative timestamp (e.g. "5 minutes ago")
 
 ### Row actions
 
-Each row carries the same re-run / cancel actions as the run detail page, so the common "retry a flaky run" loop no longer requires opening the run first. They appear on the desktop table, the mobile card, and the commit-grouped view:
+Each row carries the same re-run / cancel actions as the run detail page, so you can retry a run without opening it first. They appear on the desktop table, the mobile card, and the commit-grouped view:
 
 - **Re-run** -- shown on terminal-state runs (success, failed, cancelled, error, timed out) that carry a trigger event or are themselves a re-run. Opens the same confirmation dialog before re-running on the same commit, then navigates to the new run.
 - **Cancel** -- shown on pending, running, cancelling, queued, or held runs. For a running run it sends a graceful cancel; for an already-cancelling run a **Force cancel** action appears to kill it immediately without cleanup.
@@ -104,7 +104,7 @@ The page uses a responsive multi-panel layout that adapts to screen width:
 
 A summary bar above the two panels shows:
 
-- **Breadcrumbs** -- Runs > github > owner/repo > commit SHA > #runId > workflow name (each segment is clickable and filters the run list by that dimension)
+- **Breadcrumbs** -- Runs > github > owner/repo > commit SHA > #runId > workflow name. The provider, repository, commit, and workflow segments filter the run list by that value, and `#runId` links to the run itself. A run that spans several workflows shows its first workflow with a `+N` suffix. A run from a local machine has no provider segment, and its repository segment is plain text
 - **Status badge** -- the current run status
 - **Trigger icon** -- visual indicator of the event type
 - **Branch** -- the git ref with a branch icon
@@ -172,7 +172,7 @@ The metadata panel shows detailed information organized into sections:
 
 A run whose recorded tier is anything other than `trusted` also shows a **Reduced privilege** banner at the top of the page. It names each reduction the orchestrator applied. Install and registry secrets were withheld, and the build cache was isolated to that run. A run that read the base branch's definitions gets a third line, saying workflow changes on the ref did not take effect. Without the banner the difference is invisible: the build fails on a missing private dependency with nothing on the page explaining why.
 
-Provider-specific links (e.g., GitHub commit URL, branch URL, PR link, workflow source file link) are automatically generated based on the repository context. The workflow name in the metadata panel is a clickable link to the `.kici/workflows/<name>.ts` source file on the provider (e.g. GitHub blob view).
+Provider-specific links (e.g., GitHub commit URL, branch URL, PR link, workflow source file link) are automatically generated based on the repository context. A run from a GitHub Enterprise Server source links to that server, not to github.com. The workflow name in the metadata panel is a clickable link to the `.kici/workflows/<name>.ts` source file on the provider (e.g. GitHub blob view).
 
 ### WebSocket connection indicator
 
@@ -185,7 +185,7 @@ page as they happen. It has three states:
   retried automatically.
 - **Red dot (pulsing)** -- disconnected; live updates are paused.
 
-Hovering (or focusing) the indicator opens a short explanation of what live
+Hovering (or focusing) the indicator opens a short explanation. It covers what live
 updates are, the impact while they are paused (run views fall back to refreshing
 every ~20 seconds instead of updating live), and the auto-retry status. When the
 connection is not active, the popover also offers a **Retry now** control that
@@ -210,7 +210,7 @@ keeps the full text.
 ### stdout and stderr are recorded separately
 
 Every stored log entry records which stream it came from — standard output or
-standard error — so a diagnostic can be told apart from ordinary progress output
+standard error. A diagnostic can therefore be told apart from ordinary progress output
 when you read the raw log records, for example the log a `kici run --local` run
 prints. The viewer itself shows both streams inline, in the order they were
 produced. Entries from an agent that does not report a stream are recorded as

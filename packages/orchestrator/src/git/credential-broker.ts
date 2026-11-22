@@ -38,6 +38,8 @@ type MintFn = (args: {
   installationId: string;
   repositories: readonly string[];
   permissions?: Readonly<Record<string, string>>;
+  /** Web URL of the GitHub Enterprise Server to mint at; unset mints at github.com. */
+  githubUrl?: string;
 }) => Promise<MintedToken>;
 
 /**
@@ -74,6 +76,12 @@ export interface BrokerResolveArgs {
   jobId?: string;
   /** Server truth a `<context>:<key>` reference is gated on. */
   gate: BrokerGateContext;
+  /**
+   * Web URL of the GitHub Enterprise Server the job's source lives on, where an
+   * `app` reference mints. Unset (github.com, or a source of another
+   * provider) mints at github.com.
+   */
+  githubUrl?: string;
 }
 
 /**
@@ -153,6 +161,9 @@ export class GitCredentialBroker {
           privateKey,
           repositories: args.repositories,
           ...(args.permissions ? { permissions: args.permissions } : {}),
+          // fails-when: a GHES job's App credential mints at api.github.com
+          // breaks-if-wrong: a github.com job mints with no server, as before
+          ...(args.githubUrl ? { githubUrl: args.githubUrl } : {}),
         });
         return {
           kind: 'basic',

@@ -32,6 +32,11 @@ export interface OverlayManifest {
    * Absent from a manifest written by a CLI that predates it.
    */
   symlinks?: Record<string, string>;
+  /**
+   * What the shipped `.git` holds (depth, tags). Absent from a manifest written
+   * by a CLI that ships the developer's raw `.git`; validated by the reader.
+   */
+  git?: unknown;
 }
 
 /** A file the overlay writes into the repository, at its real path. */
@@ -39,6 +44,10 @@ export interface CheckedCopy {
   key: string;
   src: string;
   dest: string;
+  /** The link text, when the tarball ships this path as a file symlink. */
+  linkText?: string;
+  /** For a file symlink: its verified target, relative to the extraction root. */
+  linkTarget?: string;
 }
 
 /** A path the overlay removes, at its real path. */

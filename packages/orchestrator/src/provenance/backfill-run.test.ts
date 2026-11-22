@@ -133,7 +133,13 @@ describe('backfillRunToPlatform workflow repo attribution', () => {
   async function statusFrame(row: BackfillRunRow): Promise<Record<string, unknown> | undefined> {
     const send = vi.fn();
     await backfillRunToPlatform(
-      { send, loadRun: async () => row, loadJobs: async () => [] },
+      {
+        send,
+        loadRun: async () => row,
+        loadJobs: async () => [],
+        githubSourceOf: (rk) =>
+          rk === 'github:7' ? { githubUrl: 'https://ghe.corp.example' } : {},
+      },
       row.run_id,
     );
     return send.mock.calls
@@ -146,6 +152,15 @@ describe('backfillRunToPlatform workflow repo attribution', () => {
     expect(status?.workflowRepoIdentifier).toBe(WORKFLOW_REPO);
     // The source repo is untouched — a global run belongs to both.
     expect(status?.repoIdentifier).toBe('acme/source-app');
+  });
+
+  it('carries the server of a run from a GitHub Enterprise Server source', async () => {
+    const status = await statusFrame(runRow({ routing_key: 'github:7' }));
+    // fails-when: a backfilled GHES run lands in the mirror with no server, so it links to github.com
+    expect(status?.repoWebUrl).toBe('https://ghe.corp.example');
+    // breaks-if-wrong: a github.com run's backfilled frame gains no key
+    const dotcom = await statusFrame(runRow({ routing_key: 'github:42' }));
+    expect(dotcom).not.toHaveProperty('repoWebUrl');
   });
 
   it('omits the workflow repo for an ordinary per-repository run', async () => {

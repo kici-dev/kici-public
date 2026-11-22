@@ -14,7 +14,7 @@
 import type { Command } from 'commander';
 import { createLogger, createPool } from '@kici-dev/shared';
 import { runIdempotentStep } from '@kici-dev/shared/idempotency';
-import { loadConfig } from '../../config.js';
+import { ConfigScope, loadConfig } from '../../config.js';
 import { createDb } from '../../db/client.js';
 import { DashboardEncryptionKeyRepo } from '../../db/repos/dashboard-encryption-keys-repo.js';
 import { ClusterSettingsReader } from '../../cluster/cluster-settings-reader.js';
@@ -26,7 +26,7 @@ import { cliAction, resolveDatabaseUrl } from './shared/cli-action.js';
 const logger = createLogger({ prefix: 'kici-admin-dashboard-encryption-key' });
 
 function resolveSecretKey(): string {
-  const config = loadConfig();
+  const config = loadConfig(ConfigScope.enum.admin);
   if (!config.secretKey) {
     throw new Error(
       'KICI_SECRET_KEY is required for the dashboard encryption key (it wraps the private key).',
@@ -51,7 +51,7 @@ async function withRepo<T>(
 
 /** Published whenever a provenance issuer is configured, independent of the Verified tier. */
 function publishedJwksUrl(): string | null {
-  const issuer = loadConfig().provenanceSigningIssuer;
+  const issuer = loadConfig(ConfigScope.enum.admin).provenanceSigningIssuer;
   return issuer ? jwksUrlFor(issuer) : null;
 }
 

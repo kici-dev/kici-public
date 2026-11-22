@@ -14,6 +14,9 @@ import {
 } from './prompts.js';
 import { OrchestratorMode, PLATFORM_CONNECTED_MODES } from '@kici-dev/engine';
 import { input } from '@inquirer/prompts';
+import { DEFAULT_PLATFORM_RELAY_URL } from '../../helpers/platform-relay-url.js';
+
+export { DEFAULT_PLATFORM_RELAY_URL };
 
 /** A GitHub App source the wizard collected, to be added once the orchestrator is running. */
 export interface OrchestratorSourceHint {
@@ -30,6 +33,11 @@ export interface OrchestratorWizardOptions {
    * the Platform relay plus this orchestrator's own direct webhook ingress.
    */
   defaultMode?: OrchestratorMode;
+  /**
+   * Default for the Platform relay URL prompt (`orchestrator install
+   * --platform-url`). Defaults to {@link DEFAULT_PLATFORM_RELAY_URL}.
+   */
+  defaultPlatformUrl?: string;
 }
 
 interface OrchestratorInstallConfig {
@@ -84,12 +92,6 @@ export async function checkPrivateKeyReadable(keyPath: string): Promise<string |
     return `Warning: private key path ${keyPath} is not readable — fix the path before running the source-add command`;
   }
 }
-
-/**
- * Default Platform relay URL; kept in lockstep with the quickstart compose
- * `KICI_PLATFORM_URL`, pinned by orchestrator-wizard.test.ts.
- */
-export const DEFAULT_PLATFORM_RELAY_URL = 'wss://api.kici.dev/ws';
 
 /**
  * Asks only the essential questions. The public webhook base URL is required in
@@ -163,7 +165,10 @@ export async function runOrchestratorWizard(
   let webhookPublicUrl: string | undefined;
   if (PLATFORM_CONNECTED_MODES.includes(mode)) {
     console.log('');
-    platformUrl = await promptUrl('Platform relay URL:', DEFAULT_PLATFORM_RELAY_URL);
+    platformUrl = await promptUrl(
+      'Platform relay URL:',
+      opts.defaultPlatformUrl ?? DEFAULT_PLATFORM_RELAY_URL,
+    );
     platformToken = await promptSecret('Platform authentication token:');
   }
   if (mode === OrchestratorMode.enum.observed) {

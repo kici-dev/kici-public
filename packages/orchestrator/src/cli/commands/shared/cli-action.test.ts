@@ -3,13 +3,17 @@ import {
   cliAction,
   parseIntOption,
   printJsonOr,
+  requireDbOnlyUrl,
   resolveDatabaseUrl,
+  resolveDbOnlyUrl,
   resolveDirectDbUrl,
+  setAdminUrlOnCommandLine,
 } from './cli-action.js';
 
 afterEach(() => {
   vi.restoreAllMocks();
   delete process.env.KICI_DATABASE_URL;
+  setAdminUrlOnCommandLine(false);
 });
 
 describe('cliAction', () => {
@@ -45,6 +49,26 @@ describe('db url resolution', () => {
     expect(resolveDirectDbUrl()).toBeNull();
   });
 
+  it('lets an explicit --url win over the env var, but not over --database-url', () => {
+    process.env.KICI_DATABASE_URL = 'postgres://env';
+    setAdminUrlOnCommandLine(true);
+    // fails-when: the orchestrator host's KICI_DATABASE_URL overrides an explicit --url
+    expect(resolveDirectDbUrl()).toBeNull();
+    // breaks-if-wrong: an explicit --database-url still selects the database
+    expect(resolveDirectDbUrl('postgres://a')).toBe('postgres://a');
+  });
+
+  it('resolves a database-only command from the env var even with an explicit --url', () => {
+    process.env.KICI_DATABASE_URL = 'postgres://env';
+    setAdminUrlOnCommandLine(true);
+    // fails-when: an explicit --url hides KICI_DATABASE_URL from a command with no admin API mode
+    expect(resolveDbOnlyUrl()).toBe('postgres://env');
+    expect(resolveDatabaseUrl()).toBe('postgres://env');
+    expect(resolveDbOnlyUrl('postgres://a')).toBe('postgres://a');
+    delete process.env.KICI_DATABASE_URL;
+    expect(resolveDbOnlyUrl()).toBeNull();
+  });
+
   // fails-when: the required variant returns '' instead of throwing
   it('resolveDatabaseUrl throws the documented message when unset', () => {
     expect(() => resolveDatabaseUrl()).toThrow(
@@ -52,6 +76,27 @@ describe('db url resolution', () => {
     );
     process.env.KICI_DATABASE_URL = 'postgres://env';
     expect(resolveDatabaseUrl()).toBe('postgres://env');
+  });
+});
+
+describe('requireDbOnlyUrl', () => {
+  it('refuses naming KICI_DATABASE_URL, the only variable it reads', () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    requireDbOnlyUrl(undefined);
+    // fails-when: the refusal names DATABASE_URL or another variable kici-admin never reads
+    expect(err).toHaveBeenCalledWith(
+      'Error: --database-url or KICI_DATABASE_URL is required (direct-DB only)',
+    );
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it('returns the URL from KICI_DATABASE_URL without refusing', () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    process.env.KICI_DATABASE_URL = 'postgres://from-env';
+    // breaks-if-wrong: the variable the message names is the one that is read
+    expect(requireDbOnlyUrl(undefined)).toBe('postgres://from-env');
+    expect(exit).not.toHaveBeenCalled();
   });
 });
 

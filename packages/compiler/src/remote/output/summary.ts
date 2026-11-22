@@ -6,6 +6,7 @@ import {
   toCanonicalStatus,
   type CanonicalStatus,
 } from '@kici-dev/engine';
+import type { OverlayReport } from '../../commands/preview.js';
 
 /** One job of a fixture's result. */
 export interface RunJobResult {
@@ -35,6 +36,8 @@ export interface RunResult {
   jobs: RunJobResult[];
   /** Each run the fixture created; absent when the result predates it. */
   runs?: FixtureRunResult[];
+  /** What the run's overlay carried; absent when no overlay was built. */
+  overlay?: OverlayReport;
 }
 
 /** True when the jobs come from more than one workflow, so a bare job name is ambiguous. */

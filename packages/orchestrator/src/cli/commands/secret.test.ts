@@ -5,7 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runCli } from '../../__test-helpers__/cli.js';
 
-const mockSetContextSecretDirect = vi.fn();
+const mockSetSecretDirect = vi.fn();
+const mockVerifySecretsDirect = vi.fn();
+const DIRECT_SETTINGS = { masterKeys: null, pgCustomerSecrets: true };
 const mockListContextsDirect = vi.fn();
 const mockShowContextDirect = vi.fn();
 
@@ -13,19 +15,27 @@ vi.mock('@kici-dev/shared', async (importOriginal) => {
   const original = (await importOriginal()) as Record<string, unknown>;
   return {
     ...original,
-    setContextSecretDirect: mockSetContextSecretDirect,
     listContextsDirect: mockListContextsDirect,
     showContextDirect: mockShowContextDirect,
   };
 });
 
-const { registerSecretCommands } = await import('./secret.js');
+// The encrypting writer has its own database test (shared/secret-direct.db.test.ts).
+vi.mock('./shared/secret-direct.js', () => ({
+  setSecretDirect: mockSetSecretDirect,
+  verifySecretsDirect: mockVerifySecretsDirect,
+  resolveDirectSecretSettings: () => DIRECT_SETTINGS,
+  secretEnvFromEnvFile: () => ({}),
+}));
+
+const { registerSecretCommands, UNCONFIRMED_KEY_WARNING } = await import('./secret.js');
 const { unboundContextWarning } = await import('./shared/unbound-context-warning.js');
 const { ContextType } = await import('@kici-dev/engine');
 
 interface MockClient {
   get: ReturnType<typeof vi.fn>;
   listScopes: ReturnType<typeof vi.fn>;
+  verifySecrets: ReturnType<typeof vi.fn>;
   listKeys: ReturnType<typeof vi.fn>;
   setSecret: ReturnType<typeof vi.fn>;
   deleteSecret: ReturnType<typeof vi.fn>;
@@ -38,6 +48,7 @@ function makeMockClient(): MockClient {
   return {
     get: vi.fn(),
     listScopes: vi.fn(),
+    verifySecrets: vi.fn(),
     listKeys: vi.fn(),
     setSecret: vi.fn(),
     deleteSecret: vi.fn(),
@@ -58,6 +69,7 @@ describe('kici-admin secret CLI', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     delete process.env.KICI_DATABASE_URL;
+    mockSetSecretDirect.mockResolvedValue({ keyConfirmed: true });
   });
 
   afterEach(() => {
@@ -79,7 +91,7 @@ describe('kici-admin secret CLI', () => {
     });
 
     it('sets a secret via direct-DB mode', async () => {
-      mockSetContextSecretDirect.mockResolvedValue({ inserted: true });
+      mockSetSecretDirect.mockResolvedValue({ keyConfirmed: true });
       const { stdout, exitCode } = await runCommand([
         'secret',
         'set',
@@ -87,37 +99,18 @@ describe('kici-admin secret CLI', () => {
         'staging',
         'DEPLOY_KEY',
         '--value',
-        'ciphertext',
+        'plain-value',
         '--database-url',
         'postgres://x',
       ]);
       expect(exitCode).toBeNull();
-      expect(mockSetContextSecretDirect).toHaveBeenCalledWith('postgres://x', {
-        orgId: 'org-1',
-        context: 'staging',
-        key: 'DEPLOY_KEY',
-        encryptedValue: 'ciphertext',
-      });
-      expect(stdout).toContain('(direct)');
-    });
-
-    it('refuses a direct-DB write whose key would make the AAD ambiguous', async () => {
-      // Direct-DB bypasses the admin route and PgSecretStore, so it needs its own guard.
-      mockSetContextSecretDirect.mockResolvedValue({ inserted: true });
-      const { stderr, exitCode } = await runCommand([
-        'secret',
-        'set',
-        'org-1',
-        'staging',
-        'a:b',
-        '--value',
-        'ciphertext',
-        '--database-url',
+      // The plaintext goes to the encrypting writer, never to a verbatim insert.
+      expect(mockSetSecretDirect).toHaveBeenCalledWith(
         'postgres://x',
-      ]);
-      expect(exitCode).toBe(1);
-      expect(stderr).toMatch(/letters, digits/);
-      expect(mockSetContextSecretDirect).not.toHaveBeenCalled();
+        { orgId: 'org-1', scope: 'staging', key: 'DEPLOY_KEY', value: 'plain-value' },
+        DIRECT_SETTINGS,
+      );
+      expect(stdout).toContain('(direct)');
     });
   });
 
@@ -152,7 +145,7 @@ describe('kici-admin secret CLI', () => {
     });
 
     it('warns in direct-DB mode too', async () => {
-      mockSetContextSecretDirect.mockResolvedValue({ inserted: true });
+      mockSetSecretDirect.mockResolvedValue({ keyConfirmed: true });
       mockListContextsDirect.mockResolvedValue({
         contexts: [{ name: 'staging', type: ContextType.enum.fixed }],
       });
@@ -188,6 +181,92 @@ describe('kici-admin secret CLI', () => {
   });
 
   // ── sugar form ───────────────────────────────────────────────────────────
+  describe('verify', () => {
+    const PLAIN = { orgId: 'org-1', scope: 'legacy', key: 'PLAIN' };
+
+    it('lists each undecryptable secret by location and exits 1 (HTTP)', async () => {
+      const client = makeMockClient();
+      client.verifySecrets.mockResolvedValue({ undecryptable: [PLAIN] });
+      const { stdout, exitCode } = await runCommand(['secret', 'verify'], client);
+      // fails-when: verify exits 0 while a row the orchestrator cannot read is stored
+      expect(exitCode).toBe(1);
+      expect(stdout).toContain('org org-1  scope legacy  key PLAIN');
+      expect(stdout).toContain('kici-admin secret set');
+    });
+
+    it('exits 0 when every secret decrypts', async () => {
+      // breaks-if-wrong: a clean install must pass the check a script gates on
+      const client = makeMockClient();
+      client.verifySecrets.mockResolvedValue({ undecryptable: [] });
+      const { stdout, exitCode } = await runCommand(['secret', 'verify', '--json'], client);
+      expect(exitCode).toBeNull();
+      expect(JSON.parse(stdout)).toEqual({ undecryptable: [] });
+    });
+
+    it('reads the database directly in direct-DB mode', async () => {
+      mockVerifySecretsDirect.mockResolvedValue([PLAIN]);
+      const client = makeMockClient();
+      const { exitCode } = await runCommand(
+        ['secret', 'verify', '--database-url', 'postgres://x', '--env-file', '/etc/kici/o.env'],
+        client,
+      );
+      expect(mockVerifySecretsDirect).toHaveBeenCalledWith('postgres://x', DIRECT_SETTINGS);
+      expect(client.verifySecrets).not.toHaveBeenCalled();
+      expect(exitCode).toBe(1);
+    });
+  });
+
+  describe('--env-file and the master key', () => {
+    it('refuses --env-file outside direct-database mode, for set and verify', async () => {
+      // fails-when: --env-file is silently ignored, so the operator believes its key was used
+      for (const args of [
+        ['secret', 'set', 'org-1', 'staging', 'K', '--value', 'v', '--env-file', '/etc/kici/o.env'],
+        ['secret', 'verify', '--env-file', '/etc/kici/o.env'],
+      ]) {
+        const { stderr, exitCode, client } = await runCommand(args);
+        expect(exitCode, args.join(' ')).toBe(1);
+        expect(stderr).toContain('--env-file is read only in direct-database mode');
+        expect(client.setSecret).not.toHaveBeenCalled();
+        expect(client.verifySecrets).not.toHaveBeenCalled();
+      }
+    });
+
+    it('warns, and points at secret verify, when no stored secret confirms the key', async () => {
+      mockSetSecretDirect.mockResolvedValue({ keyConfirmed: false });
+      const { stdout, stderr, exitCode } = await runCommand([
+        'secret',
+        'set',
+        'org-1',
+        'staging',
+        'K',
+        '--value',
+        'v',
+        '--database-url',
+        'postgres://x',
+        '--env-file',
+        '/etc/kici/o.env',
+      ]);
+      expect(exitCode).toBeNull();
+      expect(stdout).toContain("Secret 'K' set in scope 'staging' for org org-1 (direct).");
+      expect(stderr).toContain(UNCONFIRMED_KEY_WARNING);
+      expect(UNCONFIRMED_KEY_WARNING).toContain('kici-admin secret verify');
+      // breaks-if-wrong: a key the store confirmed writes with no warning
+      mockSetSecretDirect.mockResolvedValue({ keyConfirmed: true });
+      const confirmed = await runCommand([
+        'secret',
+        'set',
+        'org-1',
+        'staging',
+        'K',
+        '--value',
+        'v',
+        '--database-url',
+        'postgres://x',
+      ]);
+      expect(confirmed.stderr).not.toContain('confirms the master key');
+    });
+  });
+
   describe('set (--context sugar form)', () => {
     it('sets a secret via HTTP using --org/--context/--key', async () => {
       const client = makeMockClient();
@@ -213,7 +292,7 @@ describe('kici-admin secret CLI', () => {
     });
 
     it('sets a secret via direct-DB using --context sugar', async () => {
-      mockSetContextSecretDirect.mockResolvedValue({ inserted: false });
+      mockSetSecretDirect.mockResolvedValue({ keyConfirmed: true });
       const { stdout, exitCode } = await runCommand([
         'secret',
         'set',
@@ -229,12 +308,11 @@ describe('kici-admin secret CLI', () => {
         'postgres://x',
       ]);
       expect(exitCode).toBeNull();
-      expect(mockSetContextSecretDirect).toHaveBeenCalledWith('postgres://x', {
-        orgId: 'org-1',
-        context: 'staging',
-        key: 'DEPLOY_KEY',
-        encryptedValue: 'v1',
-      });
+      expect(mockSetSecretDirect).toHaveBeenCalledWith(
+        'postgres://x',
+        { orgId: 'org-1', scope: 'staging', key: 'DEPLOY_KEY', value: 'v1' },
+        DIRECT_SETTINGS,
+      );
       expect(stdout).toContain('(direct)');
     });
 

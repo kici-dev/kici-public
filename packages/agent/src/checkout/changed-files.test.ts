@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { EventPayload } from '@kici-dev/sdk';
@@ -211,6 +212,109 @@ describe('computeChangedFiles', () => {
         expect(res).toEqual({ files: ['src/new.ts'], status: 'fetched' });
       } finally {
         await rm(clone, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('in a full clone (checkout fetchDepth 0)', () => {
+    const prEvent = (baseBranch: string) =>
+      ({ type: 'pull_request', baseBranch, targetBranch: baseBranch }) as unknown as EventPayload;
+    const inClone = (clone: string, args: string[]) =>
+      execFileSync('git', ['-C', clone, ...args], { encoding: 'utf8' }).trim();
+
+    /** More commits than the deepen loop fetches (one `--depth 1` plus five 50-commit deepens). */
+    const BASE_COMMITS = 300;
+
+    /** Write a branch `unrelated` of `count` commits with no common history, in one fast-import. */
+    function unrelatedBranch(count: number): void {
+      const lines: string[] = [];
+      for (let i = 1; i <= count; i++) {
+        const message = `unrelated ${i}`;
+        lines.push('commit refs/heads/unrelated', `committer t <t@t> ${1_700_000_000 + i} +0000`);
+        lines.push(`data ${message.length}`, message);
+        lines.push('');
+      }
+      execFileSync('git', ['-C', dir, 'fast-import', '--quiet'], { input: lines.join('\n') });
+    }
+
+    /** Clone `branch` with full history, the way the agent clones at fetchDepth 0. */
+    function fullClone(branch: string): string {
+      const clone = join(dir, '..', `${dir.split('/').pop()}-full`);
+      execFileSync('git', ['clone', '-q', '--branch', branch, `file://${dir}`, clone]);
+      return clone;
+    }
+
+    it('never deepens a full clone whose PR base has no merge-base', async () => {
+      await commit({ 'a.ts': '1' }, 'base');
+      git(['checkout', '-q', '-b', 'feature']);
+      await commit({ 'src/new.ts': 'x' }, 'feature work');
+      const full = fullClone('feature');
+      try {
+        // The base appears on the remote after the clone, with unrelated history
+        // longer than the bounded deepen loop reaches.
+        unrelatedBranch(BASE_COMMITS);
+        await computeChangedFiles(full, prEvent('unrelated'));
+        // fails-when: the missing base is fetched with --depth 1 on a full clone, which
+        // makes it shallow; the bounded deepen loop cannot reach the base's root
+        expect(inClone(full, ['rev-parse', '--is-shallow-repository'])).toBe('false');
+        expect(inClone(full, ['rev-list', '--count', 'origin/unrelated'])).toBe(
+          String(BASE_COMMITS),
+        );
+      } finally {
+        await rm(full, { recursive: true, force: true });
+      }
+    });
+
+    it('runs no deepen fetch in a full clone whose PR base has no merge-base', async () => {
+      await commit({ 'a.ts': '1' }, 'base');
+      git(['checkout', '-q', '-b', 'feature']);
+      await commit({ 'src/new.ts': 'x' }, 'feature work');
+      git(['checkout', '-q', '--orphan', 'unrelated']);
+      await commit({ 'other.ts': 'z' }, 'unrelated root');
+      const full = fullClone('feature');
+      try {
+        const cloned = inClone(full, ['rev-parse', 'origin/unrelated']);
+        // The remote base advances after the clone; a deepen fetch would move the ref.
+        await commit({ 'other.ts': 'zz' }, 'unrelated advances');
+        const res = await computeChangedFiles(full, prEvent('unrelated'));
+        expect(res).toEqual({ files: [], status: 'unavailable' });
+        // fails-when: the bounded deepen loop runs its --deepen fetches on a full clone
+        expect(inClone(full, ['rev-parse', 'origin/unrelated'])).toBe(cloned);
+      } finally {
+        await rm(full, { recursive: true, force: true });
+      }
+    });
+
+    it('a full clone holding the base diffs without any fetch', async () => {
+      await commit({ 'a.ts': '1' }, 'base');
+      git(['checkout', '-q', '-b', 'feature']);
+      await commit({ 'src/new.ts': 'x' }, 'feature work');
+      const full = fullClone('feature');
+      try {
+        const res = await computeChangedFiles(full, prEvent('main'));
+        expect(res).toEqual({ files: ['src/new.ts'], status: 'fetched' });
+        // breaks-if-wrong: the fast path stays fetch-free (any fetch writes FETCH_HEAD)
+        expect(existsSync(join(full, '.git', 'FETCH_HEAD'))).toBe(false);
+      } finally {
+        await rm(full, { recursive: true, force: true });
+      }
+    });
+
+    it('fetches a push commit the full clone lacks without making it shallow', async () => {
+      const before = await commit({ 'a.ts': '1' }, 'base');
+      const full = fullClone('main');
+      try {
+        const after = await commit({ 'src/late.ts': 'x' }, 'pushed after the clone');
+        const res = await computeChangedFiles(full, {
+          type: 'push',
+          targetBranch: 'main',
+          payload: { before, after },
+        } as unknown as EventPayload);
+        expect(res).toEqual({ files: ['src/late.ts'], status: 'fetched' });
+        // fails-when: ensureCommit fetches the missing commit with --depth 1 on a full clone
+        expect(inClone(full, ['rev-parse', '--is-shallow-repository'])).toBe('false');
+      } finally {
+        await rm(full, { recursive: true, force: true });
       }
     });
   });

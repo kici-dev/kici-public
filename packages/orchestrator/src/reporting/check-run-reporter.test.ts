@@ -11,6 +11,7 @@ import { REDUCED_PRIVILEGE_MARKER } from '../security/reduced-privilege-note.js'
 import { SUMMARY_BYTE_LIMIT } from './check-run-summary.js';
 import { StepLogBuffer } from './step-log-buffer.js';
 import { GithubCheckConclusion } from './github-check-conclusion.js';
+import { createAppOctokit, createInstallationOctokit } from '../providers/github/auth.js';
 
 vi.mock('../metrics/prometheus.js', () => ({
   githubCheckRunTotal: { add: vi.fn() },
@@ -24,6 +25,10 @@ const mockChecksCreate = vi.fn().mockImplementation(() => {
 const mockChecksUpdate = vi.fn().mockResolvedValue({});
 const mockChecksListForRef = vi.fn().mockResolvedValue({ data: { check_runs: [] } });
 
+// App-level Octokit for stale check-run cleanup: the one path that lists check runs from the
+// GitHub API instead of the in-memory id map, so it resolves the installation as the App.
+const mockGetRepoInstallation = vi.fn().mockResolvedValue({ data: { id: 77 } });
+
 vi.mock('../providers/github/auth.js', () => ({
   createInstallationOctokit: vi.fn().mockReturnValue({
     checks: {
@@ -32,21 +37,12 @@ vi.mock('../providers/github/auth.js', () => ({
       listForRef: (...args: unknown[]) => mockChecksListForRef(...args),
     },
   }),
-}));
-
-// App-level Octokit for stale check-run cleanup: the one path that lists check runs from the
-// GitHub API instead of the in-memory id map, so it resolves the installation as the App.
-const mockGetRepoInstallation = vi.fn().mockResolvedValue({ data: { id: 77 } });
-
-vi.mock('@octokit/rest', () => ({
-  Octokit: class {
-    apps = {
+  createAppOctokit: vi.fn().mockReturnValue({
+    apps: {
       getRepoInstallation: (...args: unknown[]) => mockGetRepoInstallation(...args),
-    };
-  },
+    },
+  }),
 }));
-
-vi.mock('@octokit/auth-app', () => ({ createAppAuth: vi.fn() }));
 
 const githubConfig = {
   appId: '12345',
@@ -54,12 +50,15 @@ const githubConfig = {
 };
 const ROUTING_KEY = 'github:12345';
 
-/** A registry whose GitHub bundle at `routingKey` carries `githubConfig`. */
-function githubRegistry(routingKey: string = ROUTING_KEY): ProviderRegistry {
+/** A registry whose GitHub bundle at `routingKey` carries `config` (`githubConfig` by default). */
+function githubRegistry(
+  routingKey: string = ROUTING_KEY,
+  config: { appId: string; privateKey: string; githubUrl?: string } = githubConfig,
+): ProviderRegistry {
   const registry = new ProviderRegistry();
   registry.registerByRoutingKey(routingKey, {
     normalizer: {} as never,
-    cloneTokenProvider: { provider: 'github', getAppConfig: () => githubConfig } as never,
+    cloneTokenProvider: { provider: 'github', getAppConfig: () => config } as never,
   });
   return registry;
 }
@@ -2269,6 +2268,21 @@ describe('stale check-run cleanup names the workflow repository', () => {
       status: 'completed',
       conclusion: CheckRunConclusion.enum.timed_out,
     });
+  });
+
+  it("resolves the installation as the App on the source's server", async () => {
+    const ghesConfig = { ...githubConfig, githubUrl: 'https://ghe.corp.example' };
+    const reporter = new CheckRunReporter({
+      providerRegistry: githubRegistry(ROUTING_KEY, ghesConfig),
+    });
+    listChecks([{ id: PER_REPO_CHECK_ID, name: `kici/${WORKFLOW}` }]);
+
+    cleanup(reporter);
+
+    await vi.waitFor(() => expect(mockChecksUpdate).toHaveBeenCalled());
+    // fails-when: the cleanup builds its own App Octokit that ignores the source's server
+    expect(vi.mocked(createAppOctokit)).toHaveBeenCalledWith(ghesConfig);
+    expect(vi.mocked(createInstallationOctokit)).toHaveBeenCalledWith(ghesConfig, 77);
   });
 
   it('times out the unqualified check when the workflow repository is the acted-on one', async () => {

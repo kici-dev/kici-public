@@ -25,4 +25,30 @@ describe('runCli', () => {
     await work.catch(() => undefined);
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
   });
+
+  // fails-when: a Platform's newer-client refusal surfaces as a stack trace, not its message
+  it('prints the Platform message and exits 1 when a Platform refuses a newer CLI', async () => {
+    const message = 'This component is newer than the KiCI Platform it connects to.';
+    vi.resetModules();
+    vi.doMock('./commands/index.js', async (importOriginal) => {
+      const { ClientNewerThanPlatformError } = await import('./remote/platform-fetch.js');
+      return {
+        ...(await importOriginal<object>()),
+        orgListCommand: async () => {
+          throw new ClientNewerThanPlatformError(message);
+        },
+      };
+    });
+    const exit = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const { runCli: fresh } = await import('./cli.js');
+      fresh(['node', 'kici', 'org', 'list']);
+      await (guard.mock.calls[0][0] as Promise<unknown>).catch(() => undefined);
+      await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
+      expect(stderr.mock.calls.map((c) => String(c[0])).join('')).toContain(message);
+    } finally {
+      vi.doUnmock('./commands/index.js');
+    }
+  });
 });

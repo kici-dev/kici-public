@@ -14,6 +14,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { toErrorMessage } from '@kici-dev/shared';
 import type { AdminApiClient } from '../api-client.js';
 import {
   buildGithubAppManifest,
@@ -22,16 +23,23 @@ import {
   verifyRepoAccess,
   validateWebhookUrl,
   type GithubAppCredentials,
+  type ManifestConversionOptions,
 } from '../../providers/github/manifest.js';
 import { manifestCreateUrl } from '../../providers/github/manifest-form.js';
+import { githubAppInstallUrl, isDefaultGithubUrl } from '../../providers/github/github-host.js';
 import { startManifestLoopback, type ManifestLoopback } from '../loopback-callback.js';
 import { openBrowserBestEffort } from '../open-browser.js';
 import { webhookNoteReason, webhookNoteHint } from '../webhook-url-notes.js';
 import type { PlatformAttachment } from '../../db/repos/org-ids-repo.js';
 import { resolveNewSourceOrg } from '../../sources/source-org.js';
 
-/** Static marketing-site page the CLI points at in headless paste-code mode. */
+/**
+ * Static marketing-site page the CLI points at in headless paste-code mode,
+ * unless the orchestrator reports a page its Platform serves itself.
+ */
 const STATIC_CALLBACK_URL = 'https://kici.dev/gh-manifest-callback';
+
+const PREFLIGHT_PATH = '/api/v1/admin/sources/github-webhook-url';
 
 /** How long to wait for the operator to click "Create" on GitHub. */
 const CREATE_TIMEOUT_MS = 5 * 60_000;
@@ -52,6 +60,11 @@ export interface ManifestSetupOptions {
   webhookUrl?: string;
   /** Org the source belongs to; the orchestrator defaults it to the attached org. */
   customerId?: string;
+  /**
+   * GitHub web URL the App is created on (`--github-url`), already validated
+   * with `parseGithubWebUrl`. Unset means github.com.
+   */
+  githubUrl?: string;
 }
 
 /** Injectable boundary so unit tests can stub GitHub + the browser + stdin. */
@@ -59,7 +72,7 @@ export interface ManifestSetupDeps {
   startLoopback: typeof startManifestLoopback;
   openBrowser: (url: string) => void | Promise<void>;
   readLine: (prompt: string) => Promise<string>;
-  convert: (code: string) => Promise<GithubAppCredentials>;
+  convert: (code: string, opts?: ManifestConversionOptions) => Promise<GithubAppCredentials>;
   waitForInstallation: typeof waitForInstallation;
   verifyRepoAccess: typeof verifyRepoAccess;
   /** Persist a created App's PEM to a 0600 file for orphan-app recovery. */
@@ -87,7 +100,7 @@ export const realManifestSetupDeps: ManifestSetupDeps = {
   startLoopback: startManifestLoopback,
   openBrowser: openBrowserBestEffort,
   readLine: defaultReadLine,
-  convert: (code) => convertManifestCode(code),
+  convert: (code, opts) => convertManifestCode(code, opts),
   waitForInstallation,
   verifyRepoAccess,
   writeRecoveryFile: defaultWriteRecoveryFile,
@@ -114,37 +127,134 @@ async function checkSourceOrg(opts: ManifestSetupOptions, client: AdminApiClient
   if (!org.ok) throw new Error(org.error);
 }
 
-/** Resolve the org-scoped webhook URL via the pre-flight route; abort if null. */
-async function resolveWebhookUrl(client: AdminApiClient): Promise<string> {
-  const pre = await client.get<{ webhookUrl: string | null; webhookNote?: string }>(
-    '/api/v1/admin/sources/github-webhook-url',
-  );
+/** What the orchestrator's manifest pre-flight reports. */
+interface ManifestPreflight {
+  webhookUrl: string | null;
+  webhookNote?: string;
+  /** A headless manifest page the orchestrator's Platform serves itself. */
+  manifestCallbackUrl?: string;
+}
+
+/** Read the manifest pre-flight: the org-scoped webhook URL and the Platform's own page. */
+async function readManifestPreflight(client: AdminApiClient): Promise<ManifestPreflight> {
+  return client.get<ManifestPreflight>(PREFLIGHT_PATH);
+}
+
+/** The message of an orchestrator that predates the pre-flight route or its fields. */
+const OLDER_ORCHESTRATOR_ERROR = /^HTTP 4\d\d\b/;
+
+/**
+ * Read the pre-flight for its manifest page only (an explicit --webhook-url
+ * already fixed the webhook URL), so a pre-flight that cannot be read falls
+ * back to the default page. Only a 4xx, an orchestrator without the route, is
+ * tolerated silently; any other failure is named before the fallback.
+ */
+async function readPreflightForPage(
+  client: AdminApiClient,
+): Promise<ManifestPreflight | undefined> {
+  try {
+    return await readManifestPreflight(client);
+  } catch (err) {
+    const message = toErrorMessage(err);
+    // fails-when: a 5xx or a transport failure falls back to the default page silently
+    // breaks-if-wrong: an older orchestrator's 404 must stay a silent fallback
+    if (!OLDER_ORCHESTRATOR_ERROR.test(message)) {
+      console.error(
+        `Note: could not read the manifest pre-flight (${message}); using the default page`,
+      );
+    }
+    return undefined;
+  }
+}
+
+/**
+ * The headless page kici-admin prints and bakes into the App's redirect URL:
+ * the page the orchestrator reports, or the default page. A reported value
+ * that is not a plain http(s) URL aborts the flow rather than being printed.
+ */
+function headlessPageUrl(pre: ManifestPreflight | undefined): string {
+  const value = pre?.manifestCallbackUrl;
+  if (!value) return STATIC_CALLBACK_URL;
+  const refuse = (): never => {
+    throw new Error(
+      `The orchestrator reported an unusable manifest page URL (${JSON.stringify(value)}): ` +
+        'it must be an http:// or https:// URL with no credentials, fragment, whitespace or ' +
+        'control character',
+    );
+  };
+  // fails-when: a javascript:, credential-bearing or line-broken value is printed for the
+  //   operator to open and baked into the App's redirect URL
+  // breaks-if-wrong: http://127.0.0.1:14460/github/manifest-callback (a local install's
+  //   page) must still be accepted verbatim
+  if (/[\s\u0000-\u001f\u007f]/.test(value)) refuse();
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return refuse();
+  }
+  if (
+    (url.protocol !== 'http:' && url.protocol !== 'https:') ||
+    url.username !== '' ||
+    url.password !== '' ||
+    value.includes('#')
+  ) {
+    refuse();
+  }
+  return value;
+}
+
+/**
+ * The webhook URL baked into the App and the headless page, before anything
+ * exists on GitHub. An explicit --webhook-url means the operator owns delivery
+ * and is used verbatim; the pre-flight is then read only with --no-browser,
+ * for its manifest page. Otherwise the pre-flight supplies the webhook URL, and
+ * a null one aborts. The loopback flow neither prints nor bakes the headless
+ * page, so only --no-browser uses the reported page.
+ */
+async function resolveManifestTargets(
+  opts: ManifestSetupOptions,
+  client: AdminApiClient,
+): Promise<{ webhookUrl: string; callbackUrl: string }> {
+  if (opts.webhookUrl) {
+    const webhookUrl = validateWebhookUrl(opts.webhookUrl);
+    // fails-when: the loopback flow reads a pre-flight it uses for nothing
+    // breaks-if-wrong: --no-browser must still read it to print the reported page
+    const callbackUrl = opts.noBrowser
+      ? headlessPageUrl(await readPreflightForPage(client))
+      : STATIC_CALLBACK_URL;
+    return { webhookUrl, callbackUrl };
+  }
+  const pre = await readManifestPreflight(client);
   if (!pre.webhookUrl) {
     throw new Error(
       `Cannot resolve the webhook URL for the new GitHub App: ${webhookNoteReason(pre.webhookNote)}. ` +
         webhookNoteHint(pre.webhookNote),
     );
   }
-  return pre.webhookUrl;
+  return {
+    webhookUrl: pre.webhookUrl,
+    callbackUrl: opts.noBrowser ? headlessPageUrl(pre) : STATIC_CALLBACK_URL,
+  };
 }
 
 /**
  * Catch the short-lived setup code: over the loopback (browser mode) or by
- * printing the static-site URL and reading the pasted code (headless mode).
+ * printing the headless page's URL and reading the pasted code.
  */
 async function captureCode(
   opts: ManifestSetupOptions,
   deps: ManifestSetupDeps,
   manifestJson: string,
   state: string,
-  redirectUrl: string,
+  callbackUrl: string,
   createUrl: string,
   loopback: ManifestLoopback,
 ): Promise<string> {
   if (opts.noBrowser) {
     const m = Buffer.from(manifestJson, 'utf-8').toString('base64url');
     const url =
-      `${STATIC_CALLBACK_URL}#m=${m}&state=${encodeURIComponent(state)}` +
+      `${callbackUrl}#m=${m}&state=${encodeURIComponent(state)}` +
       `&createUrl=${encodeURIComponent(createUrl)}`;
     console.log('Open this URL in a browser to create your App:');
     console.log(`  ${url}`);
@@ -157,16 +267,18 @@ async function captureCode(
   await deps.openBrowser(loopback.formUrl);
   console.log(`  (if your browser did not open, visit ${loopback.formUrl} )`);
   const { code } = await loopback.waitForCode(CREATE_TIMEOUT_MS);
-  void redirectUrl;
   return code;
 }
+
+/** A created App's credentials, with the GitHub Enterprise Server it lives on when there is one. */
+type ServerAppCredentials = GithubAppCredentials & { githubUrl?: string };
 
 /** Store credentials + register; on failure, save the PEM so the App is not orphaned. */
 async function storeAndRegister(
   opts: ManifestSetupOptions,
   client: AdminApiClient,
   deps: ManifestSetupDeps,
-  creds: GithubAppCredentials,
+  creds: ServerAppCredentials,
 ): Promise<{ routingKey: string }> {
   try {
     // GitHub's conversion response is the source of truth for name and slug;
@@ -178,6 +290,7 @@ async function storeAndRegister(
       appId: creds.appId,
       privateKey: creds.privateKey,
       webhookSecret: creds.webhookSecret,
+      ...(creds.githubUrl && { githubUrl: creds.githubUrl }),
       ...(opts.customerId && { customerId: opts.customerId }),
     });
   } catch (err) {
@@ -190,6 +303,7 @@ async function storeAndRegister(
     console.error(
       `    kici-admin source add github --name "${opts.name}" --app-id ${creds.appId} ` +
         `--private-key @${file} --webhook-secret ${creds.webhookSecret}` +
+        (creds.githubUrl ? ` --github-url ${creds.githubUrl}` : '') +
         (opts.customerId ? ` --org ${opts.customerId}` : ''),
     );
     throw err;
@@ -203,15 +317,12 @@ export async function runGithubManifestSetup(
 ): Promise<void> {
   await checkSourceOrg(opts, client);
 
-  // Resolve the webhook URL BEFORE creating anything on GitHub. An explicit
-  // --webhook-url means the operator owns delivery and is used verbatim.
-  const webhookUrl = opts.webhookUrl
-    ? validateWebhookUrl(opts.webhookUrl)
-    : await resolveWebhookUrl(client);
+  // Resolve the webhook URL BEFORE creating anything on GitHub.
+  const { webhookUrl, callbackUrl } = await resolveManifestTargets(opts, client);
 
   // CSRF state; GitHub generates the webhook secret itself.
   const state = randomBytes(16).toString('hex');
-  const createUrl = manifestCreateUrl(opts.githubOrg);
+  const createUrl = manifestCreateUrl(opts.githubOrg, opts.githubUrl);
 
   const loopback = await deps.startLoopback({
     state,
@@ -222,7 +333,7 @@ export async function runGithubManifestSetup(
     const manifest = buildGithubAppManifest({
       name: opts.name,
       webhookUrl,
-      redirectUrl: opts.noBrowser ? STATIC_CALLBACK_URL : loopback.redirectUrl,
+      redirectUrl: opts.noBrowser ? callbackUrl : loopback.redirectUrl,
     });
     const manifestJson = JSON.stringify(manifest);
 
@@ -230,24 +341,27 @@ export async function runGithubManifestSetup(
     loopback.close();
     const lb = await deps.startLoopback({ state, manifestJson, createUrl });
     try {
-      const code = await captureCode(
-        opts,
-        deps,
-        manifestJson,
-        state,
-        lb.redirectUrl,
-        createUrl,
-        lb,
-      );
+      const code = await captureCode(opts, deps, manifestJson, state, callbackUrl, createUrl, lb);
 
-      // The private key stays on this host.
-      const creds = await deps.convert(code);
-      console.log(`→ ✓ App created (id ${creds.appId}), credentials captured`);
+      // The private key stays on this host. The code is exchanged on the API of
+      // the host the App was created on: github.com without --github-url.
+      const converted = await (opts.githubUrl
+        ? deps.convert(code, { githubUrl: opts.githubUrl })
+        : deps.convert(code));
+      console.log(`→ ✓ App created (id ${converted.appId}), credentials captured`);
 
+      // Every later step talks to the App's server: storing it, the install
+      // wait and the access check. A github.com App carries no server.
+      // fails-when: a GitHub Enterprise Server App is stored and checked as a github.com App
+      // breaks-if-wrong: an explicit --github-url https://github.com keeps today's credentials
+      const creds: ServerAppCredentials = {
+        ...converted,
+        ...(!isDefaultGithubUrl(opts.githubUrl) && { githubUrl: opts.githubUrl }),
+      };
       const stored = await storeAndRegister(opts, client, deps, creds);
       console.log(`→ ✓ Stored on orchestrator (encrypted), registered as ${stored.routingKey}`);
 
-      const installUrl = `https://github.com/apps/${creds.slug}/installations/new`;
+      const installUrl = githubAppInstallUrl(creds.githubUrl, creds.slug);
       console.log(`→ Install the App on your repos: ${installUrl}`);
       if (!opts.noBrowser) await deps.openBrowser(installUrl);
 

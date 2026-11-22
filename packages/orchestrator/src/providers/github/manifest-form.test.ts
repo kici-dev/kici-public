@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { DEFAULT_GITHUB_URL } from './github-host.js';
 import {
   manifestCreateUrl,
   renderManifestFormHtml,
@@ -7,9 +8,23 @@ import {
 
 describe('manifest form', () => {
   it('targets personal vs org create endpoints', () => {
+    // breaks-if-wrong: github.com operators keep today's URL
     expect(manifestCreateUrl()).toBe('https://github.com/settings/apps/new');
     expect(manifestCreateUrl('acme')).toBe(
       'https://github.com/organizations/acme/settings/apps/new',
+    );
+    expect(manifestCreateUrl(undefined, DEFAULT_GITHUB_URL)).toBe(
+      'https://github.com/settings/apps/new',
+    );
+  });
+
+  it('targets a GitHub Enterprise Server host', () => {
+    // fails-when: --github-url stops reaching the create URL
+    expect(manifestCreateUrl(undefined, 'https://ghe.corp.example')).toBe(
+      'https://ghe.corp.example/settings/apps/new',
+    );
+    expect(manifestCreateUrl('acme', 'https://ghe.corp.example')).toBe(
+      'https://ghe.corp.example/organizations/acme/settings/apps/new',
     );
   });
 

@@ -64,7 +64,7 @@ const { ContextStore } = await import('./contexts/context-store.js');
 const { VariableStore } = await import('./contexts/variable-store.js');
 const { createIndependentApprovalExtras } = await import('./approvals/independent-wiring.js');
 
-import type { OrchestratorHooks } from './orchestrator-core.js';
+import type { ModeAppDepsExtras, OrchestratorHooks } from './orchestrator-core.js';
 import { OrchestratorMode } from '@kici-dev/engine';
 import { buildLocalGithubIngressUrl } from './cli/local-github-ingress-url.js';
 import {
@@ -271,6 +271,19 @@ await guardStartup(logger, async () => {
       }
 
       return {
+        configReloaderExtras: {
+          onProviderChange: async (_newConfig: any, _oldConfig: any, s: any) => {
+            // Providers are DB-managed via SourceManager -- reload from DB
+            await s.sourceManager.reload();
+            const newRegistry = s.sourceManager.getRegistry();
+            s.providerRegistry = newRegistry;
+            s.checkRunReporter.updateRegistry(newRegistry);
+            logger.info('Provider registry reloaded from sources (standalone)', {
+              routingKeys: newRegistry.getRoutingKeys(),
+            });
+          },
+        },
+
         // No platformClient in independent mode. The EventLogWriter is
         // constructed by orchestrator-core and passed through createApp()
         // automatically.
@@ -327,20 +340,8 @@ await guardStartup(logger, async () => {
           // and the stale detector both read, plus the release callbacks the
           // detector resumes a lapsed wait / freed concurrency slot through.
           ...approvals,
-        },
-
-        configReloaderExtras: {
-          onProviderChange: async (_newConfig: any, _oldConfig: any, s: any) => {
-            // Providers are DB-managed via SourceManager -- reload from DB
-            await s.sourceManager.reload();
-            const newRegistry = s.sourceManager.getRegistry();
-            s.providerRegistry = newRegistry;
-            s.checkRunReporter.updateRegistry(newRegistry);
-            logger.info('Provider registry reloaded from sources (standalone)', {
-              routingKeys: newRegistry.getRoutingKeys(),
-            });
-          },
-        },
+          // Checked here: a typo in a returned literal otherwise compiles.
+        } satisfies ModeAppDepsExtras,
 
         // No extra shutdown steps (no Platform client to disconnect)
         shutdownExtras: [],

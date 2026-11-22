@@ -54,9 +54,15 @@ export {
 // Admin API client + GitHub App manifest setup (exported for tests that drive
 // the one-click setup orchestration against a running orchestrator with the
 // GitHub API boundary stubbed).
-export { AdminApiClient } from './cli/api-client.js';
+export { AdminApiClient, AdminApiHttpError, AdminApiUnreachableError } from './cli/api-client.js';
+export type { AdminRequestOptions } from './cli/api-client.js';
 export {
   runGithubManifestSetup,
   type ManifestSetupOptions,
   type ManifestSetupDeps,
 } from './cli/commands/source-manifest.js';
+
+// Lazy dependencies (exported for tests that fetch one through a mirror, the way
+// `KICI_LAZY_DEPS_MIRROR` makes kici-admin fetch it on an air-gapped host)
+export { ensureDep } from './cli/lazy-deps/downloader.js';
+export { getDepMetadata, type LazyDep } from '@kici-dev/shared/lazy-deps';

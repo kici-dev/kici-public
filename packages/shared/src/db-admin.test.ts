@@ -2,7 +2,10 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { Migration, MigrationProvider } from 'kysely/migration';
 import pg from 'pg';
 import {
+  QUIET_STATEMENT_SETTINGS,
   computeMigrationsHash,
+  createDbRole,
+  createReadOnlyDbUser,
   dropAndCreateDatabase,
   ensureDatabase,
   maskDatabaseUrl,
@@ -15,7 +18,6 @@ import {
   listContextsDirect,
   showContextDirect,
   createContextTemplateDirect,
-  setContextSecretDirect,
   listCheckRunTrackingDirect,
   registerWorkflowManualDirect,
   isSchemaCurrent,
@@ -883,60 +885,6 @@ describe('createContextTemplateDirect', () => {
   });
 });
 
-describe('setContextSecretDirect', () => {
-  let pool: ReturnType<typeof installPoolMock>;
-  afterEach(() => pool?.restore());
-
-  it('upserts and returns inserted flag', async () => {
-    pool = installPoolMock([{ rows: [{ inserted: true }], rowCount: 1 }]);
-    const result = await setContextSecretDirect('postgresql://u:p@h:5432/d', {
-      orgId: 'org1',
-      context: 'staging',
-      key: 'API_KEY',
-      encryptedValue: 'e2e-dummy:abc',
-    });
-    expect(result).toEqual({ inserted: true });
-    expect(pool.calls[0].sql).toMatch(/INSERT INTO scoped_secrets/);
-    expect(pool.calls[0].params).toEqual(['org1', 'staging', 'API_KEY', 'e2e-dummy:abc']);
-  });
-
-  it('rejects missing orgId', async () => {
-    pool = installPoolMock([]);
-    await expect(
-      setContextSecretDirect('postgresql://u:p@h:5432/d', {
-        orgId: '',
-        context: 'staging',
-        key: 'x',
-        encryptedValue: 'y',
-      }),
-    ).rejects.toThrow(/orgId required/);
-  });
-
-  it('rejects missing context', async () => {
-    pool = installPoolMock([]);
-    await expect(
-      setContextSecretDirect('postgresql://u:p@h:5432/d', {
-        orgId: 'org1',
-        context: '',
-        key: 'x',
-        encryptedValue: 'y',
-      }),
-    ).rejects.toThrow(/context name required/);
-  });
-
-  it('rejects missing key', async () => {
-    pool = installPoolMock([]);
-    await expect(
-      setContextSecretDirect('postgresql://u:p@h:5432/d', {
-        orgId: 'org1',
-        context: 'staging',
-        key: '',
-        encryptedValue: 'y',
-      }),
-    ).rejects.toThrow(/key required/);
-  });
-});
-
 describe('listCheckRunTrackingDirect', () => {
   let pool: ReturnType<typeof installPoolMock>;
   afterEach(() => pool?.restore());
@@ -1194,6 +1142,8 @@ describe('isSchemaCurrent kinds', () => {
     );
     expect(s.kind).toBe(SchemaStatusKind.UnknownApplied);
     expect(s.reason).toBe('migration count mismatch (applied=3, expected=2)');
+    // fails-when: the count reason hides which migrations the database carries beyond the build
+    expect(s.unknown).toEqual(['012_y']);
   });
   // fails-when: a same-count rename is reported as current
   it('reports same-count name drift as unknown-applied', async () => {
@@ -1203,6 +1153,7 @@ describe('isSchemaCurrent kinds', () => {
     );
     expect(s.kind).toBe(SchemaStatusKind.UnknownApplied);
     expect(s.reason).toBe('migration names mismatch (unknown applied: 011_other)');
+    expect(s.unknown).toEqual(['011_other']);
   });
   // fails-when: a ledger row this build does not carry (a baseline row a development
   // build wrote) reads as anything but unknown-applied
@@ -1234,5 +1185,88 @@ describe('isSchemaCurrent kinds', () => {
     await expect(
       isSchemaCurrent(fakePool(refused, null), provider(['010_baseline'])),
     ).rejects.toThrow(/ENOTFOUND/);
+  });
+});
+
+describe('role password statements', () => {
+  let pool: ReturnType<typeof installPoolMock>;
+  afterEach(() => pool?.restore());
+
+  const empty = (n: number): MockQueryResult[] =>
+    Array.from({ length: n }, () => ({ rows: [], rowCount: 0 }));
+  const SU = { rows: [{ su: true }], rowCount: 1 };
+  const quietSets = QUIET_STATEMENT_SETTINGS.map(([n, v]) => `SET LOCAL ${n} = '${v}'`);
+  const nQuiet = QUIET_STATEMENT_SETTINGS.length;
+
+  it('turns statement logging off for a superuser session before the password statement', async () => {
+    // fails-when: the CREATE ROLE runs with the server's logging settings, so
+    // log_statement=ddl writes the password literal into the server log.
+    pool = installPoolMock([
+      ...empty(1), // SELECT 1 FROM pg_roles — absent
+      SU,
+      ...empty(nQuiet + 1), // each SET LOCAL, then CREATE ROLE
+    ]);
+    const outcome = await createDbRole('postgresql://postgres:pw@localhost:5432/postgres', {
+      username: 'kici_app',
+      password: "s3cr'et",
+    });
+    expect(outcome).toBe('created');
+    expect(pool.calls.map((c) => c.sql).slice(1)).toEqual([
+      "SELECT current_setting('is_superuser') = 'on' AS su",
+      'BEGIN',
+      ...quietSets,
+      `CREATE ROLE "kici_app" LOGIN PASSWORD 's3cr''et'`,
+      'COMMIT',
+    ]);
+  });
+
+  it('runs the statement unchanged for a role that cannot change the settings', async () => {
+    // breaks-if-wrong: a CREATEROLE non-superuser cannot SET these settings;
+    // trying would fail the whole command.
+    pool = installPoolMock([
+      { rows: [{ '?column?': 1 }], rowCount: 1 }, // role exists
+      { rows: [{ su: false }], rowCount: 1 },
+      { rows: [], rowCount: 0 }, // ALTER ROLE
+    ]);
+    const outcome = await createDbRole('postgresql://owner:pw@localhost:5432/postgres', {
+      username: 'kici_app',
+      password: 'pw2',
+    });
+    expect(outcome).toBe('updated');
+    const sqls = pool.calls.map((c) => c.sql);
+    expect(sqls.at(-1)).toBe(`ALTER ROLE "kici_app" PASSWORD 'pw2'`);
+    expect(sqls.some((s) => s.startsWith('SET'))).toBe(false);
+    expect(sqls).not.toContain('BEGIN');
+  });
+
+  it('rolls back and rethrows when the password statement fails', async () => {
+    pool = installPoolMock([
+      ...empty(1),
+      SU,
+      ...empty(nQuiet), // no response for CREATE ROLE: the mock throws
+    ]);
+    await expect(
+      createDbRole('postgresql://postgres:pw@localhost:5432/postgres', {
+        username: 'kici_app',
+        password: 'pw',
+      }),
+    ).rejects.toThrow(/no response queued/);
+    expect(pool.calls.at(-1)?.sql).toBe('ROLLBACK');
+  });
+
+  it('applies the same suppression to the read-only user', async () => {
+    pool = installPoolMock([
+      ...empty(1), // role absent
+      SU,
+      ...empty(nQuiet + 5), // each SET LOCAL, CREATE ROLE, four GRANT / ALTER DEFAULT
+    ]);
+    await createReadOnlyDbUser('postgresql://postgres:pw@localhost:5432/platform', {
+      username: 'ro',
+      password: 'ro-pw',
+    });
+    const sqls = pool.calls.map((c) => c.sql);
+    const create = sqls.indexOf(`CREATE ROLE "ro" LOGIN PASSWORD 'ro-pw'`);
+    for (const s of quietSets) expect(sqls.indexOf(s)).toBeLessThan(create);
+    expect(sqls[create + 1]).toBe('COMMIT');
   });
 });

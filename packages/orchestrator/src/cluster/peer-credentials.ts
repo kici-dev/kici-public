@@ -214,13 +214,15 @@ export class PeerCredentialStore {
       .execute();
   }
 
-  async revoke(instanceId: string): Promise<void> {
-    await this.db
+  /** @returns The number of active credentials revoked: 0 when the instance has none. */
+  async revoke(instanceId: string): Promise<number> {
+    const result = await this.db
       .updateTable('peer_credentials' as any)
       .set({ revoked_at: new Date() })
       .where('instance_id', '=', instanceId)
       .where('revoked_at', 'is', null)
-      .execute();
+      .executeTakeFirst();
+    return Number((result as any)?.numUpdatedRows ?? 0);
   }
 
   /** @returns The number of credentials revoked. */

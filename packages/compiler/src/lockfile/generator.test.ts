@@ -110,7 +110,7 @@ describe('schemaWindowWarning', () => {
   });
 
   it('stays silent in the additive era (the current floor is below the current version)', () => {
-    // fails-when: the v44 bump is stamped as breaking (minReaderVersion = SCHEMA_VERSION)
+    // fails-when: the v45 bump is stamped as breaking (minReaderVersion = SCHEMA_VERSION)
     expect(BREAKING_FLOOR).toBeLessThan(SCHEMA_VERSION);
     expect(schemaWindowWarning(BREAKING_FLOOR, SCHEMA_VERSION)).toBeNull();
   });
@@ -288,6 +288,39 @@ describe('generator - agent execution fields', () => {
       const lockFile = generateLockFile([makeWorkflowWithSource(w)]);
       const lockJob = onlyStaticJob(lockFile);
       expect(lockJob.checkout).toBe(false);
+    });
+
+    it('emits checkoutOptions for the object form and no checkout key', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s], checkout: { fetchDepth: 0 } });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockJob = onlyStaticJob(generateLockFile([makeWorkflowWithSource(w)]));
+      // fails-when: the object form lands in the boolean `checkout` key an older agent reads
+      expect(lockJob.checkoutOptions).toEqual({ fetchDepth: 0 });
+      expect('checkout' in lockJob).toBe(false);
+    });
+
+    it('keeps checkout: false byte-identical', () => {
+      const s = step('deploy', async () => {});
+      const j = job('deploy', { runsOn: 'linux', steps: [s], checkout: false });
+      const w = workflow('ci', { jobs: [j] });
+
+      const serialized = JSON.stringify(
+        onlyStaticJob(generateLockFile([makeWorkflowWithSource(w)])),
+      );
+      expect(serialized).toContain('"checkout":false');
+      expect(serialized).not.toContain('checkoutOptions');
+    });
+
+    it('emits neither key when checkout is unset', () => {
+      const s = step('build', async () => {});
+      const j = job('build', { runsOn: 'linux', steps: [s] });
+      const w = workflow('ci', { jobs: [j] });
+
+      const lockJob = onlyStaticJob(generateLockFile([makeWorkflowWithSource(w)]));
+      expect('checkout' in lockJob).toBe(false);
+      expect('checkoutOptions' in lockJob).toBe(false);
     });
 
     it('serializes container string to LockJob', () => {
@@ -515,7 +548,7 @@ describe('generator - agent execution fields', () => {
         mise: { version: 'v2026.5.1', env: { PROBE: 'x' } },
       });
       // fails-when: the bump is stamped breaking, so a 0.17.0 orchestrator rejects every lock
-      expect(lockFile.schemaVersion).toBe(44);
+      expect(lockFile.schemaVersion).toBe(45);
       expect(lockFile.minReaderVersion).toBe(42);
     });
 

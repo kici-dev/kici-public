@@ -38,20 +38,20 @@ Rejecting either kind of hold moves the run to `cancelled` with the `cancelled` 
 
 A job is one dispatchable unit within a run, executed by a single agent. Its status carries more outcomes than a run because jobs surface agent-level and scheduling verdicts that a run only ever reports as an aggregate:
 
-| Status            | Description                                                                | Terminal |
-| ----------------- | -------------------------------------------------------------------------- | -------- |
-| `pending`         | Queued behind dependencies or parallelism limits.                          | No       |
-| `queued`          | Ready to dispatch, waiting for an agent.                                   | No       |
-| `running`         | Executing on an agent.                                                     | No       |
-| `recovering`      | Agent temporarily disconnected; awaiting reconnect or timeout.             | No       |
-| `cancelling`      | Graceful cancellation in progress.                                         | No       |
-| `success`         | Completed successfully.                                                    | Yes      |
-| `failed`          | Completed with a failure.                                                  | Yes      |
-| `cancelled`       | Cancelled before or during execution.                                      | Yes      |
-| `skipped`         | Not run because its `if` condition or a dependency excluded it.            | Yes      |
-| `timed_out_stale` | Reaped after its agent went silent past the stale threshold.               | Yes      |
-| `drift_dropped`   | Dropped because the workflow definition changed under the run.             | Yes      |
-| `unroutable`      | Its `runsOn` matched no agent for the whole queue window, so it never ran. | Yes      |
+| Status            | Description                                                                                                              | Terminal |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------ | -------- |
+| `pending`         | Queued behind dependencies or parallelism limits.                                                                        | No       |
+| `queued`          | Ready to dispatch, waiting for an agent.                                                                                 | No       |
+| `running`         | Executing on an agent.                                                                                                   | No       |
+| `recovering`      | Agent temporarily disconnected; awaiting reconnect or timeout.                                                           | No       |
+| `cancelling`      | Graceful cancellation in progress.                                                                                       | No       |
+| `success`         | Completed successfully.                                                                                                  | Yes      |
+| `failed`          | Completed with a failure.                                                                                                | Yes      |
+| `cancelled`       | Cancelled before or during execution.                                                                                    | Yes      |
+| `skipped`         | Not run because its `if` condition or a dependency excluded it.                                                          | Yes      |
+| `timed_out_stale` | Its agent went silent past the stale threshold, or it expired in the queue because a matching agent never became usable. | Yes      |
+| `drift_dropped`   | Re-evaluating the dynamic job function on the agent no longer generated this job (determinism drift).                    | Yes      |
+| `unroutable`      | Its `runsOn` matched no agent for the whole queue window, so it never ran.                                               | Yes      |
 
 ### Step status (`ExecutionStepStatus`)
 
@@ -66,21 +66,19 @@ A step is one command within a job. Steps report independently so the run timeli
 | `pending`   | A parallel-group child queued behind the group's `maxParallel` limit, not yet launched. |
 | `cancelled` | A parallel-group sibling aborted by fail-fast. This is **not** a failure.               |
 
-A `TERMINAL_STEP_STATES` constant sits alongside the run and job terminal sets described below (`success`, `failed`, `skipped`, `cancelled`). No lifecycle logic consults it — a step's outcome is read directly from its status. Its one consumer is the dashboard, which pairs it with the job status to decide when a job has stopped producing log lines.
-
 Each step also carries a concurrency role (`StepConcurrencyKind`) that explains which of those values it can take: `sequential` for an ordinary step in the flat step sequence, `parallel-child` for a member of a `parallel()` group running concurrently with its siblings, and `parallel-group` for the structural group wrapper the dashboard renders as an aggregate band. The `pending` and `cancelled` statuses only ever appear on parallel-group children.
 
 ## Terminal states
 
-A status is **terminal** when the entity has reached a final outcome and will not change again. The terminal sets live alongside the enums in `execution-status.ts` as three constants, and the run and job sets deliberately differ:
+A status is **terminal** when the entity has reached a final outcome and will not change again. The terminal sets live alongside the enums in `execution-status.ts` as constants, and the run and job sets deliberately differ:
 
 - **`TERMINAL_RUN_STATES`** = `success`, `failed`, `cancelled`.
 - **`TERMINAL_JOB_STATES`** = `success`, `failed`, `cancelled`, `skipped`, `timed_out_stale`, `drift_dropped`, `unroutable`.
 - **`TERMINAL_STEP_STATES`** = `success`, `failed`, `skipped`, `cancelled`. The lifecycle paths read a step's status directly instead. The dashboard's run-detail log viewer is the set's one consumer: a job whose agent went silent is finalised on the job row alone, so its steps stay at `running` forever, and the viewer checks the job status first and the step set second before it closes a job's live log subscriptions.
 
-The four extra job-terminal values — `skipped`, `timed_out_stale`, `drift_dropped`, `unroutable` — are **job-level verdicts**. They describe how an individual job settled, and they roll up into the run's aggregate outcome rather than appearing on the run directly. A run whose only unfinished job is skipped still settles on `success` or `failed` based on its other jobs; it never carries a `skipped` status of its own. Keeping the two sets separate is what makes a run-level terminal check use the 3-value set and a job-level check use the 7-value set.
+The four extra job-terminal values — `skipped`, `timed_out_stale`, `drift_dropped`, `unroutable` — are **job-level verdicts**. They describe how an individual job settled, and they roll up into the run's aggregate outcome rather than appearing on the run directly. A run whose only unfinished job is skipped still settles on `success` or `failed` based on its other jobs; it never carries a `skipped` status of its own. Keeping the two sets separate is what makes a run-level terminal check use `TERMINAL_RUN_STATES` and a job-level check use `TERMINAL_JOB_STATES`.
 
-`TerminalJobStatus` is the type-level counterpart of `TERMINAL_JOB_STATES`, and its direction is deliberate. It is written as an `Exclude<>` of the five non-terminal statuses rather than an `Extract<>` of the seven terminal ones, because only `Exclude<>` widens when a value joins the enum. A switch that claims to be total over the terminal set then fails to compile until the new status is handled — which is the only reason to write such a switch. The check-run reporter is the consumer that relies on this: it maps each terminal job status onto a provider check conclusion, and a new status must not silently fall through to a default arm.
+`TerminalJobStatus` is the type-level counterpart of `TERMINAL_JOB_STATES`, and its direction is deliberate. It is written as an `Exclude<>` of the non-terminal statuses rather than an `Extract<>` of the terminal ones, because only `Exclude<>` widens when a value joins the enum. A switch that claims to be total over the terminal set then fails to compile until the new status is handled — which is the only reason to write such a switch. The check-run reporter is the consumer that relies on this: it maps each terminal job status onto a provider check conclusion, and a new status must not silently fall through to a default arm.
 
 ## Shared status classification
 
@@ -104,7 +102,7 @@ One case bypasses the roll-up entirely: a run executing in `check-fail-on-drift`
 
 A run reaches a terminal status when all of its jobs are terminal. At that point the tracker stamps the run's `completed_at` and `duration_ms` and records the failure class (`RunFailureClass`) for a failed or cancelled run, so downstream reads and notification subscriptions can match on why it ended. A failed run with a `timed_out_stale`, `drift_dropped`, or `unroutable` job gets `timed_out`, because one of its jobs never really ran; any other failed run gets `step_failure`. The init-failure paths stamp `never_started`, and the Platform stamps `dead_orchestrator`.
 
-That rollup is only as correct as the set of jobs the run knows about, so the tracker holds a run open while jobs are still to be registered. It has two mechanisms for that, and neither introduces a second notion of completeness — both keep the same all-jobs-terminal check from passing early:
+That rollup is only as correct as the set of jobs the run knows about, so the tracker holds a run open while jobs are still to be registered. Its mechanisms for that add no second notion of completeness. Each one keeps the same all-jobs-terminal check from passing early:
 
 - **Jobs gated behind another job** (a `needs` dependency, a rolling-wave hold) are registered up front as non-terminal placeholder rows and swapped for the real job when it is dispatched.
 - **Jobs whose registration is still pending.** Several windows leave a run registered with fewer jobs than it will end up with, and the tracker holds the run open across each one. A workflow whose source must be packed first runs its build job alone while the run's real jobs wait. A run without a build is registered with no jobs before its dispatch loop, and its jobs land as each dispatch returns. A job whose environment or matrix is resolved by an init step, and a dynamic job function that generates its jobs at run time, both register their jobs from work that continues after the dispatch call returns. Without a hold, the jobs registered so far reaching a terminal state would read as the run finishing — posting a green check to the provider and forwarding a terminal status to the Platform before the jobs it was still registering had run. The hold counts the outstanding registrations rather than flagging one window, so overlapping windows each keep the run open until their own jobs land, and it is a property of the in-memory run rather than a placeholder job, so it never appears as a phantom job or inflates the run's reported job count.

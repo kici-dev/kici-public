@@ -27,6 +27,7 @@ import {
   RunDetailFallbackReason,
 } from '@kici-dev/engine';
 import { loadGlobalConfig, type GlobalConfig } from './config.js';
+import { ClientNewerThanPlatformError, platformFetch } from './platform-fetch.js';
 
 export type DashboardErrorKind =
   | 'not_logged_in'
@@ -215,7 +216,7 @@ export class DashboardClient {
   }
 
   private async send(method: string, path: string, body?: unknown): Promise<Response> {
-    const res = await fetch(this.orgUrl(path), {
+    const res = await platformFetch(this.orgUrl(path), {
       method,
       headers: {
         'Content-Type': 'application/json',
@@ -223,6 +224,7 @@ export class DashboardClient {
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     }).catch((err: unknown) => {
+      if (err instanceof ClientNewerThanPlatformError) throw err;
       throw new DashboardClientError('http', `Network error: ${String(err)}`);
     });
     if (!res.ok) return this.throwForStatus(res);

@@ -207,6 +207,54 @@ describe('run remote --approve-all / --yes option wiring', () => {
   });
 });
 
+describe('run remote git flag wiring', () => {
+  function parseRemote(args: string[]): Record<string, unknown> {
+    const program = buildProgram();
+    const run = program.commands.find((c) => c.name() === 'run');
+    const remote = run?.commands.find((c) => c.name() === 'remote');
+    if (!remote) throw new Error('run remote command not found');
+    // Neutralise the action so parsing does not run the real command.
+    remote.action(() => {});
+    remote.parse(['fixture-id', ...args], { from: 'user' });
+    return remote.opts();
+  }
+
+  it('gives the tag policy three states: --git-tags, --no-git-tags, neither', () => {
+    // fails-when: declaring --no-git-tags makes Commander default gitTags to true,
+    // so a run without the flag overrides the lock-derived tag policy
+    expect(parseRemote(['--git-tags']).gitTags).toBe(true);
+    expect(parseRemote(['--no-git-tags']).gitTags).toBe(false);
+    expect(parseRemote([]).gitTags).toBeUndefined();
+  });
+
+  it('defaults commit to true and turns it off with --no-commit', () => {
+    expect(parseRemote([]).commit).toBe(true);
+    expect(parseRemote(['--no-commit']).commit).toBe(false);
+  });
+
+  it('collects every --tag and keeps --git-depth raw', () => {
+    const opts = parseRemote(['--tag', 'v1', '--tag', 'v2', '--git-depth', '0']);
+    expect(opts.tag).toEqual(['v1', 'v2']);
+    expect(opts.gitDepth).toBe('0');
+    expect(parseRemote([]).tag).toEqual([]);
+  });
+
+  it.each([
+    ['--tag a..b', "Error: --tag 'a..b' is not a valid tag name"],
+    ["--commit-message ''", 'Error: --commit-message must not be empty'],
+  ])(
+    'exits 2 with a clean error on %s, before any other work',
+    (flag, message) => {
+      const result = runCli(`run remote push-main ${flag}`);
+      expect(result.exitCode).toBe(2);
+      expect(result.stderr).toContain(message);
+      // fails-when: the validator's plain Error escapes as an uncaught stack trace
+      expect(result.stderr).not.toMatch(/^\s+at /m);
+    },
+    SPAWN_TIMEOUT_MS,
+  );
+});
+
 describe('isMainEntryPoint (symlink-tolerant entry-point guard)', () => {
   it('returns true when argv[1] is the real module path', () => {
     expect(isMainEntryPoint(CLI_PATH, pathToFileURL(CLI_PATH).href)).toBe(true);
@@ -261,4 +309,54 @@ describe('CLI invoked through a bin symlink', () => {
     },
     SPAWN_TIMEOUT_MS,
   );
+});
+
+describe('kici login --help', () => {
+  function loginHelp(): string {
+    const login = buildProgram().commands.find((c) => c.name() === 'login');
+    if (!login) throw new Error('login command not found');
+    let out = '';
+    login.configureOutput({ writeOut: (s) => (out += s), writeErr: (s) => (out += s) });
+    login.outputHelp();
+    return out;
+  }
+
+  it('describes --platform-endpoint as the Platform API URL and lists KICI_PLATFORM_URL', () => {
+    const help = loginHelp();
+    // fails-when: the flag is described as the relay (WebSocket) URL, which kici login refuses
+    // Commander wraps option descriptions; compare with the line breaks folded.
+    expect(help.replace(/\s+/g, ' ')).toContain(
+      'Platform API URL (http:// or https://, default https://api.kici.dev)',
+    );
+    expect(help).not.toContain('Platform relay URL');
+    // fails-when: the environment block omits the variable kici login reads for the endpoint
+    expect(help).toMatch(/^\s+KICI_PLATFORM_URL\s+Platform API URL/m);
+    // breaks-if-wrong: the existing variables stay listed
+    expect(help).toMatch(/^\s+KICI_OIDC_ISSUER\s+/m);
+  });
+
+  it('lists the extra-scope flag and variable', () => {
+    const help = loginHelp();
+    expect(help).toContain('--oidc-scope <scope>');
+    // fails-when: the help hides that one value may list several scopes
+    expect(help.replace(/\s+/g, ' ')).toContain(
+      'a value may list several scopes separated by commas or spaces',
+    );
+    expect(help).toMatch(/^\s+KICI_OIDC_EXTRA_SCOPES\s+Extra OIDC scopes/m);
+  });
+
+  // fails-when: a second --oidc-scope replaces the first instead of adding to it
+  it('collects every --oidc-scope in order', () => {
+    const parse = (args: string[]) => {
+      const login = buildProgram().commands.find((c) => c.name() === 'login')!;
+      login.action(() => {});
+      login.parse(args, { from: 'user' });
+      return login.opts().oidcScope as string[];
+    };
+    expect(parse(['--oidc-scope', 'groups', '--oidc-scope', 'api://kici/.default'])).toEqual([
+      'groups',
+      'api://kici/.default',
+    ]);
+    expect(parse([])).toEqual([]);
+  });
 });

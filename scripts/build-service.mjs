@@ -26,6 +26,7 @@ import {
   pruneOrphanDeclarations,
 } from './lib/atomic-dist.mjs';
 import { builtinModules } from 'node:module';
+import { importsNodeBuiltin } from './lib/build-platform.mjs';
 
 /**
  * Entries delivered to the customer job container as single files, so they are
@@ -47,6 +48,35 @@ const nodeBuiltinExternal = [
  * defined`, no build error). Revisit if minification is enabled.
  */
 export const usesCjsGlobals = (code) => /\b__(filename|dirname)\b/.test(code);
+
+/**
+ * Whether built code carries a static `import … "node:…"` statement. A browser entry must
+ * not: a browser bundler cannot resolve a node built-in, and Vite only warns while it
+ * replaces the module with an empty stub.
+ */
+export { importsNodeBuiltin };
+
+/**
+ * The `build.browserEntries` names: entries a browser bundles (the dashboard imports them)
+ * and Node imports too. They build for the neutral platform, so rolldown injects no node
+ * runtime helper, and their output is refused when it imports a node built-in.
+ *
+ * @param {Record<string, string>} entries the `build.entries` map
+ * @param {unknown} browserEntries the `build.browserEntries` value, if any
+ * @returns {Set<string>}
+ */
+export function resolveBrowserEntries(entries, browserEntries) {
+  if (browserEntries === undefined) return new Set();
+  if (!Array.isArray(browserEntries)) {
+    throw new Error('"build.browserEntries" must be an array of entry output names');
+  }
+  for (const name of browserEntries) {
+    if (!Object.hasOwn(entries, name)) {
+      throw new Error(`"build.browserEntries" names "${name}", which is not in "build.entries"`);
+    }
+  }
+  return new Set(browserEntries);
+}
 
 // The repo root is the nearest directory with pnpm-workspace.yaml: `private:
 // true` is no marker, since service packages are private too.
@@ -173,6 +203,8 @@ async function main() {
       ? { ...entries, ...devEntries }
       : entries;
 
+  const browserEntries = resolveBrowserEntries(allEntries, pkg.build?.browserEntries);
+
   const buildDate = new Date().toISOString();
 
   const repoRoot = findRepoRoot(cwd);
@@ -220,11 +252,12 @@ const __dirname = __cjs_dirname(__filename);
     const outputPath = path.join(stage, outputFile);
 
     const isBundleEntry = BUNDLE_ENTRIES.has(outputFile);
+    const isBrowserEntry = browserEntries.has(outputFile);
     const externalForEntry = isBundleEntry ? nodeBuiltinExternal : [/^[^./]/];
 
     await build({
       input: inputPath,
-      platform: 'node',
+      platform: isBrowserEntry ? 'neutral' : 'node',
       external: externalForEntry,
       // Shake ONLY the self-contained bundles: inlined barrels otherwise drag
       // in unreached deps (winston file-rotator, pg-native, aws-sdk) and
@@ -239,6 +272,12 @@ const __dirname = __cjs_dirname(__filename);
         codeSplitting: false, // Dynamic imports inlined
       },
     });
+
+    if (isBrowserEntry && importsNodeBuiltin(readFileSync(outputPath, 'utf-8'))) {
+      throw new Error(
+        `${outputFile} is a browser entry but its output imports a node built-in; a module it bundles reaches node:*`,
+      );
+    }
 
     const size = statSync(outputPath).size;
     const sizeKB = (size / 1024).toFixed(1);

@@ -13,9 +13,13 @@ import {
   pruneOrphanDeclarations,
   isTestOnlySource,
 } from './lib/atomic-dist.mjs';
+import { generatedChunksImportingNode, resolveLibraryPlatform } from './lib/build-platform.mjs';
 
 const cwd = process.cwd();
-const pkgVersion = JSON.parse(readFileSync(path.join(cwd, 'package.json'), 'utf8')).version;
+const pkg = JSON.parse(readFileSync(path.join(cwd, 'package.json'), 'utf8'));
+const pkgVersion = pkg.version;
+// `build.platform: "neutral"` for a package the dashboard bundles (lib/build-platform.mjs).
+const platform = resolveLibraryPlatform(pkg);
 
 // The build date a package's sources may read as KICI_BUILD_DATE: it tells two
 // builds at the same version apart (the kici CLI's local plane identity). No
@@ -44,9 +48,9 @@ const input = Object.fromEntries(
 // with an atomic rename, so a concurrent reader never sees a missing module.
 const stage = stageDir(cwd);
 
-await build({
+const result = await build({
   input,
-  platform: 'node',
+  platform,
   external: [/^[^./]/], // All bare imports external (library mode)
   treeshake: false,
   transform: {
@@ -62,6 +66,15 @@ await build({
     entryFileNames: '[name].js',
   },
 });
+
+if (platform === 'neutral') {
+  const offending = generatedChunksImportingNode(result.output);
+  if (offending.length > 0) {
+    throw new Error(
+      `a browser-bundled package must not ship a generated chunk importing node:*: ${offending.join(', ')}`,
+    );
+  }
+}
 
 const published = publishStagedDist(cwd);
 assertPublished(cwd, published);

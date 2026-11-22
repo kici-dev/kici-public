@@ -1,4 +1,17 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const { stageLogger } = vi.hoisted(() => ({
+  stageLogger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+vi.mock('@kici-dev/shared', async (importOriginal) => {
+  const { withPrefixedLogger } = await import('@kici-dev/test-support/logger-mock');
+  return withPrefixedLogger(
+    await importOriginal<typeof import('@kici-dev/shared')>(),
+    'stage-agent-payload',
+    stageLogger,
+  );
+});
+
 import { stageAgentPayload, type StageDeps } from './stage-agent-payload.js';
 import type { AgentPayloadSource } from './payload-source.js';
 import type { SpawnFn, SshResult } from './ssh-exec.js';
@@ -161,5 +174,43 @@ describe('stageAgentPayload (s3-direct)', () => {
         { spawnFn },
       ),
     ).rejects.toThrow(/s3-direct.*failed|pull\/verify\/extract/i);
+  });
+});
+
+describe('stageAgentPayload delivery-mode log', () => {
+  beforeEach(() => stageLogger.info.mockClear());
+
+  const URL_WITH_SIG = 'https://cache.local/agent-packages/1.2.3/p.tar.gz?X-Amz-Signature=secret';
+
+  it.each([
+    {
+      delivery: { mode: 'ssh-push' as const },
+      deps: (spawnFn: SpawnFn) =>
+        deps(spawnFn, sourceReturning('/tmp/p.tar.gz', EXPECTED), EXPECTED),
+    },
+    {
+      delivery: { mode: 's3-direct' as const, presignedUrl: URL_WITH_SIG, sha256: EXPECTED },
+      deps: (spawnFn: SpawnFn): StageDeps => ({ spawnFn }),
+    },
+  ])('logs the target and the $delivery.mode delivery mode', async ({ delivery, deps: mk }) => {
+    const { spawnFn } = makeSpawn();
+    await stageAgentPayload(
+      REACH,
+      KEY,
+      { platform: 'linux-x64', version: '1.2.3', delivery },
+      mk(spawnFn),
+    );
+    // fails-when: the line names no mode, or the mode the caller did not pick.
+    expect(stageLogger.info).toHaveBeenCalledWith(
+      `Delivering agent payload to box-1 via ${delivery.mode}`,
+      {
+        targetAgentId: 'box-1',
+        deliveryMode: delivery.mode,
+        platform: 'linux-x64',
+        version: '1.2.3',
+      },
+    );
+    // fails-when: the presigned URL, a signed credential, reaches the log.
+    expect(JSON.stringify(stageLogger.info.mock.calls)).not.toContain('X-Amz-Signature');
   });
 });

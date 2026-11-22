@@ -654,14 +654,16 @@ describe('BareMetalScalerBackend.create — the load-time nft check', () => {
     await expect(create()).resolves.toBeInstanceOf(BareMetalScalerBackend);
   });
 
-  it('says nft may be missing from PATH when the probe cannot start it', async () => {
+  it('says nft is not installed, naming where it looked, when the probe cannot start it', async () => {
     mockProbeNftables.mockResolvedValue(
       'Command `nft list tables` could not start: spawn nft ENOENT',
     );
     const err = await onPlatform('linux', () =>
       BareMetalScalerBackend.create({ name: 'img-pool', labelSets: imageOnly, maxAgents: 2 }),
     ).catch((e: unknown) => e as Error);
-    expect((err as Error).message).toContain("not on the orchestrator's PATH");
+    expect((err as Error).message).toContain(
+      "nft is not installed: it is neither on the orchestrator's PATH nor in /usr/local/sbin, /usr/sbin, /sbin.",
+    );
     expect((err as Error).message).toContain('"requireSudo: true"');
   });
 

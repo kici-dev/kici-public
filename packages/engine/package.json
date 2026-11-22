@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/engine",
-  "version": "0.28.0",
+  "version": "0.29.0",
   "description": "Shared business logic for the KiCI CI/CD stack: protocol, triggers, state machine, and provider interfaces used by the Platform relay, orchestrator, and compiler.",
   "keywords": [
     "ci",
@@ -141,6 +141,9 @@
       "import": "./dist/metrics/metric-kind-compat.js",
       "types": "./dist/metrics/metric-kind-compat.d.ts"
     }
+  },
+  "build": {
+    "platform": "neutral"
   },
   "scripts": {
     "build": "node ../../scripts/build-ts.mjs && tsc -p tsconfig.build.json --emitDeclarationOnly",

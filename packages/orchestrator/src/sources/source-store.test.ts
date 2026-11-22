@@ -140,6 +140,51 @@ describe('SourceStore', () => {
         }),
       ).rejects.toThrow(/already exists/);
     });
+
+    it('names the App id and the one-source-per-App-id rule on a duplicate', async () => {
+      const { db } = createMockDb({
+        selectFirstRow: { id: 's1', routing_key: 'github:1', config: '{"appId":"1"}' },
+      });
+      const store = new SourceStore(db, secretStore as any);
+
+      await expect(
+        store.addSource({ provider: 'github', name: 'Dup', appId: '1', privateKey: 'key' }),
+      ).rejects.toThrow(
+        'an orchestrator holds one source per GitHub App id; App id 1 is already registered as github:1. ' +
+          'A second App with the same id belongs on another orchestrator, in another organization.',
+      );
+    });
+
+    it('addSource stores githubUrl in its column only for a non-default server', async () => {
+      const insertedRow = { id: 'source-uuid-9', routing_key: 'github:1' };
+      const add = async (githubUrl: string | undefined, config?: Record<string, unknown>) => {
+        const { db, mocks } = createMockDb({ insertedRow, selectFirstRow: undefined });
+        await new SourceStore(db, secretStore as any).addSource({
+          provider: 'github',
+          name: 'App',
+          appId: '1',
+          privateKey: 'key',
+          githubUrl,
+          ...(config && { config }),
+        });
+        const values = mocks.insertValues.mock.calls[0][0];
+        return { config: values.config as string, githubUrl: values.github_url as string | null };
+      };
+
+      // fails-when: a GHES source is stored without its server
+      expect(await add('https://ghe.corp.example')).toEqual({
+        config: '{"appId":"1"}',
+        githubUrl: 'https://ghe.corp.example',
+      });
+      // breaks-if-wrong: a github.com row's config JSON is unchanged and names no server
+      expect(await add(undefined)).toEqual({ config: '{"appId":"1"}', githubUrl: null });
+      expect(await add('https://github.com')).toEqual({ config: '{"appId":"1"}', githubUrl: null });
+      // fails-when: a githubUrl in the generic config reaches the stored row
+      expect(await add(undefined, { githubUrl: 'https://evil.example' })).toEqual({
+        config: '{"appId":"1"}',
+        githubUrl: null,
+      });
+    });
   });
 
   describe('listSources()', () => {
@@ -412,6 +457,64 @@ describe('SourceStore', () => {
       expect(parsedConfig.appId).toBe('111');
       expect(parsedConfig.newField).toBe('added');
       expect(parsedConfig.existingField).toBe('keep');
+    });
+
+    it('updateSource ignores githubUrl inside the generic config', async () => {
+      const source = {
+        id: 's1',
+        routing_key: 'github:111',
+        config: JSON.stringify({ appId: '111' }),
+        github_url: 'https://ghe.corp.example',
+      };
+      const { db, mocks } = createMockDb({ selectFirstRow: source, updatedRow: source });
+      const store = new SourceStore(db, secretStore as any);
+
+      await store.updateSource('github:111', {
+        config: { githubUrl: 'https://evil.example', newField: 'added' },
+      });
+
+      const set = mocks.updateSet.mock.calls[0][0];
+      // fails-when: a scoped token can move a source through the config merge
+      expect(JSON.parse(set.config as string)).toEqual({ appId: '111', newField: 'added' });
+      expect(set).not.toHaveProperty('github_url');
+    });
+
+    it('updateSource ignores a customer inside the generic config', async () => {
+      const source = {
+        id: 's1',
+        routing_key: 'github:111',
+        config: JSON.stringify({ appId: '111' }),
+      };
+      const { db, mocks } = createMockDb({ selectFirstRow: source, updatedRow: source });
+      await new SourceStore(db, secretStore as any).updateSource('github:111', {
+        config: { customerId: 'org_Y', customer_id: 'org_Y', kept: true },
+      });
+
+      const set = mocks.updateSet.mock.calls[0][0];
+      // fails-when: the config merge carries a customer past the authorized customerId field
+      expect(JSON.parse(set.config as string)).toEqual({ appId: '111', kept: true });
+      expect(set).not.toHaveProperty('customer_id');
+    });
+
+    it('updateSource sets and clears githubUrl through its own field', async () => {
+      const update = async (githubUrl: string | null) => {
+        const source = {
+          id: 's1',
+          routing_key: 'github:111',
+          config: JSON.stringify({ appId: '111' }),
+          github_url: 'https://ghe.old.example',
+        };
+        const { db, mocks } = createMockDb({ selectFirstRow: source, updatedRow: source });
+        await new SourceStore(db, secretStore as any).updateSource('github:111', { githubUrl });
+        return mocks.updateSet.mock.calls[0][0];
+      };
+
+      const set = await update('https://ghe.corp.example');
+      expect(set.github_url).toBe('https://ghe.corp.example');
+      // breaks-if-wrong: moving the server leaves the config untouched
+      expect(set).not.toHaveProperty('config');
+      expect((await update(null)).github_url).toBeNull();
+      expect((await update('https://github.com')).github_url).toBeNull();
     });
 
     it('rotates secrets when privateKey or webhookSecret provided', async () => {

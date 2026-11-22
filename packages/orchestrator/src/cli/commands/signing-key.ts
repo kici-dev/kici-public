@@ -9,7 +9,7 @@ import { writeFile } from 'node:fs/promises';
 import type { Command } from 'commander';
 import { createLogger, createPool } from '@kici-dev/shared';
 import { runIdempotentStep } from '@kici-dev/shared/idempotency';
-import { loadConfig } from '../../config.js';
+import { ConfigScope, loadConfig } from '../../config.js';
 import { createDb } from '../../db/client.js';
 import {
   OrchestratorSigningKeyRepo,
@@ -69,8 +69,22 @@ function printSigningKeys(rows: ListedSigningKey[], json: boolean | undefined): 
   }
 }
 
+/**
+ * The orchestrator settings a signing-key subcommand reads. The subcommands talk to the
+ * database directly, often before the orchestrator runs, so they skip the runtime checks
+ * (coordinator database, Platform credentials) that no subcommand uses — the same scope the
+ * direct-database secret commands read.
+ */
+export function signingKeySettings(env: NodeJS.ProcessEnv = process.env): {
+  secretKey?: string;
+  issuer?: string;
+} {
+  const config = loadConfig(ConfigScope.enum.packaging, env);
+  return { secretKey: config.secretKey, issuer: config.provenanceSigningIssuer };
+}
+
 function resolveSecretKey(): string {
-  const config = loadConfig();
+  const config = signingKeySettings();
   if (!config.secretKey) {
     throw new Error(
       'KICI_SECRET_KEY is required to generate a db-custody signing key (it wraps the private JWK).',
@@ -293,8 +307,7 @@ export function registerSigningKeyCommands(
     .option('--database-url <url>', 'Orchestrator DB URL (else KICI_DATABASE_URL)')
     .action(
       cliAction(async (opts: { public: boolean; out?: string; databaseUrl?: string }) => {
-        const config = loadConfig();
-        const issuer = config.provenanceSigningIssuer;
+        const { issuer } = signingKeySettings();
         if (!issuer) {
           throw new Error(
             'KICI_ORCHESTRATOR_PROVENANCE_ISSUER is not configured; nothing to export.',

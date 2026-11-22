@@ -1,7 +1,7 @@
 import '../../__test-helpers__/shared-mocks.js';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type Docker from 'dockerode';
-import { link, mkdir, mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { link, mkdir, mkdtemp, readFile, writeFile, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { x as tarExtract } from 'tar';
@@ -16,11 +16,15 @@ vi.mock('@kici-dev/shared/container-runtime', () => ({
 
 // Both name-resolution files "exist", whatever the test host's /etc layout;
 // the rest stays real because the workspace copy-in walks a real tree.
-vi.mock('node:fs', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('node:fs')>()),
-  existsSync: vi.fn(() => true),
-}));
+// realpathSync stays real unless a test maps a host path onto a temp file.
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, existsSync: vi.fn(() => true), realpathSync: vi.fn(actual.realpathSync) };
+});
 
+import { realpathSync } from 'node:fs';
+const { realpathSync: realRealpathSync } =
+  await vi.importActual<typeof import('node:fs')>('node:fs');
 import { ContainerSandbox } from './container-sandbox.js';
 import {
   DEFAULT_PIDS_LIMIT,
@@ -80,6 +84,28 @@ function mockDocker(opts: { imagePresent?: boolean } = {}) {
     inspect,
     infoArchive,
   };
+}
+
+/** Give `container` an exec mock whose runner never sends job.complete. */
+function mockRunnerExec(container: ReturnType<typeof mockDocker>['container']) {
+  const exec = vi.fn().mockResolvedValue({
+    start: vi.fn().mockResolvedValue({ on: vi.fn(), destroy: vi.fn() }),
+    inspect: vi.fn().mockResolvedValue({ ExitCode: 0 }),
+  });
+  (container as unknown as { exec: typeof exec }).exec = exec;
+  return exec;
+}
+
+/**
+ * Start the job and abort it once the runner exec exists: the exec mock never
+ * completes the job, but the exec is created with its env and command first.
+ */
+async function startRunnerThenAbort(sandbox: ContainerSandbox): Promise<void> {
+  const ac = new AbortController();
+  const jobPromise = sandbox.executeJob({ signal: ac.signal } as never).catch(() => undefined);
+  await new Promise((r) => setTimeout(r, 0));
+  ac.abort();
+  await jobPromise;
 }
 
 describe('ContainerSandbox.setup hardening', () => {
@@ -329,6 +355,117 @@ describe('ContainerSandbox.setup binds (bwrap parity)', () => {
   });
 });
 
+describe('ContainerSandbox host TLS trust paths', () => {
+  const STANDARD_CA = '/etc/ssl/certs/ca-certificates.crt';
+  const BASE_BINDS = [
+    '/host/runner.js:/opt/kici/workflow-runner.js:ro',
+    '/host/container-ts-loader-hook.js:/opt/kici/ts-loader-hook.js:ro',
+  ];
+  let dir: string;
+  let caFile: string;
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    dir = await mkdtemp(join(tmpdir(), 'kici-trust-'));
+    caFile = join(dir, 'host-ca.pem');
+    await writeFile(caFile, 'host CA\n');
+    await mkdir(join(dir, 'certs'));
+  });
+
+  afterEach(async () => {
+    vi.mocked(realpathSync).mockImplementation(realRealpathSync);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  async function createdWith(env: Record<string, string>, hostTrustPaths: Record<string, string>) {
+    const { docker, createContainer, container } = mockDocker();
+    const exec = mockRunnerExec(container);
+    const sandbox = new ContainerSandbox({
+      docker,
+      image: 'node:22',
+      runnerPath: '/host/runner.js',
+      env,
+      hostTrustPaths,
+      jobId: 'job-trust',
+      hardening: hardening(),
+    });
+    await sandbox.setup({ workDir: '/work', env: {} });
+    await startRunnerThenAbort(sandbox);
+    const arg = createContainer.mock.calls[0][0] as Docker.ContainerCreateOptions;
+    const execArg = exec.mock.calls[0][0] as { Env: string[] };
+    return { binds: arg.HostConfig!.Binds!, env: arg.Env!, execEnv: execArg.Env };
+  }
+
+  // fails-when: the host file mounts over the image's /etc/ssl/certs, hiding
+  // a CA baked into the image and breaking update-ca-certificates in the job.
+  it('mounts a host CA at the standard location under /run/kici/trust, not over the image', async () => {
+    // The agent host names the standard path; here it resolves to a real file.
+    vi.mocked(realpathSync).mockImplementation(((p: string) =>
+      p === STANDARD_CA ? caFile : realRealpathSync(p)) as typeof realpathSync);
+    // The mount is named after the resolved file.
+    const target = '/run/kici/trust/0/host-ca.pem';
+    const { binds, env, execEnv } = await createdWith(
+      { PATH: '/usr/bin', SSL_CERT_FILE: STANDARD_CA },
+      { SSL_CERT_FILE: STANDARD_CA },
+    );
+    expect(binds).toEqual([...BASE_BINDS, `${caFile}:${target}:ro`]);
+    expect(binds.some((b) => b.split(':')[1]!.startsWith('/etc/ssl'))).toBe(false);
+    expect(env).toContain(`SSL_CERT_FILE=${target}`);
+    expect(execEnv).toContain(`SSL_CERT_FILE=${target}`);
+  });
+
+  it('mounts an SSL_CERT_DIR directory and points the setting at it', async () => {
+    const certs = join(dir, 'certs');
+    const { binds, env } = await createdWith(
+      { SSL_CERT_DIR: `${certs}:${join(dir, 'missing')}` },
+      { SSL_CERT_DIR: `${certs}:${join(dir, 'missing')}` },
+    );
+    expect(binds).toContain(`${certs}:/run/kici/trust/0/certs:ro`);
+    expect(env).toContain('SSL_CERT_DIR=/run/kici/trust/0/certs');
+  });
+
+  // fails-when: a dangling setting reaches the container, or a bind of a
+  // missing path makes the runtime create an empty directory there.
+  it('passes neither the setting nor a bind when the host path is missing', async () => {
+    const missing = join(dir, 'missing.pem');
+    const { binds, env, execEnv } = await createdWith(
+      { PATH: '/usr/bin', GIT_SSL_CAINFO: missing },
+      { GIT_SSL_CAINFO: missing },
+    );
+    expect(binds).toEqual(BASE_BINDS);
+    expect(env.some((e) => e.startsWith('GIT_SSL_CAINFO='))).toBe(false);
+    expect(execEnv.some((e) => e.startsWith('GIT_SSL_CAINFO='))).toBe(false);
+    // breaks-if-wrong: the rest of the job env still arrives.
+    expect(env).toContain('PATH=/usr/bin');
+  });
+
+  // fails-when: a symlink to a directory (or a socket) is bound where the
+  // setting expects a CA file.
+  it('drops a setting whose path is a symlink to something other than a file', async () => {
+    const link = join(dir, 'ca-link.pem');
+    await symlink(join(dir, 'certs'), link);
+    const { binds, env } = await createdWith({ GIT_SSL_CAINFO: link }, { GIT_SSL_CAINFO: link });
+    expect(binds).toEqual(BASE_BINDS);
+    expect(env.some((e) => e.startsWith('GIT_SSL_CAINFO='))).toBe(false);
+  });
+
+  // breaks-if-wrong: with no host trust settings (the production default), and
+  // with a setting the job supplies for its own image, the binds and env are
+  // exactly what they were.
+  it('leaves the binds and env unchanged when the host supplies no trust setting', async () => {
+    const env = { PATH: '/usr/bin', SSL_CERT_FILE: '/image/ca.pem' };
+    const created = await createdWith(env, {});
+    expect(created.binds).toEqual(BASE_BINDS);
+    expect(created.env).toEqual([
+      'PATH=/usr/bin',
+      'SSL_CERT_FILE=/image/ca.pem',
+      'KICI_TS_LOADER_HOOK_PATH=/opt/kici/ts-loader-hook.js',
+      'KICI_LOG_STDERR=1',
+    ]);
+    expect(created.execEnv).toEqual(created.env);
+  });
+});
+
 describe('ContainerSandbox loader-hook mount + stdio IPC hygiene', () => {
   beforeEach(() => vi.clearAllMocks());
 
@@ -358,11 +495,7 @@ describe('ContainerSandbox loader-hook mount + stdio IPC hygiene', () => {
 
   it('sets the loader-path + stderr env on the per-step exec too', async () => {
     const { docker, container } = mockDocker();
-    const exec = vi.fn().mockResolvedValue({
-      start: vi.fn().mockResolvedValue({ on: vi.fn(), destroy: vi.fn() }),
-      inspect: vi.fn().mockResolvedValue({ ExitCode: 0 }),
-    });
-    (container as unknown as { exec: typeof exec }).exec = exec;
+    const exec = mockRunnerExec(container);
     const sandbox = new ContainerSandbox({
       docker,
       image: 'node:20-alpine',
@@ -373,13 +506,7 @@ describe('ContainerSandbox loader-hook mount + stdio IPC hygiene', () => {
     });
 
     await sandbox.setup({ workDir: '/work', env: {} });
-    // executeJob never completes (the mock never emits job.complete), but the
-    // exec is created with the asserted env before the abort.
-    const ac = new AbortController();
-    const jobPromise = sandbox.executeJob({ signal: ac.signal } as never).catch(() => undefined);
-    await new Promise((r) => setTimeout(r, 0));
-    ac.abort();
-    await jobPromise;
+    await startRunnerThenAbort(sandbox);
 
     expect(exec).toHaveBeenCalled();
     const execArg = exec.mock.calls[0][0] as { Env: string[] };
@@ -389,11 +516,7 @@ describe('ContainerSandbox loader-hook mount + stdio IPC hygiene', () => {
 
   it('launches the runner on the injected node, not the image’s own', async () => {
     const { docker, container } = mockDocker();
-    const exec = vi.fn().mockResolvedValue({
-      start: vi.fn().mockResolvedValue({ on: vi.fn(), destroy: vi.fn() }),
-      inspect: vi.fn().mockResolvedValue({ ExitCode: 0 }),
-    });
-    (container as unknown as { exec: typeof exec }).exec = exec;
+    const exec = mockRunnerExec(container);
     const sandbox = new ContainerSandbox({
       docker,
       image: 'python:3.12-slim',
@@ -405,11 +528,7 @@ describe('ContainerSandbox loader-hook mount + stdio IPC hygiene', () => {
     });
 
     await sandbox.setup({ workDir: '/work', env: {} });
-    const ac = new AbortController();
-    const jobPromise = sandbox.executeJob({ signal: ac.signal } as never).catch(() => undefined);
-    await new Promise((r) => setTimeout(r, 0));
-    ac.abort();
-    await jobPromise;
+    await startRunnerThenAbort(sandbox);
 
     // A bare `node` would resolve from the image's PATH, and the image need not
     // ship Node (python:3.12-slim does not).
@@ -426,11 +545,7 @@ describe('ContainerSandbox loader-hook mount + stdio IPC hygiene', () => {
 
   it('falls back to the image’s node when no runtime is injected', async () => {
     const { docker, container } = mockDocker();
-    const exec = vi.fn().mockResolvedValue({
-      start: vi.fn().mockResolvedValue({ on: vi.fn(), destroy: vi.fn() }),
-      inspect: vi.fn().mockResolvedValue({ ExitCode: 0 }),
-    });
-    (container as unknown as { exec: typeof exec }).exec = exec;
+    const exec = mockRunnerExec(container);
     const sandbox = new ContainerSandbox({
       docker,
       image: 'node:20-alpine',
@@ -441,11 +556,7 @@ describe('ContainerSandbox loader-hook mount + stdio IPC hygiene', () => {
     });
 
     await sandbox.setup({ workDir: '/work', env: {} });
-    const ac = new AbortController();
-    const jobPromise = sandbox.executeJob({ signal: ac.signal } as never).catch(() => undefined);
-    await new Promise((r) => setTimeout(r, 0));
-    ac.abort();
-    await jobPromise;
+    await startRunnerThenAbort(sandbox);
 
     // Legacy contract, kept until every spawn path provisions the runtime.
     const execArg = exec.mock.calls[0][0] as { Cmd: string[] };

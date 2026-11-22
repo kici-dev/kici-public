@@ -5,7 +5,7 @@ import { encodeChunk } from './chunk-encoder.js';
 import { chunkObjectKey, type DbKind } from './key.js';
 import { parseManifest, serializeManifest } from './manifest.js';
 import type { TableAdapter } from './table-adapter.js';
-import type { ChunkManifest } from './types.js';
+import type { ArchiveCycleSummary, ChunkManifest } from './types.js';
 
 interface Row {
   id: number;
@@ -32,7 +32,14 @@ function makeAdapter(db: DbKind): TableAdapter<unknown> {
  * An in-memory store holding one encoded chunk per side, plus its manifest.
  * With `bucket`, each chunk sits under that per-bucket (v2) subprefix.
  */
-async function makeFake(opts: { enabled?: boolean; bucket?: string; rows?: Row[] } = {}) {
+async function makeFake(
+  opts: {
+    enabled?: boolean;
+    bucket?: string;
+    rows?: Row[];
+    archiveSummary?: Partial<ArchiveCycleSummary>;
+  } = {},
+) {
   const objects = new Map<string, Buffer>();
   const adapters = new Map<string, TableAdapter<unknown>>();
   const chunks = new Map<DbKind, { chunkId: string; dataKey: string; manifestKey: string }>();
@@ -95,6 +102,14 @@ async function makeFake(opts: { enabled?: boolean; bucket?: string; rows?: Row[]
         if (!body) throw new Error(`NoSuchKey: ${key}`);
         return body;
       },
+      runArchiveCycle: async (): Promise<ArchiveCycleSummary> => ({
+        tablesProcessed: 1,
+        chunksWritten: 0,
+        rowsArchived: 0,
+        rowsFailed: 0,
+        skipped: { disabled: 0, min_chunk: 0, min_warm: 0, no_tables: 0 },
+        ...opts.archiveSummary,
+      }),
       putManifestObject: async (key: string, m: ChunkManifest) => {
         objects.set(key, Buffer.from(serializeManifest(m)));
       },
@@ -161,6 +176,35 @@ describe('createColdStoreAdminOps', () => {
       "no cold-store adapter registered for table 'nope' on Platform; registered: execution_runs",
     );
     expect(fake.close).toHaveBeenCalledTimes(1);
+  });
+
+  // fails-when: archiveNow prints the summary and returns although a chunk write
+  // failed, so the CLI exits 0 with the rows still in Postgres
+  it.each(SIDES)('%s archive-now throws after the summary when a row failed', async (db) => {
+    const fake = await makeFake({
+      archiveSummary: { chunksWritten: 1, rowsArchived: 2, rowsFailed: 3 },
+    });
+    const out = captureStdout();
+    await expect(
+      opsFor(fake, db).archiveNow({ databaseUrl: 'u', table: 'execution_runs' }),
+    ).rejects.toThrow('archive-now execution_runs: 3 row(s) failed to archive');
+    expect(out()).toBe(
+      'archive-now execution_runs: tablesProcessed=1 chunksWritten=1 rowsArchived=2 rowsFailed=3\n',
+    );
+    expect(fake.close).toHaveBeenCalledTimes(1);
+  });
+
+  // breaks-if-wrong: a cycle that archived everything, or found nothing to
+  // archive, still succeeds
+  it.each([
+    { chunksWritten: 1, rowsArchived: 2 },
+    { chunksWritten: 0, rowsArchived: 0 },
+  ])('archive-now succeeds when no row failed ($rowsArchived archived)', async (summary) => {
+    const fake = await makeFake({ archiveSummary: summary });
+    captureStdout();
+    await expect(
+      opsFor(fake, 'platform').archiveNow({ databaseUrl: 'u', table: 'execution_runs' }),
+    ).resolves.toBeUndefined();
   });
 
   // fails-when: assertEnabled is skipped

@@ -621,3 +621,23 @@ describe('serializeJobsToLock — generated invoke gate', () => {
     expect(result[0].invoke && 'optional' in result[0].invoke).toBe(false);
   });
 });
+
+describe('serializeJobsToLock — generated job checkout', () => {
+  it('serializes checkout: false and the object form of a generated job', async () => {
+    const jobs = [
+      job('g', { runsOn: 'x', steps: [], checkout: { fetchDepth: 0 } }),
+      job('off', { runsOn: 'x', steps: [], checkout: false }),
+      job('plain', { runsOn: 'x', steps: [] }),
+    ];
+    const result = await serializeJobsToLock(jobs, mockCtx());
+    expect(result).toHaveLength(3);
+    // fails-when: the lockJob literal omits the checkout fields, so the generated job always clones
+    expect(result[0].checkoutOptions).toEqual({ fetchDepth: 0 });
+    expect('checkout' in result[0]).toBe(false);
+    expect(result[1].checkout).toBe(false);
+    expect('checkoutOptions' in result[1]).toBe(false);
+    // breaks-if-wrong: a generated job without checkout keeps the lock shape it had
+    expect('checkout' in result[2]).toBe(false);
+    expect('checkoutOptions' in result[2]).toBe(false);
+  });
+});

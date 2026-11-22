@@ -75,6 +75,17 @@ export interface JobCredentialContext {
   policyBranch: string;
   /** The event type that started the run, for a context's trigger-type filters. */
   triggerType: string;
+  /**
+   * Web URL of the GitHub Enterprise Server the job's source lives on, from
+   * the server that source stores; a workflow-supplied App credential mints
+   * there. Unset mints at github.com.
+   */
+  githubUrl?: string;
+  /**
+   * Set when the job's GitHub source is no longer configured: a workflow-supplied
+   * App credential is refused with this message instead of minting anywhere.
+   */
+  githubAppMintRefusal?: string;
 }
 
 export interface GitCredentialHandlerDeps {
@@ -243,6 +254,11 @@ export function buildGitCredentialHandler(deps: GitCredentialHandlerDeps) {
             `${Object.keys(job.declaredCredentials).join(', ') || '(none)'}`,
         );
       }
+      // fails-when: an App credential of a job whose GitHub source is gone mints at github.com
+      // breaks-if-wrong: token and ssh refs of such a job still resolve (they send no App JWT)
+      if (ref.kind === 'app' && job.githubAppMintRefusal) {
+        throw refuse(logCtx, job.githubAppMintRefusal);
+      }
     }
 
     const repos = params.repositories.map((r) => `'${r}'`).join(', ');
@@ -252,6 +268,7 @@ export function buildGitCredentialHandler(deps: GitCredentialHandlerDeps) {
         repositories: params.repositories,
         ...(ref ? { ref } : {}),
         ...(params.permissions ? { permissions: params.permissions } : {}),
+        ...(job.githubUrl ? { githubUrl: job.githubUrl } : {}),
         runId: owned.runId,
         jobId: params.jobId,
         gate: {

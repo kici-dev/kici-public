@@ -113,6 +113,8 @@ Shared business logic used by all three tiers. Single source of truth for cross-
 - Repository-pattern negation check (the one verdict on whether a repository glob reads as a negation, so an allow or deny list entry never matches its own complement)
 - Permission matrix (the resource and permission-level vocabulary and the `hasPermission` check, shared by the Platform, which enforces it, and the browser dashboard, which shows or hides each control from it)
 - Run id references (parsing a full run id or a prefix of four or more hex characters, shared by the `kici` CLI, `kici-admin` and the Platform)
+- CLI login configuration (the schema of the login settings a Platform publishes to the `kici` CLI: the OIDC issuer and client to authenticate against)
+- Author regex safety (the ReDoS check that refuses a catastrophic author-supplied pattern at compile or registration time, and the one rule that drops the stateful `g` and `y` flags from every compiled matcher)
 - Label utilities (platform label derivation, runsOn normalization, `kici:*` set-only reserved namespace, role labels)
 - Host inventory (the canonical queryable host-roster schema shared by the orchestrator's roster store, the agent-facing inventory API, and the SDK's `ctx.kici.inventory`)
 - Audit policy and retention (per-action access-log sampling, warm-retention windows for cold-store eligibility, federated activity row schema)
@@ -157,7 +159,7 @@ Shared utilities used across packages, including everything from `@kici-dev/core
 
 ### Dashboard
 
-Web UI for KiCI. A browser single-page application that provides the operator dashboard with execution run listing, run detail views, real-time log streaming, settings management, and keyboard shortcut support. Authenticates via OIDC against the identity provider and communicates with the Platform REST-over-WebSocket API.
+Web UI for KiCI. A browser single-page application that provides the operator dashboard with execution run listing, run detail views, real-time log streaming, settings management, and keyboard shortcut support. It authenticates via OIDC against the identity provider. It calls the Platform's REST API over HTTP, and holds a WebSocket to the Platform for live log lines and run, job, and step status updates. The Platform answers a request for orchestrator-held data through its REST-over-WebSocket proxy to the orchestrator.
 
 ### `kici` (wrapper)
 

@@ -4,7 +4,7 @@ import type { LockJob } from './types.js';
 
 describe('lock schema container.dockerfile', () => {
   it('carries the current SCHEMA_VERSION', () => {
-    expect(SCHEMA_VERSION).toBe(44);
+    expect(SCHEMA_VERSION).toBe(45);
   });
 
   it('carries a dockerfile build with its context, target and args', () => {

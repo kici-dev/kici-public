@@ -15,7 +15,7 @@ import {
   type RefreshStorage,
 } from '../../agent-packaging/index.js';
 import { readKiciVersion } from '../service/instance/manifest.js';
-import { readEnvValues } from '../service/backup-timer.js';
+import { envFileVariables } from './shared/env-file-variables.js';
 import { loadConfig } from '../../config.js';
 import { createCacheStorage } from '../../storage/index.js';
 
@@ -85,17 +85,11 @@ export function storageEnvFromEnvFile(
   envFilePath: string,
   readFile: (p: string) => string = (p) => fs.readFileSync(p, 'utf-8'),
 ): StorageEnvSource {
-  let content: string;
-  try {
-    content = readFile(envFilePath);
-  } catch (err) {
-    const reason = (err as NodeJS.ErrnoException).code ?? toErrorMessage(err);
-    throw new Error(`cannot read the env file ${envFilePath} (${reason})`, { cause: err });
-  }
-  const env: NodeJS.ProcessEnv = {};
-  for (const [key, value] of readEnvValues(content)) {
-    if (STORAGE_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) env[key] = value;
-  }
+  const env = envFileVariables(
+    envFilePath,
+    (key) => STORAGE_ENV_PREFIXES.some((prefix) => key.startsWith(prefix)),
+    readFile,
+  );
   return { env, origin: `the env file ${envFilePath}` };
 }
 

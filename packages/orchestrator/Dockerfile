@@ -8,7 +8,7 @@ ARG DHI_PREFIX=dhi.io
 # Stage 1: Build (on the -dev variant — keeps apt + shell + corepack so we
 # can install/compile in the usual pnpm flow). DHI ships ca-certificates
 # in both variants by default, so no apt-get for certs is needed.
-FROM ${DHI_PREFIX}/node:24.22.1-0-debian13-dev@sha256:20cf36e12660c68b1e28887d1e71a7f2494bcea9d034709368e0afce77728eb0 AS builder
+FROM ${DHI_PREFIX}/node:24.22.3-0-debian13-dev@sha256:9354eb131b6856f43fc9c7eba8cb54f5d0200fe7fbf5495bf6065be8a4a43e3b AS builder
 WORKDIR /app
 
 # Enable pnpm. Pin matches the root package.json `packageManager` field and
@@ -108,7 +108,7 @@ RUN rm -f .npmrc \
 # binary + its shared-library closure into the distroless runtime. The runtime
 # stays distroless (no apt/shell/perl); nft is the only host tool it needs
 # (agent network isolation, requires --cap-add=NET_ADMIN at runtime).
-FROM ${DHI_PREFIX}/node:24.22.1-0-debian13-dev@sha256:20cf36e12660c68b1e28887d1e71a7f2494bcea9d034709368e0afce77728eb0 AS nft
+FROM ${DHI_PREFIX}/node:24.22.3-0-debian13-dev@sha256:9354eb131b6856f43fc9c7eba8cb54f5d0200fe7fbf5495bf6065be8a4a43e3b AS nft
 RUN apt-get update \
   && apt-get install -y --no-install-recommends nftables \
   && rm -rf /var/lib/apt/lists/*
@@ -146,7 +146,7 @@ RUN set -eux; \
 # Stage 3: Runtime (distroless -debian13 — no apt, no shell, no perl). The nft
 # binary + its shared-library closure are COPYed from the nft extractor stage;
 # libc + the dynamic loader already ship with the Node base.
-FROM ${DHI_PREFIX}/node:24.22.1-0-debian13@sha256:ed3fabe4078bb9d72244e1befc441ed5e827e92cb64932a014337786d635d3f8
+FROM ${DHI_PREFIX}/node:24.22.3-0-debian13@sha256:62c93ab05c09dce569199f42d14be5b9c11471d318f1ba11383f9d5e652d52c1
 WORKDIR /app
 
 # nft binary + its shared-library closure, staged at arch-correct absolute

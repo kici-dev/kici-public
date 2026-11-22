@@ -1,5 +1,6 @@
 /** `--json` output for CI integration. */
 
+import type { OverlayReport } from '../../commands/preview.js';
 import type { RunJobResult, RunResult } from './summary.js';
 
 interface JsonJob {
@@ -19,6 +20,8 @@ interface JsonOutput {
     totalDurationMs: number;
     jobs: JsonJob[];
     runs?: Array<{ runId: string; workflowName?: string; status: string; jobs: JsonJob[] }>;
+    /** The overlay's compressed size, file count and `.git` details. */
+    overlay?: OverlayReport;
   }>;
   summary: {
     passed: number;
@@ -48,6 +51,7 @@ export function formatJsonResult(results: RunResult[]): string {
           jobs: run.jobs.map(jsonJob),
         })),
       }),
+      ...(r.overlay && { overlay: r.overlay }),
     })),
     summary: {
       passed,

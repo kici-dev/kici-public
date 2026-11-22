@@ -55,10 +55,9 @@ async function createTestOverlay(
   dirLinks: Record<string, string> = {},
   /** Manifest fields written over the generated ones (for malformed manifests). */
   manifestOverride: Record<string, unknown> = {},
+  /** Files among `files` shipped with the executable bit. */
+  executables: string[] = [],
 ): Promise<{ encryptedData: Buffer; cliPublicKey: string; orchestratorPrivateKey: string }> {
-  const orchestratorKp = generateKeypair();
-  const cliKp = generateKeypair();
-
   const stagingDir = path.join(tmpDir, 'staging');
   await fs.mkdir(stagingDir, { recursive: true });
 
@@ -69,6 +68,7 @@ async function createTestOverlay(
     const fullPath = path.join(stagingDir, filePath);
     await fs.mkdir(path.dirname(fullPath), { recursive: true });
     await fs.writeFile(fullPath, content);
+    if (executables.includes(filePath)) await fs.chmod(fullPath, 0o755);
     checksums[filePath] = sha256(Buffer.from(content));
     fileList.push(filePath);
   }
@@ -105,15 +105,21 @@ async function createTestOverlay(
     '.kici-overlay-tmp/manifest.json',
   ]);
 
-  const tarballData = await fs.readFile(tarballPath);
+  return encryptTarball(await fs.readFile(tarballPath));
+}
 
+/** A gzipped tarball encrypted the way the CLI uploader does, plus the keys the agent decrypts it with. */
+function encryptTarball(tarballData: Buffer): {
+  encryptedData: Buffer;
+  cliPublicKey: string;
+  orchestratorPrivateKey: string;
+} {
+  const orchestratorKp = generateKeypair();
+  const cliKp = generateKeypair();
   // CLI side: cli private + orchestrator public.
   const aesKey = deriveSharedSecret(cliKp.privateKey, orchestratorKp.publicKey);
-
-  const encryptedData = encryptBuffer(tarballData, aesKey);
-
   return {
-    encryptedData,
+    encryptedData: encryptBuffer(tarballData, aesKey),
     cliPublicKey: cliKp.publicKey.toString('base64'),
     orchestratorPrivateKey: orchestratorKp.privateKey.toString('base64'),
   };
@@ -342,6 +348,136 @@ describe('overlay-applier', () => {
     });
   });
 
+  describe('the manifest git record', () => {
+    async function applyWithManifest(manifestOverride: Record<string, unknown>) {
+      const { encryptedData, cliPublicKey, orchestratorPrivateKey } = await createTestOverlay(
+        tmpDir,
+        { 'a.txt': 'a' },
+        [],
+        {},
+        {},
+        {},
+        manifestOverride,
+      );
+      const downloadMod = await import('./download.js');
+      vi.spyOn(downloadMod, 'downloadUrl').mockResolvedValue(encryptedData);
+      return applyOverlay({
+        tarballUrl: 'https://s3.example.com/test.tar.gz.enc',
+        cliPublicKey,
+        orchestratorPrivateKey,
+        repoDir,
+      });
+    }
+
+    it('returns the manifest git record', async () => {
+      const result = await applyWithManifest({ git: { fetchDepth: 1, allTags: false } });
+      // fails-when: the record never leaves the manifest, so the history-gap check sees nothing
+      expect(result.git).toEqual({ fetchDepth: 1, allTags: false });
+    });
+
+    it('ignores a malformed git record', async () => {
+      const result = await applyWithManifest({ git: { fetchDepth: 'x' } });
+      // breaks-if-wrong: a malformed record must not fail the apply
+      expect(result.git).toBeUndefined();
+      expect(result.verified).toBe(true);
+      expect(await fs.readFile(path.join(repoDir, 'a.txt'), 'utf-8')).toBe('a');
+    });
+
+    it('returns no record for a manifest without one', async () => {
+      const result = await applyWithManifest({});
+      expect(result).not.toHaveProperty('git');
+    });
+  });
+
+  describe('onlyPathPrefix (a checkout: false full-repo job)', () => {
+    /** A full-repo overlay: `.git`, a source file, a workflow, and a deletion on each side. */
+    async function fullRepoOverlay() {
+      await fs.mkdir(path.join(repoDir, '.kici'), { recursive: true });
+      await fs.writeFile(path.join(repoDir, 'stale.ts'), 'old');
+      await fs.writeFile(path.join(repoDir, '.kici', 'old.ts'), 'old');
+      const overlay = await createTestOverlay(
+        tmpDir,
+        {
+          '.git/HEAD': 'ref: refs/heads/main\n',
+          'src/a.ts': 'export const a = 1;',
+          '.kici/workflows/w.ts': 'export default {};',
+        },
+        ['stale.ts', '.kici/old.ts'],
+      );
+      const downloadMod = await import('./download.js');
+      vi.spyOn(downloadMod, 'downloadUrl').mockResolvedValue(overlay.encryptedData);
+      return overlay;
+    }
+
+    it('applies only .kici/ for a checkout: false full-repo job', async () => {
+      const { cliPublicKey, orchestratorPrivateKey } = await fullRepoOverlay();
+      const result = await applyOverlay({
+        tarballUrl: 'https://s3.example.com/test.tar.gz.enc',
+        cliPublicKey,
+        orchestratorPrivateKey,
+        repoDir,
+        onlyPathPrefix: '.kici/',
+      });
+      // fails-when: the prefix filter is removed (src/a.ts and .git/HEAD appear)
+      await expect(fs.access(path.join(repoDir, '.git', 'HEAD'))).rejects.toThrow();
+      await expect(fs.access(path.join(repoDir, 'src', 'a.ts'))).rejects.toThrow();
+      expect(await fs.readFile(path.join(repoDir, '.kici/workflows/w.ts'), 'utf-8')).toBe(
+        'export default {};',
+      );
+      // Deletions are filtered the same way: only the one under .kici/ runs.
+      expect(await fs.readFile(path.join(repoDir, 'stale.ts'), 'utf-8')).toBe('old');
+      await expect(fs.access(path.join(repoDir, '.kici', 'old.ts'))).rejects.toThrow();
+      expect(result).toMatchObject({ filesApplied: 1, filesDeleted: 1, verified: true });
+    });
+
+    it('excludes a key that only starts with .kici/ before normalization', async () => {
+      const content = 'export const a = 1;';
+      const { encryptedData, cliPublicKey, orchestratorPrivateKey } = await createTestOverlay(
+        tmpDir,
+        { 'src/a.ts': content, '.kici/workflows/w.ts': 'export default {};' },
+        ['.kici/../stale.ts'],
+        { '.kici/../src/a.ts': sha256(Buffer.from(content)) },
+      );
+      await fs.writeFile(path.join(repoDir, 'stale.ts'), 'old');
+      const downloadMod = await import('./download.js');
+      vi.spyOn(downloadMod, 'downloadUrl').mockResolvedValue(encryptedData);
+
+      await applyOverlay({
+        tarballUrl: 'https://s3.example.com/test.tar.gz.enc',
+        cliPublicKey,
+        orchestratorPrivateKey,
+        repoDir,
+        onlyPathPrefix: '.kici/',
+      });
+      // fails-when: the raw startsWith is restored, so .kici/../src/a.ts writes src/a.ts
+      // and .kici/../stale.ts deletes stale.ts
+      await expect(fs.access(path.join(repoDir, 'src', 'a.ts'))).rejects.toThrow();
+      expect(await fs.readFile(path.join(repoDir, 'stale.ts'), 'utf-8')).toBe('old');
+      expect(await fs.readFile(path.join(repoDir, '.kici/workflows/w.ts'), 'utf-8')).toBe(
+        'export default {};',
+      );
+    });
+
+    it('applies every entry without a prefix (a checkout: true full-repo job)', async () => {
+      const { cliPublicKey, orchestratorPrivateKey } = await fullRepoOverlay();
+      const result = await applyOverlay({
+        tarballUrl: 'https://s3.example.com/test.tar.gz.enc',
+        cliPublicKey,
+        orchestratorPrivateKey,
+        repoDir,
+      });
+      // breaks-if-wrong: a checkout !== false full-repo job still gets every entry
+      expect(await fs.readFile(path.join(repoDir, '.git', 'HEAD'), 'utf-8')).toBe(
+        'ref: refs/heads/main\n',
+      );
+      expect(await fs.readFile(path.join(repoDir, 'src', 'a.ts'), 'utf-8')).toBe(
+        'export const a = 1;',
+      );
+      await expect(fs.access(path.join(repoDir, 'stale.ts'))).rejects.toThrow();
+      expect(result).toMatchObject({ filesApplied: 3, filesDeleted: 2, verified: true });
+    });
+  });
+
   describe('path containment', () => {
     /**
      * Apply a hostile overlay next to a normal one and prove the refusal is
@@ -561,9 +697,33 @@ describe('overlay-applier', () => {
       });
     }
 
-    it('applies a tracked relative file symlink as its target content', async () => {
-      // breaks-if-wrong: a repository with a tracked file symlink (this one has
-      // docs-site/public/monitoring-pack/* -> docs/) must still run remotely.
+    it('keeps the executable bit of a shipped file, over a clone file or not', async () => {
+      await fs.writeFile(path.join(repoDir, 'over.sh'), 'old');
+      await fs.chmod(path.join(repoDir, 'over.sh'), 0o644);
+      const overlay = await createTestOverlay(
+        tmpDir,
+        { 'run.sh': '#!/bin/sh\n', 'over.sh': '#!/bin/sh\n', 'plain.txt': 'x' },
+        [],
+        {},
+        {},
+        {},
+        {},
+        ['run.sh', 'over.sh'],
+      );
+
+      await apply(overlay);
+
+      const mode = async (rel: string) => (await fs.stat(path.join(repoDir, rel))).mode & 0o111;
+      // fails-when: the applier drops the mode, so git in the workspace reads a mode change
+      expect(await mode('run.sh')).not.toBe(0);
+      expect(await mode('over.sh')).not.toBe(0);
+      // breaks-if-wrong: a plain file stays non-executable
+      expect(await mode('plain.txt')).toBe(0);
+    });
+
+    it('applies a tracked relative file symlink as a link to its shipped target', async () => {
+      // breaks-if-wrong: a repository with a tracked file symlink (this one links its
+      // docs site's monitoring-pack files to docs/) must still run remotely.
       const overlay = await createTestOverlay(
         tmpDir,
         { 'docs/alerts.yaml': 'groups: []' },
@@ -577,6 +737,8 @@ describe('overlay-applier', () => {
       expect(result.filesApplied).toBe(2);
       const dest = path.join(repoDir, 'site/alerts.yaml');
       expect(await fs.readFile(dest, 'utf-8')).toBe('groups: []');
+      expect(await fs.readlink(dest)).toBe('../docs/alerts.yaml');
+      expect(result.symlinksApplied).toBe(1);
     });
 
     it('refuses a symlink entry that points outside the extraction root', async () => {
@@ -593,7 +755,7 @@ describe('overlay-applier', () => {
 
       // fails-when: the applier follows the link to the host file and copies it in
       await expect(apply(overlay)).rejects.toThrow(
-        /leak\.txt: (resolves outside the overlay|file not found in tarball)/,
+        'leak.txt: symlink entry leak.txt not extracted: the link text leaves the extraction directory',
       );
       await expect(fs.access(path.join(repoDir, 'leak.txt'))).rejects.toThrow();
       expect(await fs.readFile(path.join(repoDir, 'inside.txt'), 'utf-8')).toBe('original');
@@ -616,10 +778,106 @@ describe('overlay-applier', () => {
         { checksums: { 'dir/secret.txt': secretHash } },
       );
 
+      // fails-when: the error names only a missing file, not the skipped link above it
       await expect(apply(overlay)).rejects.toThrow(
-        /dir\/secret\.txt: (resolves outside the overlay|file not found in tarball)/,
+        'dir/secret.txt: symlink entry dir not extracted: the link text leaves the extraction directory',
       );
       await expect(fs.access(path.join(repoDir, 'dir/secret.txt'))).rejects.toThrow();
+    });
+
+    describe('a hostile manifest entry', () => {
+      /** A manifest that applies cleanly: read as the overlay's own, it makes `apply` succeed. */
+      const validManifest = JSON.stringify({ sha: 'abc123', deletions: [], checksums: {} });
+      let stage: string;
+      let hostDir: string;
+      let hostFile: string;
+
+      beforeEach(async () => {
+        stage = path.join(tmpDir, 'hostile-stage');
+        await fs.mkdir(path.join(stage, '.kici-overlay-tmp'), { recursive: true });
+        hostDir = path.join(tmpDir, 'host');
+        await fs.mkdir(hostDir);
+        hostFile = path.join(hostDir, 'manifest.json');
+        await fs.writeFile(hostFile, validManifest);
+      });
+
+      /** The encrypted overlay of `entries` read from the stage, in that order. */
+      async function overlayOf(entries: string[]) {
+        const file = path.join(tmpDir, 'hostile.tar.gz');
+        await tarCreate({ gzip: true, file, cwd: stage }, entries);
+        return encryptTarball(await fs.readFile(file));
+      }
+
+      /** Nothing reached the repository, and the host directory holds only what it did. */
+      async function expectUntouched(): Promise<void> {
+        expect(await fs.readdir(repoDir)).toEqual([]);
+        expect(await fs.readdir(hostDir)).toEqual(['manifest.json']);
+      }
+
+      it.each([
+        ['an absolute link', (host: string) => host, 'the link text is absolute'],
+        ['a link climbing out', climbTo, 'the link text leaves the extraction directory'],
+      ])('refuses a manifest that is %s to a host file', async (_shape, textOf, reason) => {
+        await fs.symlink(textOf(hostFile), path.join(stage, '.kici-overlay-tmp/manifest.json'));
+
+        // fails-when: link texts are written unconfined and the manifest read follows the link,
+        // which reads the host file as a valid manifest and applies it
+        await expect(apply(await overlayOf(['.kici-overlay-tmp/manifest.json']))).rejects.toThrow(
+          'Overlay manifest not found: expected .kici-overlay-tmp/manifest.json in tarball ' +
+            `(symlink entry .kici-overlay-tmp/manifest.json not extracted: ${reason})`,
+        );
+        await expectUntouched();
+      });
+
+      it('refuses a manifest directory that is a link to a host directory', async () => {
+        await fs.rm(path.join(stage, '.kici-overlay-tmp'), { recursive: true });
+        await fs.symlink(hostDir, path.join(stage, '.kici-overlay-tmp'));
+
+        // fails-when: the directory link is placed as given and followed by the manifest read
+        await expect(apply(await overlayOf(['.kici-overlay-tmp']))).rejects.toThrow(
+          'Overlay manifest not found: expected .kici-overlay-tmp/manifest.json in tarball ' +
+            '(symlink entry .kici-overlay-tmp not extracted: the link text is absolute)',
+        );
+        await expectUntouched();
+      });
+
+      it('never reads the manifest through an in-root directory link', async () => {
+        await fs.rm(path.join(stage, '.kici-overlay-tmp'), { recursive: true });
+        await fs.mkdir(path.join(stage, 'meta'));
+        await fs.writeFile(path.join(stage, 'meta/manifest.json'), validManifest);
+        await fs.symlink('meta', path.join(stage, '.kici-overlay-tmp'));
+
+        // fails-when: the manifest read follows a link (the link is in-root, so only the read
+        // guard stands between this overlay and a successful apply)
+        await expect(
+          apply(await overlayOf(['meta/manifest.json', '.kici-overlay-tmp'])),
+        ).rejects.toThrow(
+          'Overlay manifest refused: .kici-overlay-tmp/manifest.json: ' +
+            'a directory above it is a symlink or a file',
+        );
+      });
+
+      it('never reads the manifest through an in-root file link', async () => {
+        await fs.writeFile(path.join(stage, '.kici-overlay-tmp/real.json'), validManifest);
+        await fs.symlink('real.json', path.join(stage, '.kici-overlay-tmp/manifest.json'));
+
+        // fails-when: the manifest read follows its own link
+        await expect(
+          apply(
+            await overlayOf(['.kici-overlay-tmp/real.json', '.kici-overlay-tmp/manifest.json']),
+          ),
+        ).rejects.toThrow(
+          'Overlay manifest refused: .kici-overlay-tmp/manifest.json: it is a symlink',
+        );
+      });
+
+      it('refuses a manifest that is not a regular file', async () => {
+        await fs.mkdir(path.join(stage, '.kici-overlay-tmp/manifest.json'));
+
+        await expect(apply(await overlayOf(['.kici-overlay-tmp/manifest.json']))).rejects.toThrow(
+          'Overlay manifest refused: .kici-overlay-tmp/manifest.json: it is not a regular file',
+        );
+      });
     });
 
     describe('a changed file symlink over a clone', () => {
@@ -647,17 +905,62 @@ describe('overlay-applier', () => {
         await apply(overlay);
 
         expect(await fs.readFile(path.join(repoDir, 'site/alerts.yaml'), 'utf-8')).toBe('b');
+        // fails-when: the link is written as a copy of its target, which git reads as a type change
+        expect(await fs.readlink(path.join(repoDir, 'site/alerts.yaml'))).toBe('../docs/b.yaml');
+      });
+
+      const alerts = { 'site/alerts.yaml': { target: 'hop.yaml', hashOf: 'b' } };
+      const hop = { 'site/hop.yaml': { target: '../docs/b.yaml', hashOf: 'b' } };
+
+      it.each([
+        ['the dependent link first', { ...alerts, ...hop }],
+        // node-tar refuses a link whose target is a link it already extracted.
+        ['the target link first', { ...hop, ...alerts }],
+      ])('recreates a chain of file links as links, %s in the tarball', async (_order, links) => {
+        // fails-when: the extraction drops a link entry that points at an earlier link entry
+        const overlay = await createTestOverlay(tmpDir, { 'docs/b.yaml': 'b' }, [], {}, links);
+
+        await apply(overlay);
+
+        expect(await fs.readlink(path.join(repoDir, 'site/alerts.yaml'))).toBe('hop.yaml');
+        expect(await fs.readlink(path.join(repoDir, 'site/hop.yaml'))).toBe('../docs/b.yaml');
+        expect(await fs.readFile(path.join(repoDir, 'site/alerts.yaml'), 'utf-8')).toBe('b');
       });
 
       it('refuses the link when it ships without its target', async () => {
         // fails-when: the link alone is shipped and the applier reads the clone's file through it
         const overlay = await createTestOverlay(tmpDir, {}, [], {}, changedLink);
 
+        // fails-when: the error from an older CLI's tarball says only "file not found in tarball"
         await expect(apply(overlay)).rejects.toThrow(
-          /site\/alerts\.yaml: file not found in tarball/,
+          'site/alerts.yaml: symlink entry site/alerts.yaml not extracted: its target was not shipped in the overlay',
         );
         expect(await fs.readlink(path.join(repoDir, 'site/alerts.yaml'))).toBe('../docs/a.yaml');
       });
+    });
+
+    it('keeps the copy of a link whose target holds a copy from another source', async () => {
+      // The clone has `p -> q`, so the overlay's `p/f` (bytes B) lands at `q/f`.
+      // The tarball also holds a `q/f` outside the manifest (bytes A), which the
+      // link `L -> q/f` resolves to and its checksum covers.
+      await fs.mkdir(path.join(repoDir, 'q'));
+      await fs.symlink('q', path.join(repoDir, 'p'));
+      const overlay = await createTestOverlay(
+        tmpDir,
+        { 'p/f': 'B', 'q/f': 'A' },
+        [],
+        {},
+        { L: { target: 'q/f', hashOf: 'A' } },
+        {},
+        { checksums: { 'p/f': sha256(Buffer.from('B')), L: sha256(Buffer.from('A')) } },
+      );
+
+      await apply(overlay);
+
+      expect(await fs.readFile(path.join(repoDir, 'q/f'), 'utf-8')).toBe('B');
+      // fails-when: the link is kept because some copy was written at its target
+      expect((await fs.lstat(path.join(repoDir, 'L'))).isSymbolicLink()).toBe(false);
+      expect(await fs.readFile(path.join(repoDir, 'L'), 'utf-8')).toBe('A');
     });
 
     describe('directory symlinks', () => {

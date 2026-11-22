@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadConfig } from './config.js';
+import { ConfigScope, KICI_ADMIN_ENV_VARS, loadConfig } from './config.js';
 import { resolveLocalConfig } from './config/resolver.js';
 import { PeerDiscoveryMode } from './config/schema.js';
 import { DEFAULT_CACHE_STORAGE_S3_PREFIX, clusterSentinelKey } from './cluster/cluster-identity.js';
@@ -433,7 +433,16 @@ describe('orchestrator loadConfig', () => {
       process.env.KICI_TEST_ACCEPTED_DISPATCH_DELAY_MS = '1';
       process.env.KICI_SKIP_S3_SENTINEL_VALIDATION = 'true';
       process.env.KICI_SKIP_DB_TESTS = '1';
+      // breaks-if-wrong: the public mirror's CI sets it for every package's tests
+      process.env.KICI_SKIP_VISUAL_SNAPSHOTS = '1';
       expect(() => loadConfig()).not.toThrow();
+    });
+
+    it('rejects a stray KICI_SKIP_VISUAL_SNAPSHOTS under any other NODE_ENV', () => {
+      // fails-when: a production orchestrator boots with a test-runner switch set
+      process.env.NODE_ENV = 'production';
+      process.env.KICI_SKIP_VISUAL_SNAPSHOTS = '1';
+      expect(() => loadConfig()).toThrow(/Unknown KICI_\* env var/);
     });
 
     it('rejects a stray KICI_TEST_* var under any other NODE_ENV (defense in depth)', () => {
@@ -516,6 +525,53 @@ describe('orchestrator loadConfig', () => {
     it('starts when KICI_CONFIG is set in the environment', () => {
       process.env.KICI_CONFIG = yamlPath;
       expect(() => loadConfig()).not.toThrow();
+    });
+
+    // breaks-if-wrong: the kici-admin launcher (packages/kici-admin/bin) sets KICI_LOG_STDERR
+    //   before it loads the CLI, so every direct-database command loads this config with it set
+    it('starts with KICI_LOG_STDERR in the environment', () => {
+      process.env.KICI_LOG_STDERR = '1';
+      try {
+        expect(() => loadConfig()).not.toThrow();
+      } finally {
+        delete process.env.KICI_LOG_STDERR;
+      }
+    });
+
+    // fails-when: KICI_ADMIN_TOKEN written for KICI_BOOTSTRAP_ADMIN_TOKEN boots an orchestrator
+    //   with no admin token, or another kici-admin setting slips past the boot check
+    it('refuses to boot on a kici-admin setting, naming what it is', () => {
+      for (const name of KICI_ADMIN_ENV_VARS) {
+        process.env[name] = 'x';
+        try {
+          expect(() => loadConfig(), name).toThrow(
+            new RegExp(`${name}\\s+\\(a kici-admin setting the orchestrator does not read`),
+          );
+        } finally {
+          delete process.env[name];
+        }
+      }
+      process.env.KICI_ADMIN_TOKEN = 'x';
+      try {
+        expect(() => loadConfig()).toThrow(/its own admin token is KICI_BOOTSTRAP_ADMIN_TOKEN/);
+      } finally {
+        delete process.env.KICI_ADMIN_TOKEN;
+      }
+    });
+
+    // breaks-if-wrong: a kici-admin direct-database command (signing-key,
+    //   dashboard-encryption-key, attestations reverify) still runs in the shell its own
+    //   --url / --token settings came from; a near-miss still refuses there
+    it('the admin scope accepts the kici-admin settings, and nothing more', () => {
+      const names = [...KICI_ADMIN_ENV_VARS, 'KICI_LOG_STDERR'];
+      for (const name of names) process.env[name] = 'x';
+      try {
+        expect(() => loadConfig(ConfigScope.enum.admin)).not.toThrow();
+        process.env.KICI_ADMIN_TOKENS = 'x';
+        expect(() => loadConfig(ConfigScope.enum.admin)).toThrow(/Unknown KICI_\* env var/);
+      } finally {
+        for (const name of [...names, 'KICI_ADMIN_TOKENS']) delete process.env[name];
+      }
     });
 
     // breaks-if-wrong: accepting KICI_CONFIG must stay path selection. A

@@ -5789,43 +5789,50 @@ describe('evaluateJobContexts — a context concurrency limit counts siblings ad
   });
 });
 
+/** A generated static job as a generator's agent reply carries it. */
+const genLockJob = (name: string, extra: Record<string, unknown> = {}) =>
+  ({
+    _type: 'static',
+    name,
+    runsOn: [{ kind: 'exact', value: 'linux' }],
+    steps: [],
+    needs: [],
+    ...extra,
+  }) as never;
+
+/** The dispatchable configs `resolveGeneratedJobConfigs` builds for `generatedJobs`. */
+async function resolveGenerated(
+  generatedJobs: unknown[],
+  dynamicEntry: Record<string, unknown> = { _type: 'dynamic', source: { file: 'ci.ts', index: 0 } },
+  extraJobConfig?: Record<string, unknown>,
+): Promise<GeneratedJobConfig[]> {
+  const { dispatchable } = await resolveGeneratedJobConfigs({
+    ctx: {
+      deps: {} as never,
+      runId: 'run-1',
+      resolvedOrgId: 'org-1',
+      event: {} as never,
+      info: { routingKey: 'rk' },
+      ...(extraJobConfig && { extraJobConfig }),
+    } as never,
+    workflow: { name: 'ci', source: 'ci.ts' } as never,
+    fullLockFile: { source: 'ci.ts' } as never,
+    runPublicKeyBase64: undefined,
+    npmRegistries: undefined,
+    installEnvSecrets: undefined,
+    generatedJobs: generatedJobs as never,
+    dynamicEntry: dynamicEntry as never,
+  });
+  return dispatchable;
+}
+
 describe('resolveGeneratedJobConfigs gitCredentials', () => {
   const DECLARED = {
     default: { kind: 'token', tokenSecret: 'ci:FORGE_PAT' },
   } as const;
 
-  const genLockJob = (name: string, extra: Record<string, unknown> = {}) =>
-    ({
-      _type: 'static',
-      name,
-      runsOn: [{ kind: 'exact', value: 'linux' }],
-      steps: [],
-      needs: [],
-      ...extra,
-    }) as never;
-
-  async function resolve(args: {
-    dynamicEntry: Record<string, unknown>;
-    generatedJobs: unknown[];
-  }): Promise<GeneratedJobConfig[]> {
-    const { dispatchable } = await resolveGeneratedJobConfigs({
-      ctx: {
-        deps: {} as never,
-        runId: 'run-1',
-        resolvedOrgId: 'org-1',
-        event: {} as never,
-        info: { routingKey: 'rk' },
-      } as never,
-      workflow: { name: 'ci', source: 'ci.ts' } as never,
-      fullLockFile: { source: 'ci.ts' } as never,
-      runPublicKeyBase64: undefined,
-      npmRegistries: undefined,
-      installEnvSecrets: undefined,
-      generatedJobs: args.generatedJobs as never,
-      dynamicEntry: args.dynamicEntry as never,
-    });
-    return dispatchable;
-  }
+  const resolve = (args: { dynamicEntry: Record<string, unknown>; generatedJobs: unknown[] }) =>
+    resolveGenerated(args.generatedJobs, args.dynamicEntry);
 
   it("copies the generator's lock-declared map onto every child", async () => {
     const out = await resolve({
@@ -5878,6 +5885,100 @@ describe('resolveGeneratedJobConfigs gitCredentials', () => {
     // Nothing declared or persisted: the relay refuses every workflow ref (fail-closed).
     expect('gitCredentials' in out[0].genJobConfig).toBe(false);
     expect(out[0].gitCredentials).toBeUndefined();
+  });
+});
+
+describe('dispatch forwards the lock job checkout settings', () => {
+  it('a static job with checkout: false dispatches checkout: false', async () => {
+    const { ctx, dispatched } = makeSingleJobContext({ bundle: undefined, jobCheckout: false });
+    await dispatchMatchedWorkflow(ctx);
+    expect(dispatched).toHaveLength(1);
+    // fails-when: makeBuildJobConfig copies fields one by one and skips checkout — the shape that shipped
+    expect(dispatched[0].jobConfig.checkout).toBe(false);
+  });
+
+  it('a static job with options dispatches checkoutOptions', async () => {
+    const { ctx, dispatched } = makeSingleJobContext({
+      bundle: undefined,
+      jobCheckout: { fetchDepth: 0, fetchTags: true },
+    });
+    await dispatchMatchedWorkflow(ctx);
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0].jobConfig.checkoutOptions).toEqual({ fetchDepth: 0, fetchTags: true });
+    expect('checkout' in dispatched[0].jobConfig).toBe(false);
+  });
+
+  it('a job without either key dispatches neither', async () => {
+    const { ctx, dispatched } = makeSingleJobContext({ bundle: undefined });
+    await dispatchMatchedWorkflow(ctx);
+    expect(dispatched).toHaveLength(1);
+    // breaks-if-wrong: existing jobs stay byte-identical
+    expect('checkout' in dispatched[0].jobConfig).toBe(false);
+    expect('checkoutOptions' in dispatched[0].jobConfig).toBe(false);
+  });
+});
+
+describe('resolveGeneratedJobConfigs checkout', () => {
+  const resolve = (generatedJobs: unknown[]) => resolveGenerated(generatedJobs);
+
+  it('copies checkout: false and checkoutOptions from each generated job', async () => {
+    const out = await resolve([
+      genLockJob('a', { checkout: false }),
+      genLockJob('b', { checkoutOptions: { fetchDepth: 0 } }),
+      genLockJob('c'),
+    ]);
+    expect(out).toHaveLength(3);
+    const byName = new Map(out.map((cfg) => [cfg.genJob.name, cfg.genJobConfig]));
+    // fails-when: buildGeneratedJobConfig builds genJobConfig without the checkout spread
+    expect(byName.get('a')?.checkout).toBe(false);
+    expect('checkoutOptions' in (byName.get('a') ?? {})).toBe(false);
+    expect(byName.get('b')?.checkoutOptions).toEqual({ fetchDepth: 0 });
+    expect('checkout' in (byName.get('b') ?? {})).toBe(false);
+    // breaks-if-wrong: a generated job with no checkout key keeps the default clone
+    // fails-when: job c is never dispatched, which would make the two negatives below pass vacuously
+    expect(byName.has('c')).toBe(true);
+    expect('checkout' in (byName.get('c') ?? {})).toBe(false);
+    expect('checkoutOptions' in (byName.get('c') ?? {})).toBe(false);
+  });
+
+  it('drops an invalid checkoutOptions arriving on the agent reply', async () => {
+    // Load-bearing: `generatedJobs` is unvalidated agent JSON.
+    const out = await resolve([genLockJob('a', { checkoutOptions: { fetchDepth: 'all' } })]);
+    expect(out).toHaveLength(1);
+    expect('checkoutOptions' in out[0].genJobConfig).toBe(false);
+    expect('checkout' in out[0].genJobConfig).toBe(false);
+  });
+});
+
+describe('resolveGeneratedJobConfigs test-run provenance', () => {
+  async function resolve(extraJobConfig?: Record<string, unknown>): Promise<GeneratedJobConfig> {
+    const dispatchable = await resolveGenerated([genLockJob('gen')], undefined, extraJobConfig);
+    expect(dispatchable).toHaveLength(1);
+    return dispatchable[0];
+  }
+
+  it("bakes a remote run's fullRepo and overlay keys into a generated job's config", async () => {
+    const provenance = {
+      isTestRun: true,
+      fixtureId: 'fx-1',
+      fullRepo: true,
+      tarballUrl: 'https://cache.example/overlay.tar',
+      cliPublicKey: 'cli-pub',
+      orchestratorPrivateKey: 'orch-priv',
+    };
+    const cfg = await resolve(provenance);
+    // fails-when: a generated job in a test run lacks fullRepo or the overlay keys — a
+    // needs-gated, held or routed one re-dispatches through the base dispatcher and the
+    // agent clones an empty repoUrl instead of unpacking the overlay
+    expect(cfg.genJobConfig).toMatchObject(provenance);
+  });
+
+  it('adds no test-run keys outside a test run', async () => {
+    const cfg = await resolve();
+    // breaks-if-wrong: a webhook run's generated job keeps its ordinary clone
+    expect('fullRepo' in cfg.genJobConfig).toBe(false);
+    expect('tarballUrl' in cfg.genJobConfig).toBe(false);
+    expect('isTestRun' in cfg.genJobConfig).toBe(false);
   });
 });
 

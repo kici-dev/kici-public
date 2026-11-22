@@ -28,6 +28,7 @@ All types are exported from `@kici-dev/sdk` as type-only imports.
 | `OutputSchema`                    | Record of Zod types for step outputs                                                                                                                                                                                                                                               |
 | `InferOutputs<T>`                 | Infer output type from output schema                                                                                                                                                                                                                                               |
 | `ContainerConfig`                 | Container config for job execution: `image` or `dockerfile` (with `context`, `target`, `args`), plus `env` and registry `auth`. See [Container jobs](../container-jobs.md).                                                                                                        |
+| `CheckoutOptions`                 | Object form of a job's `checkout` option: `fetchDepth` (commits to clone, `0` = full history) and `fetchTags` (`true` = every tag, `false` = none). See [Checkout depth and tags](./core.md#checkout-depth-and-tags)                                                               |
 | `RunsOn`                          | Union of `runsOn` forms: `string \| RegExp \| (string \| RegExp)[] \| RunsOnSelector`. A plain string matches exactly, a string with glob metacharacters (`*?[]{}`) is a glob, and a `RegExp` is a regular expression. See [Targeting by pattern](./core.md#targeting-by-pattern). |
 | `RunsOnSelector`                  | Object form for `runsOn` with `labels` (required) and `exclude` (optional) properties. Each element accepts the exact / glob / regex forms on both sides.                                                                                                                          |
 | `RunsOnPick`                      | Single-agent selection policy when several agents match a `runsOn` selector: `'deterministic'` (stable hash — same job lands on the same host across re-runs) or `'any'` (spread load). See [runsOnAll](./runs-on-all.md#targeting-by-pattern) for the fan-out forms.              |
@@ -587,7 +588,7 @@ const migrate = job('migrate', async (ctx) => {
 });
 ```
 
-A `runsOn` of a single host's `agentId` (as in `runsOn: [h.agentId]` above) **pins the job to that host**: the orchestrator routes it to that agent only, and queues it with the pin if the host is momentarily offline — the same host-pin path `runsOnAll` uses. A `runsOn` with multiple labels or a glob/regex pattern stays ordinary label routing.
+A `runsOn` of a single host's `agentId` (as in `runsOn: [h.agentId]` above) **pins the job to that host**. The orchestrator routes it to that agent only, and queues it with the pin if the host is momentarily offline — the same host-pin path `runsOnAll` uses. A `runsOn` with multiple labels or a glob/regex pattern stays ordinary label routing.
 
 `ctx.kici.inventory` is available to **both** steps and dynamic-job generators (unlike `ctx.kici.oidc.token`, which is job-bound — the inventory is cluster-scoped, not job-bound).
 
@@ -722,7 +723,7 @@ step('discover', async (ctx) => {
 
 ### File-mounted secrets (ctx.secrets.mountFile / exposeFile)
 
-Tools that require a file path on disk (sops `SOPS_AGE_KEY_FILE`, kubectl `KUBECONFIG`, gcloud `GOOGLE_APPLICATION_CREDENTIALS`) get a typed step-side API: `ctx.secrets.mountFile(opts)` writes the concatenation of one or more existing secrets to a per-step tmpfile and returns the path; `ctx.secrets.exposeFile(envVar, opts)` additionally sets `process.env[envVar] = path`. Files are removed and env vars are unset automatically when the step completes (success, failure, or timeout) — no manual cleanup. See [Mounting secrets as files](../secrets.md#mounting-secrets-as-files) for the full options table, lifecycle details, and the canonical sops example.
+Tools that require a file path on disk (sops `SOPS_AGE_KEY_FILE`, kubectl `KUBECONFIG`, gcloud `GOOGLE_APPLICATION_CREDENTIALS`) get a typed step-side API: `ctx.secrets.mountFile(opts)` writes the concatenation of one or more existing secrets to a per-step tmpfile and returns the path. `ctx.secrets.exposeFile(envVar, opts)` additionally sets `process.env[envVar] = path`. Files are removed and env vars are unset automatically when the step completes (success, failure, or timeout) — no manual cleanup. See [Mounting secrets as files](../secrets.md#mounting-secrets-as-files) for the full options table, lifecycle details, and the canonical sops example.
 
 ### Local test mode secrets
 

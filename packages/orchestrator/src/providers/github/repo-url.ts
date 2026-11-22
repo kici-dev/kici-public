@@ -2,28 +2,33 @@
  * GitHub repository URL builder.
  *
  * Implements the RepoUrlBuilder interface from @kici-dev/engine for GitHub.
- * Constructs HTTPS clone URLs and raw file access URLs.
+ * Constructs HTTPS clone URLs and raw file access URLs on the GitHub server
+ * the source's App lives on.
  */
 
 import type { RepoUrlBuilder } from '@kici-dev/engine';
+import { DEFAULT_GITHUB_URL } from './github-host.js';
 
 /**
  * GitHub-specific implementation of RepoUrlBuilder.
  *
- * Builds URLs for github.com repositories.
- * repoIdentifier is expected in "owner/repo" format.
+ * Builds URLs on github.com, or on the GitHub Enterprise Server named by
+ * `githubUrl`. repoIdentifier is expected in "owner/repo" format.
  */
 export class GitHubRepoUrlBuilder implements RepoUrlBuilder {
   readonly provider = 'github' as const;
+
+  /** @param githubUrl - Web URL of the App's server; github.com when unset. */
+  constructor(private readonly githubUrl: string = DEFAULT_GITHUB_URL) {}
 
   /**
    * Build the HTTPS clone URL for a GitHub repository.
    *
    * @param repoIdentifier - "owner/repo" format
-   * @returns https://github.com/owner/repo.git
+   * @returns <githubUrl>/owner/repo.git
    */
   buildCloneUrl(repoIdentifier: string): string {
-    return `https://github.com/${repoIdentifier}.git`;
+    return `${this.githubUrl}/${repoIdentifier}.git`;
   }
 
   /**
@@ -34,9 +39,9 @@ export class GitHubRepoUrlBuilder implements RepoUrlBuilder {
    * @param repoIdentifier - "owner/repo" format
    * @param ref - Git ref (branch, tag, SHA)
    * @param path - File path relative to repo root
-   * @returns https://github.com/owner/repo/raw/ref/path
+   * @returns <githubUrl>/owner/repo/raw/ref/path
    */
   buildRawFileUrl(repoIdentifier: string, ref: string, path: string): string {
-    return `https://github.com/${repoIdentifier}/raw/${ref}/${path}`;
+    return `${this.githubUrl}/${repoIdentifier}/raw/${ref}/${path}`;
   }
 }

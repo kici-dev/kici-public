@@ -28,6 +28,30 @@ export const LICENSE_TEXT_OVERRIDES = {
     file: 'oxc.LICENSE',
     source: 'https://github.com/oxc-project/oxc/blob/main/LICENSE',
   },
+  // Every @hono middleware package is published from the honojs/middleware
+  // repository, whose root LICENSE covers it; @hono/zod-validator ships no copy.
+  '@hono/zod-validator': {
+    file: 'hono-middleware.LICENSE',
+    source: 'https://github.com/honojs/middleware/blob/main/LICENSE',
+  },
+  // The native builds of snappy, published from the Brooooooklyn/snappy
+  // repository. The snappy package ships the same LICENSE; its bindings ship none.
+  '@napi-rs/snappy-*': {
+    file: 'snappy.LICENSE',
+    source: 'https://github.com/Brooooooklyn/snappy/blob/main/LICENSE',
+  },
+  // The dashboard bundle inlines it; the package ships no copy of the repository's LICENSE.
+  'react-remove-scroll-bar': {
+    file: 'react-remove-scroll-bar.LICENSE',
+    source: 'https://github.com/theKashey/react-remove-scroll-bar/blob/master/LICENSE',
+  },
+  // Published from the victory monorepo, whose root license covers its own code (MIT). It
+  // declares "MIT AND ISC" because lib-vendor/ copies the d3 libraries, each with its own
+  // LICENSE; its es/ entry points the dashboard bundles import d3 from the d3 packages.
+  'victory-vendor': {
+    file: 'victory.LICENSE',
+    source: 'https://github.com/FormidableLabs/victory/blob/main/LICENSE.txt',
+  },
   // Declares ISC; neither the package nor its repository has a license text.
   'split-ca': { file: 'split-ca.LICENSE', source: 'https://spdx.org/licenses/ISC.html' },
 };

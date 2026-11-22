@@ -32,7 +32,7 @@ Coordination is scoped to that plane, whose state lives under `~/.kici/local/` �
 
 By default, `kici run <event> --local` executes steps inside an **isolated tmp checkout** rather than against your real working directory. Any file a step writes, builds, or deletes — and any `git` mutation a step performs — lands in that throwaway copy, so casual local runs never touch your tree.
 
-What gets materialized into the isolated checkout has full parity with what `kici run remote` reconstructs: your current working tree minus gitignored files, with `.kiciignore` applied to local changes, over a real `.git` directory. Concretely, the checkout is built from a clone pinned to your current `HEAD`, with your local overlay (modified, staged, and untracked-but-not-ignored files) copied on top and locally-deleted files removed. Workflows that read git metadata work because the `.git` directory is present and pinned to your `HEAD`.
+The isolated checkout holds the same files that `kici run remote` uploads: your current working tree minus gitignored files, with `.kiciignore` applied to local changes. The CLI clones your repository into a temp directory at your current `HEAD`. It copies your local changes on top (modified, staged, and untracked-but-not-ignored files), removes locally deleted files, and commits the result on your current branch. The agent then clones that temp repository at the job's [`checkout` depth](../sdk/core.md#checkout-depth-and-tags). Steps that read git metadata see a real `.git`, with your uncommitted changes as the last commit.
 
 The checkout is a fresh temp directory named `kici-local-run-<random>` under the system temp directory (for example, `/tmp/kici-local-run-ab12cd`).
 
@@ -106,6 +106,8 @@ Like `kici run <event> --local`, `kici run remote` recompiles your workflows (`.
 
 The orchestrator must have **cache storage configured** (`KICI_STORAGE_TYPE` = `s3` or `filesystem`) with a dev-reachable upload endpoint so the CLI's direct upload succeeds; see the [testing guide](../testing-guide.md) and [Storage layout](../../operator/orchestrator/storage-layout.md) for setup.
 
+The job runs on your working tree over a `.git` that matches a fresh checkout of your repository, with your uncommitted changes as a commit on top of your `HEAD`. See [What the remote workspace contains](#what-the-remote-workspace-contains).
+
 ```bash
 kici run remote [fixture] [options]
 ```
@@ -138,6 +140,15 @@ kici run remote --workflow ci
 
 # Send a fixture's event to one workflow only (bypass trigger matching)
 kici run remote push-main --workflow ci
+
+# Ship the full git history and every tag to the remote workspace
+kici run remote push-main --git-depth 0
+
+# Keep uncommitted changes uncommitted in the remote workspace
+kici run remote push-main --no-commit
+
+# Tag the remote workspace commit, for steps that run `git describe`
+kici run remote tag-release --tag v1.2.3-rc.1
 
 # Quiet mode -- just pass/fail
 kici run remote push-main --quiet
@@ -204,13 +215,126 @@ workflows that define a job of the same name never share a run:
   entry's `status` is the combined result. `runs` lists each run
   (`runId`, `workflowName`, `status`, `jobs`), and each job carries
   `workflowName`. The entry's top-level `runId` names the first run and is
-  deprecated: read `runs` instead.
+  deprecated: read `runs` instead. `overlay` describes the upload (see
+  [the `overlay` field](#what-the-remote-workspace-contains)).
+
+**A failed status read does not stop the follow.** The CLI reads each run's
+status and logs from the Platform, or from the orchestrator for a direct target.
+The CLI retries a read with backoff when one of these happens:
+
+- The read gets a server error (5xx), a rate limit (429) or a request timeout
+  (408).
+- The server sends no answer within 30 seconds.
+- The connection drops, also in the middle of an answer.
+- The Platform reports that the orchestrator running the run is not connected,
+  for example while that orchestrator restarts.
+
+The CLI prints a warning that names the run. The log read starts again from the
+same position, so no log line is lost or repeated. The CLI retries for up to 2
+minutes of consecutive failures. After that, it stops following the run and the
+command fails. The error names the run, the last error and the status the run
+last had. The CLI does not cancel the run: it continues on the orchestrator.
+Check it later with `kici runs show <run-id>`. A refusal fails the command at
+once: `401` (token not accepted), `403` (access denied), or `404` for a run
+that was already read. Ctrl-C stops a read or a retry in progress and cancels
+the run.
 
 A `kici` older than 0.21.0 follows a single run. For it, the orchestrator runs
 the matched workflows as one shared run when their job names cannot collide.
 When they can collide, it refuses the fixture. That happens when two workflows
 define a job of the same name, or when one defines dynamic jobs. The refusal
 names the shared job names and asks you to upgrade `kici` or pass `--workflow`.
+
+##### What the remote workspace contains
+
+The agent clones nothing for a `kici run remote` job. It extracts the upload into an empty workspace, which holds:
+
+- **Your files:** every tracked file with your staged and unstaged changes, and every untracked file that `.gitignore` does not exclude. `.kiciignore` excludes more files. See [Repo state transfer](../testing-guide.md#repo-state-transfer).
+- **A `.git` that matches a fresh checkout:** the CLI builds a new repository from your local one, as `git clone` does at the selected depth and tag policy. It holds the commits within that depth, your current branch, its `origin/<branch>` remote-tracking branch, and an index of the checked-out commit. When your `HEAD` is detached, the remote `HEAD` is detached too.
+
+The CLI prints what it ships, for example:
+
+```
+Running your local working tree over a checkout of your repository
+Git: depth 1, default tags (default)
+Workspace commit: 9f3c2e1d8b7a6c5f4e3d2c1b0a9f8e7d6c5b4a39 (synthetic commit over HEAD 4b7a0d2e9c8f1a3b5d7e9f0a2c4b6d8e1f3a5c7b)
+```
+
+**History depth and tags.** By default, the remote workspace gets depth 1 and git's default tags: the tags that point at a shipped commit. A job asks for more history with its [`checkout` option](../sdk/core.md#checkout-depth-and-tags). The CLI reads the compiled lock file and ships the deepest `fetchDepth` among the jobs that can run:
+
+- With `--workflow`, or a fixture that names its own `workflowName`, these are the jobs of that workflow.
+- Otherwise, these are the jobs of the workflows that the fixture's event matches. The CLI matches `paths` filters as if every file changed. When the event matches no workflow, every job in the lock file counts.
+- `fetchDepth: 0` (full history) wins over any number. A job with `checkout: false` does not count.
+- When one of these jobs sets `fetchTags: true`, every tag ships.
+
+The `Git:` line names the job that asks for more, for example `Git: full history + tags (job "release" asks for fetchDepth 0)`.
+
+These flags replace what the jobs ask for, each for its own setting only:
+
+- `--git-depth <n>` sets the number of commits. `--git-depth 0` ships the full history, with every local branch as an `origin/*` remote-tracking branch and every tag.
+- `--git-tags` ships every tag.
+- `--no-git-tags` ships no tags, also with `--git-depth 0`.
+
+A [dynamic job generator](../sdk/rules-matrix-dynamic.md#dynamicjobfn) creates its jobs during the run, so the lock file does not hold their `checkout` options. Pass `--git-depth` or `--git-tags` for these jobs. When a job asks for more history or tags than the run shipped, the job's setup log shows a warning that names the flag to add. The job still runs.
+
+**Uncommitted changes as a synthetic commit.** When your working tree differs from `HEAD`, the CLI adds one commit on top of your `HEAD` that holds your changes: the synthetic commit. The remote workspace checks it out, so `git status` there is clean and `git diff HEAD~1` shows your changes. The depth counts your own commits, so depth 1 ships the synthetic commit and your `HEAD`. A clean working tree ships your `HEAD` as it is.
+
+- The author is the identity your own commit gets: `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL`, then `author.name` / `author.email`, then `user.name` / `user.email`. When the name or the email is not set, the author is `KiCI <noreply@kici.dev>`.
+- The committer is always `KiCI <noreply@kici.dev>`.
+- The message is `kici: working-tree snapshot`.
+- `--commit-message <msg>` sets the message. `--commit-author "Name <email>"` sets the author.
+- `--no-commit` makes no synthetic commit. The remote workspace checks out your `HEAD`, and `git status` there shows your changes as uncommitted. `--no-commit` cannot be combined with `--commit-message` or `--commit-author`.
+
+The CLI writes the synthetic commit with your own git and git configuration, so line-ending settings and filter drivers apply as they do for your own commits. Your repository does not change: the CLI writes no ref, index, object, reflog or configuration in it.
+
+**Synthetic tags (`--tag`).** `--tag <name>` creates an annotated tag at the commit the remote workspace checks out: the synthetic commit, or your `HEAD`. Repeat the flag to create more tags. The tagger is `KiCI <noreply@kici.dev>`, and the tag message is the tag name.
+
+- The tag ships whatever the tag policy is, also with `--no-git-tags`.
+- When the shipped repository already holds a tag of that name, the new tag replaces it, and the CLI prints a line that says so.
+- Your own repository gets no tag.
+- The tag changes only the git that the steps see. The fixture's event stays the same.
+- The CLI refuses a name that `git check-ref-format` rejects, a name that starts with `-` or `refs/`, and a name that git reserves for a special ref, such as `HEAD` or `FETCH_HEAD`.
+
+**What never ships.** The CLI copies no file from your own `.git`:
+
+- `.git/config` is generated. It holds the core settings a clone writes, your `origin` remote, and the branch tracking. The `origin` URL loses its user name, password or token. A `scheme://` URL also loses its query string and fragment. Without an `origin` remote, the config has no remote.
+- Hooks, reflogs, stashes, `FETCH_HEAD`, `ORIG_HEAD`, submodule repositories, Git LFS objects and worktree metadata never ship.
+- An object that the shipped refs cannot reach within the depth never ships.
+
+**Changed files and `before`.** The event's commit is the commit the remote workspace checks out. For a push fixture, `before` is the parent of that commit. A fixture that sets its own `sha` gets no `before`. The CLI computes the changed files from your local history and sends them with the event. So `paths` filters and `ctx.changedFiles` see your changes, and the agent does not contact your git host:
+
+- **Push:** the files that differ between `before` and the event's commit. With a synthetic commit, these are your uncommitted changes. On a clean working tree, these are the files that your `HEAD` commit changed.
+- **Pull request:** the files that differ between the event's commit and its merge base with the base branch. The CLI reads the local base branch, else `origin/<base>`. When neither exists, or the base branch has no merge base with the event's commit in your local history (a shallow clone, or unrelated histories), the CLI prints a warning and sends no list. The CLI also prints a warning when the diff itself fails. The agent then decides the changed files as it does for any run.
+- **`--no-commit`:** the list also holds your uncommitted changes.
+- Other events, such as tag and manual events, send no list.
+
+**Jobs with `checkout: false`.** Such a job gets only the `.kici/` directory of the upload. Your other files and the `.git` do not reach it.
+
+**Limits and warnings:**
+
+- When `.kici/` is not at the top level of your git repository, no `.git` ships. The CLI prints a warning, and steps see no git repository.
+- A shallow local repository ships only the history it holds. When that is less than the depth asked for, the CLI prints a warning. Run `git fetch --unshallow` to get more history, then run again.
+- In a partial clone, the run stops with an error when local objects are missing for the history asked for. Fetch the missing objects, or pass a smaller `--git-depth`.
+- A repository with no commit stops the run. Commit your files first.
+- Files that Git LFS tracks ship with their working-tree content. The remote workspace does not run Git LFS, so git there can report these files as modified.
+- With `core.symlinks=false` (common on Windows), git writes each symbolic link as a plain file. That file ships as a regular file, so `git status` in the remote workspace shows a type change for the link.
+
+**The `overlay` field in `--json` output.** Each fixture entry carries `overlay` once the CLI has built the upload:
+
+| Field                            | Meaning                                                                                                                                                                                       |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `overlay.compressedSize`         | Size of the compressed upload, in bytes                                                                                                                                                       |
+| `overlay.fileCount`              | Number of files in the upload, the `.git` files included                                                                                                                                      |
+| `overlay.git.depth`              | Depth the CLI asked for (`0` = full history)                                                                                                                                                  |
+| `overlay.git.tags`               | Tag policy the CLI asked for: `default`, `all` or `none`                                                                                                                                      |
+| `overlay.git.shipped.fetchDepth` | Depth the shipped `.git` holds (`0` = full history). When your local repository is shallow, it can be shallower than `depth` asks: a smaller number, or a positive number when `depth` is `0` |
+| `overlay.git.shipped.allTags`    | `true` when every tag shipped                                                                                                                                                                 |
+| `overlay.git.synthetic`          | `true` when the workspace commit is a synthetic commit                                                                                                                                        |
+| `overlay.git.workspaceSha`       | The commit the remote workspace checks out                                                                                                                                                    |
+| `overlay.git.baseSha`            | Your `HEAD`                                                                                                                                                                                   |
+| `overlay.git.syntheticTags`      | The names of the tags that `--tag` created                                                                                                                                                    |
+
+`overlay.git` is absent when no `.git` ships.
 
 #### Host narrowing with `--target`
 
@@ -241,10 +365,11 @@ for the `when` gating model.
 
 **Exit codes:**
 
-| Code | Meaning                                       |
-| ---- | --------------------------------------------- |
-| 0    | Every run of every matched workflow passed    |
-| 1    | One or more runs failed, or a run was refused |
+| Code | Meaning                                                                                  |
+| ---- | ---------------------------------------------------------------------------------------- |
+| 0    | Every run of every matched workflow passed                                               |
+| 1    | One or more runs failed, or a run was refused                                            |
+| 2    | A usage error: an invalid flag value, or flags that cannot be combined. Nothing uploads. |
 
 #### How the run is routed
 
@@ -261,7 +386,7 @@ Through the Platform, a remote run is dispatched to your **active organization**
 2. Otherwise the active org saved in your global config by `kici org use <org>`.
 3. If neither is set, the command errors and asks you to select an org with `kici org use` or pass `--org`.
 
-The orchestrator anchors the org without any manual webhook source: it auto-provisions a system-managed **remote source** (routing key `remote:<orgId>`) that maps to its bound organization, so even a zero-source org is immediately routable for remote runs. You never set a routing key for a remote run — selecting the org is enough.
+The orchestrator anchors the org without any manual webhook source. It auto-provisions a system-managed **remote source** (routing key `remote:<orgId>`) that maps to its bound organization, so even a zero-source org is immediately routable for remote runs. You never set a routing key for a remote run — selecting the org is enough.
 
 When an org has more than one connected orchestrator cluster, the CLI picks the target cluster in this order:
 
@@ -312,7 +437,7 @@ For executing workflow steps on your own machine without an orchestrator (no sca
 
 `kici run remote` works even if the repo has never been pushed to GitHub, because no run depends on a git remote. Every `kici run remote` run behaves the same way, with or without a remote:
 
-- The entire working tree is uploaded, including the `.git` directory, so steps that run git commands work
+- The working tree is uploaded with a `.git` that matches a fresh checkout of your repository, so steps that run git commands work (see [What the remote workspace contains](#what-the-remote-workspace-contains))
 - The lock file is sent inline (no GitHub API fetch)
 - The build cache is skipped: no `__build__` job runs, and no cached source or dependencies are used
 - A bound context that does not set `allowLocalExecution: true` (the default is `false`) is skipped for the run, and the run shows a warning that names it
@@ -330,9 +455,9 @@ kici orchestrators list [--org <id>]
 kici orchestrators use <clusterName> [--org <id>]
 ```
 
-**`kici orchestrators list`** prints the org's connected orchestrator clusters, so you know what to pass to `--orchestrator` (or to `kici orchestrators use`).
+**`kici orchestrators list`** prints the org's connected orchestrator clusters with their versions, so you know what to pass to `--orchestrator` (or to `kici orchestrators use`). The per-org default cluster is marked with a star (`*`).
 
-**`kici orchestrators use <clusterName>`** sets the default orchestrator cluster for the org, stored per-org in your global config. Subsequent `kici run remote` invocations target that cluster unless overridden with `--orchestrator`.
+**`kici orchestrators use <clusterName>`** sets the default orchestrator cluster for the org, stored per-org in your global config. Subsequent `kici run remote` invocations target that cluster unless overridden with `--orchestrator`. The name must match a connected cluster. An unknown name fails, lists the connected clusters, and saves nothing.
 
 **Examples:**
 
@@ -572,7 +697,7 @@ kici runs artifacts list abc123 --json
 
 #### kici runs artifacts download
 
-Download a run's artifacts. Name one to fetch just that artifact; omit the name
+Download a run's artifacts. Name one to fetch only that artifact; omit the name
 to download every artifact of the run. Each artifact extracts into its own
 `<name>/` directory by default.
 
@@ -661,9 +786,14 @@ kici approve abc123 --job deploy-production
 
 # Approve a held step (steps are addressed by index)
 kici approve abc123 --job migrate-and-deploy --step 1
+
+# Approve the security hold of a job that also has a reviewer hold
+kici approve abc123 --job deploy-production --hold-type security
 ```
 
-You must be eligible for at least one unsatisfied clause (a member of a named team, or a named user) and hold the permission that matches the hold's type — `ci_trust:write` for a **security** hold, `contexts:admin` for a **wait-timer** hold, `contexts:write` for every other hold. The server enforces this, so the same rule applies to the dashboard and to an AI agent's tools. The command reports whether the element was released, how many clauses remain, or that it was rejected.
+With no option, the command acts on the run's only pending hold. When the run has several, it fails and lists them. `--step` requires `--job`. `--hold-type <reviewer|timer|concurrency|security>` narrows the match to one hold type, for example for a job that carries both a `requireApproval` gate and a security context gate. When nothing else separates two holds, pass the hold id from the error listing with `--hold <id>`, which ignores the other options. `kici reject` selects the hold the same way.
+
+You must be eligible for at least one unsatisfied clause (a member of a named team, or a named user). You must also hold the permission that matches the hold's type — `ci_trust:write` for a **security** hold, `contexts:admin` for a **wait-timer** hold, `contexts:write` for every other hold. The server enforces this, so the same rule applies to the dashboard and to an AI agent's tools. The command reports whether the element was released, how many clauses remain, or that it was rejected.
 
 ## Reference
 
@@ -754,31 +884,38 @@ Synopsis: `kici run remote [fixture] [options]`
 
 **Options**
 
-| Option                      | Default | Description                                                                                               |
-| --------------------------- | ------- | --------------------------------------------------------------------------------------------------------- |
-| `--workflow <name>`         |         | Run only this workflow, bypassing triggers (with a fixture: send its event to this workflow)              |
-| `--all`                     | `false` | Run all available fixtures                                                                                |
-| `-p, --pick`                | `false` | Interactively pick fixtures to run                                                                        |
-| `--parallel`                | `false` | Run matching fixtures concurrently                                                                        |
-| `--no-wait`                 |         | Fire and forget (print runIds, don't stream)                                                              |
-| `--quiet`                   | `false` | Suppress output except final result                                                                       |
-| `--json`                    | `false` | Output structured JSON result                                                                             |
-| `--junit <path>`            |         | Output JUnit XML result                                                                                   |
-| `--history`                 | `false` | Show recent run history                                                                                   |
-| `--routing-key <key>`       |         | Deprecated; has no effect (the orchestrator chooses the routing key)                                      |
-| `--orchestrator-url <url>`  |         | Run on this orchestrator directly, skipping the Platform (token: KICI_ORCHESTRATOR_TOKEN or kici connect) |
-| `--org <id>`                |         | Target organization (overrides the active org)                                                            |
-| `--orchestrator <name>`     |         | Target orchestrator cluster (overrides the per-org default)                                               |
-| `--debug`                   | `false` | Verbose internals                                                                                         |
-| `--kici-dir <path>`         | `.kici` | Path to .kici directory                                                                                   |
-| `--context <ctx.key=value>` |         | Inject a namespaced context secret, uploaded encrypted to the orchestrator (repeatable)                   |
-| `--env <KEY=VALUE>`         |         | Provide a per-run secret (repeatable); uploaded encrypted to the orchestrator                             |
-| `--check`                   | `false` | Run in check mode: report drift, change nothing                                                           |
-| `--fail-on-drift`           | `false` | In check mode, exit non-zero if any step reports drift                                                    |
-| `--target <selector>`       |         | Narrow runsOnAll jobs to hosts matching this label selector (repeatable, AND-combined)                    |
-| `--target-allow-empty`      | `false` | A --target that narrows a runsOnAll job to zero hosts skips it instead of failing                         |
-| `--input <KEY=VALUE>`       |         | Typed workflow-dispatch input (repeatable)                                                                |
-| `--yes, --approve-all`      | `false` | Auto-approve every approval gate this run holds on (run-scoped; eligibility still enforced)               |
+| Option                      | Default | Description                                                                                                                   |
+| --------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `--workflow <name>`         |         | Run only this workflow, bypassing triggers (with a fixture: send its event to this workflow)                                  |
+| `--all`                     | `false` | Run all available fixtures                                                                                                    |
+| `-p, --pick`                | `false` | Interactively pick fixtures to run                                                                                            |
+| `--parallel`                | `false` | Run matching fixtures concurrently                                                                                            |
+| `--no-wait`                 |         | Fire and forget (print runIds, don't stream)                                                                                  |
+| `--quiet`                   | `false` | Suppress output except final result                                                                                           |
+| `--json`                    | `false` | Output structured JSON result                                                                                                 |
+| `--junit <path>`            |         | Output JUnit XML result                                                                                                       |
+| `--history`                 | `false` | Show recent run history                                                                                                       |
+| `--routing-key <key>`       |         | Deprecated; has no effect (the orchestrator chooses the routing key)                                                          |
+| `--orchestrator-url <url>`  |         | Run on this orchestrator directly, skipping the Platform (token: KICI_ORCHESTRATOR_TOKEN or kici connect)                     |
+| `--org <id>`                |         | Target organization (overrides the active org)                                                                                |
+| `--orchestrator <name>`     |         | Target orchestrator cluster (overrides the per-org default)                                                                   |
+| `--debug`                   | `false` | Verbose internals                                                                                                             |
+| `--kici-dir <path>`         | `.kici` | Path to .kici directory                                                                                                       |
+| `--context <ctx.key=value>` |         | Inject a namespaced context secret, uploaded encrypted to the orchestrator (repeatable)                                       |
+| `--env <KEY=VALUE>`         |         | Provide a per-run secret (repeatable); uploaded encrypted to the orchestrator                                                 |
+| `--check`                   | `false` | Run in check mode: report drift, change nothing                                                                               |
+| `--fail-on-drift`           | `false` | In check mode, exit non-zero if any step reports drift                                                                        |
+| `--target <selector>`       |         | Narrow runsOnAll jobs to hosts matching this label selector (repeatable, AND-combined)                                        |
+| `--target-allow-empty`      | `false` | A --target that narrows a runsOnAll job to zero hosts skips it instead of failing                                             |
+| `--input <KEY=VALUE>`       |         | Typed workflow-dispatch input (repeatable)                                                                                    |
+| `--git-depth <n>`           |         | Commits of history the remote workspace gets (0 = full history, every branch and tag); default: what the jobs ask for, else 1 |
+| `--git-tags`                |         | Ship every tag in the remote workspace                                                                                        |
+| `--no-git-tags`             |         | Ship no tags in the remote workspace                                                                                          |
+| `--no-commit`               |         | Leave uncommitted changes uncommitted in the remote workspace instead of a synthetic commit                                   |
+| `--commit-message <msg>`    |         | Message of the synthetic commit (default: "kici: working-tree snapshot")                                                      |
+| `--commit-author <author>`  |         | Author of the synthetic commit, as "Name <email>" (default: your git user)                                                    |
+| `--tag <name>`              |         | Create an annotated tag at the remote workspace commit (repeatable)                                                           |
+| `--yes, --approve-all`      | `false` | Auto-approve every approval gate this run holds on (run-scoped; eligibility still enforced)                                   |
 
 ### `kici runs`
 

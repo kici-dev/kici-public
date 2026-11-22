@@ -62,7 +62,7 @@ If the network-copyleft constraint doesn't work for your business model, email
 
 A longer "what you can and can't do" write-up for workflow authors,
 self-hosters, and would-be resellers lives at
-[`docs/developer/licensing.md`](docs/developer/licensing.md).
+[`docs/operator/licensing.md`](docs/operator/licensing.md).
 
 ## Third-party licenses
 

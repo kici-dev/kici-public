@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { buildLocalTriggerRequest, triggerRuns, type RunDiscoveryClient } from './plane-trigger.js';
+import { AdminApiHttpError, AdminApiUnreachableError } from '@kici-dev/orchestrator';
 
 /** The first run's id, for the single-workflow cases. */
 async function triggerRun(...args: Parameters<typeof triggerRuns>): Promise<string | undefined> {
@@ -257,6 +258,66 @@ describe('triggerRun', () => {
     // breaks-if-wrong: a single-workflow delivery never waits out the settle window
     expect(runs.map((r) => r.runId)).toEqual(['run-a']);
     expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
+  // fails-when: one failed runs-list read aborts the trigger, leaving the created run unfollowed
+  it('retries a 500 from the runs list and still returns the run', async () => {
+    let listed = 0;
+    const get = vi.fn(async (path: string) => {
+      const isRunsList = !path.startsWith('/api/v1/admin/event-log');
+      if (isRunsList && ++listed === 1) throw new AdminApiHttpError(500, 'Internal server error');
+      return isRunsList
+        ? { runs: [{ runId: 'run-r' }] }
+        : { deliveries: [{ status: 'processed', matchedCount: 1 }] };
+    });
+    const runs = await triggerRuns('http://127.0.0.1:4319', 'tok', input, {
+      client: { get: get as RunDiscoveryClient['get'] },
+      pollIntervalMs: 1,
+      timeoutMs: 5_000,
+      readRetry: { budgetMs: 5_000, baseDelayMs: 1 },
+    });
+    expect(runs.map((r) => r.runId)).toEqual(['run-r']);
+    expect(listed).toBe(2);
+  });
+
+  // fails-when: a runs-list read the plane never answers hangs the trigger
+  it('retries a runs-list read that passes its deadline', async () => {
+    let listed = 0;
+    const get = vi.fn(async (path: string, opts?: { signal?: AbortSignal }) => {
+      if (path.startsWith('/api/v1/admin/event-log')) {
+        return { deliveries: [{ status: 'processed', matchedCount: 1 }] };
+      }
+      if (++listed > 1) return { runs: [{ runId: 'run-s' }] };
+      return new Promise((_resolve, reject) =>
+        opts?.signal?.addEventListener('abort', () =>
+          reject(new AdminApiUnreachableError('no answer', { cause: opts.signal?.reason })),
+        ),
+      );
+    });
+    const runs = await triggerRuns('http://127.0.0.1:4319', 'tok', input, {
+      client: { get: get as RunDiscoveryClient['get'] },
+      pollIntervalMs: 1,
+      timeoutMs: 5_000,
+      readTimeoutMs: 50,
+      readRetry: { budgetMs: 5_000, baseDelayMs: 1 },
+    });
+    expect(runs.map((r) => r.runId)).toEqual(['run-s']);
+    expect(listed).toBe(2);
+  });
+
+  // fails-when: a runs list that keeps failing is retried forever, or the error drops the delivery id
+  it('fails naming the delivery once the runs list keeps failing', async () => {
+    const get = vi.fn(async () => {
+      throw new AdminApiHttpError(503, 'Service unavailable');
+    });
+    await expect(
+      triggerRuns('http://127.0.0.1:4319', 'tok', input, {
+        client: { get: get as RunDiscoveryClient['get'] },
+        pollIntervalMs: 1,
+        timeoutMs: 5_000,
+        readRetry: { budgetMs: 30, baseDelayMs: 5 },
+      }),
+    ).rejects.toThrow(/delivery rk:del-1: .*HTTP 503: Service unavailable/);
   });
 });
 

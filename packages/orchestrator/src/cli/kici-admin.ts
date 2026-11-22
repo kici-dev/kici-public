@@ -16,6 +16,7 @@ import { realpathSync } from 'node:fs';
 import { Command, Option, type ParseOptionsResult } from 'commander';
 import { makeCliStdioBlocking } from '@kici-dev/shared';
 import { AdminApiClient, DEFAULT_ADMIN_URL } from './api-client.js';
+import { setAdminUrlOnCommandLine } from './commands/shared/cli-action.js';
 import { registerSecretCommands } from './commands/secret.js';
 import { registerRotateCommand } from './commands/rotate.js';
 import { registerAuditCommands } from './commands/audit.js';
@@ -114,6 +115,12 @@ export function buildProgram(): Command {
         .default(DEFAULT_ADMIN_URL),
     )
     .addOption(new Option('-t, --token <token>', 'Admin API token').env('KICI_ADMIN_TOKEN'));
+
+  // A dual-mode command (admin API or direct DB) reads this: an explicit --url
+  // selects the admin API even when KICI_DATABASE_URL is set.
+  program.hook('preAction', () => {
+    setAdminUrlOnCommandLine(program.getOptionValueSource('url') === 'cli');
+  });
 
   /** Lazy, so --help works without --token. */
   function getClient(): AdminApiClient {

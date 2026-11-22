@@ -49,6 +49,8 @@
  *   mise init preset; an older agent ignores it and installs mise unpinned).
  * Schema version 44 (additive): adds the apt init preset ({ apt: LockAptInitConfig }) to
  *   LockJob.init; an agent without the preset fails the job and never skips the item.
+ * Schema version 45 (additive): adds LockJob.checkoutOptions (clone depth and tags); an older
+ *   agent ignores it and clones at depth 1.
  */
 
 import { z } from 'zod';
@@ -58,13 +60,14 @@ import type { InputsDescriptorMap } from '../inputs/descriptor.js';
 import { LabelMatcher } from '../labels-match.js';
 import { ExecutionJobStatus, TERMINAL_JOB_STATES } from '../protocol/messages/execution-status.js';
 import { isFailureStatus } from '../status/presentation.js';
+import type { LockCheckoutOptions } from './checkout.js';
 
 /**
  * Schema version the compiler emits into every lock file. Incremented on ANY
  * schema change (additive or breaking); the bump history above records which.
  * See `BREAKING_FLOOR` for the compatibility window.
  */
-export const SCHEMA_VERSION = 44 as const;
+export const SCHEMA_VERSION = 45 as const;
 
 /**
  * Oldest lock schema version this codebase reads correctly — the lower bound of
@@ -963,6 +966,11 @@ export interface LockJob {
   readonly description?: string;
   /** When false, agent skips git clone (default: true). */
   readonly checkout?: boolean;
+  /**
+   * Clone depth and tag policy (SDK checkout object form). Absent ⇒ depth 1 and git's default tags.
+   * An agent that predates it ignores it.
+   */
+  readonly checkoutOptions?: LockCheckoutOptions;
   /** Declarative cache specs (normalized to an array). Restored before steps / saved after the job. */
   readonly cache?: readonly LockCacheSpec[];
   /**

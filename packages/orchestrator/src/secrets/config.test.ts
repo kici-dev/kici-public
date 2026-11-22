@@ -74,4 +74,16 @@ describe('resolveMasterKeys', () => {
     const keys = resolveMasterKeys({ secretKey: CURRENT, secretKeyFile: file })!;
     expect(keys.material).toBe(CURRENT);
   });
+
+  // fails-when: the resolver re-reads KICI_SECRET_KEY from the process environment, so a
+  //   kici-admin command that reads the service env file encrypts under the shell's key
+  it('reads the values it is given, never the process environment', () => {
+    process.env.KICI_SECRET_KEY = CURRENT;
+    process.env.KICI_SECRET_KEY_OLD = CURRENT;
+    const file = join(dir, 'master.key');
+    writeFileSync(file, OLD);
+    expect(resolveMasterKeys({ secretKeyFile: file })!.material).toBe(OLD);
+    expect(resolveMasterKeys({ secretKey: OLD })!.materialOld).toBeUndefined();
+    expect(resolveMasterKeys({ secretKey: CURRENT, secretKeyOld: OLD })!.materialOld).toBe(OLD);
+  });
 });

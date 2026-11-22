@@ -7,6 +7,7 @@
 import type { JobReroute, ProviderGitAuth } from '@kici-dev/engine';
 import { cloneTokenGitAuth } from '../git/clone-token-auth.js';
 import { crossHostAuthRefusal } from '../git/dispatch-git-auth.js';
+import { jobConfigForAgent } from '../pipeline/checkout-job-config.js';
 
 /**
  * Job-config keys the worker strips before the config reaches the agent: secret
@@ -74,10 +75,11 @@ export interface WorkerQueuedJob {
   jobConfig: Record<string, unknown>;
 }
 
-/** The `job.dispatch` message the worker sends its agent for a rerouted job. */
+/** The `job.dispatch` message the worker sends `agent` for a rerouted job. */
 export function buildWorkerDispatchMessage(
   job: WorkerQueuedJob,
   ids: { messageId: string; timestamp: number; concurrencyWaitTimeoutMs: number },
+  agent: { agentId: string; version: string | null },
 ): Record<string, unknown> {
   const cfg = job.jobConfig;
   const dispatchSecrets = cfg.secrets as Record<string, string> | undefined;
@@ -88,8 +90,10 @@ export function buildWorkerDispatchMessage(
   const dispatchInstallEnvSecrets = cfg.installEnvSecrets as Record<string, string> | undefined;
   const dispatchContainerRegistryAuth = cfg.containerRegistryAuth as
     { username: string; password: string; serveraddress: string } | undefined;
-  const cleanJobConfig = Object.fromEntries(
-    Object.entries(cfg).filter(([k]) => !WORKER_PRIVATE_KEYS.has(k)),
+  const cleanJobConfig = jobConfigForAgent(
+    Object.fromEntries(Object.entries(cfg).filter(([k]) => !WORKER_PRIVATE_KEYS.has(k))),
+    agent,
+    job.id,
   );
 
   return {

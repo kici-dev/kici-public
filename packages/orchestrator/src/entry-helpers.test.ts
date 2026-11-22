@@ -5,10 +5,11 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   canServeGenericProviderType,
-  extractRepoIdentifier,
+  dispatchLockFileUrl,
   diffProviderSources,
   isProductionEntry,
 } from './entry-helpers.js';
+import { GitHubRepoUrlBuilder } from './providers/github/repo-url.js';
 
 describe('isProductionEntry', () => {
   const url = (p: string) => pathToFileURL(p).href;
@@ -77,17 +78,41 @@ describe('isProductionEntry', () => {
   });
 });
 
-describe('extractRepoIdentifier', () => {
-  it('extracts owner/repo from GitHub URL', () => {
-    expect(extractRepoIdentifier('https://github.com/myorg/myrepo.git')).toBe('myorg/myrepo');
+describe('dispatchLockFileUrl', () => {
+  it('lockFileUrl for a GHES clone URL names the repository', () => {
+    const builder = new GitHubRepoUrlBuilder('https://ghe.corp.example');
+    // fails-when: a clone URL on a host other than github/gitlab/bitbucket reads unknown/unknown
+    expect(dispatchLockFileUrl(builder, 'https://ghe.corp.example/acme/app.git', 'abc')).toBe(
+      'https://ghe.corp.example/acme/app/raw/abc/.kici/kici.lock.json',
+    );
   });
 
-  it('extracts owner/repo from GitLab URL', () => {
-    expect(extractRepoIdentifier('https://gitlab.com/ns/project.git')).toBe('ns/project');
+  it('keeps the github.com lock-file URL', () => {
+    // breaks-if-wrong: github.com dispatches keep today's lockFileUrl
+    expect(
+      dispatchLockFileUrl(
+        new GitHubRepoUrlBuilder(),
+        'https://github.com/myorg/my.repo.git',
+        'abc',
+      ),
+    ).toBe('https://github.com/myorg/my.repo/raw/abc/.kici/kici.lock.json');
   });
 
-  it('returns unknown for unrecognized URLs', () => {
-    expect(extractRepoIdentifier('https://example.com/repo')).toBe('unknown/unknown');
+  it('falls back to the clone URL when the source builds no URLs', () => {
+    expect(dispatchLockFileUrl(undefined, 'https://git.example/acme/app.git', 'abc')).toBe(
+      'https://git.example/acme/app/raw/abc/.kici/kici.lock.json',
+    );
+  });
+
+  it('keeps a .git inside the host name in the fallback URL', () => {
+    // fails-when: the fallback strips the first `.git` anywhere instead of the trailing one
+    expect(dispatchLockFileUrl(undefined, 'https://git.example.gitea.io/acme/app.git', 'abc')).toBe(
+      'https://git.example.gitea.io/acme/app/raw/abc/.kici/kici.lock.json',
+    );
+    // breaks-if-wrong: a clone URL without a `.git` suffix keeps its path
+    expect(dispatchLockFileUrl(undefined, 'https://git.example.gitea.io/acme/app', 'abc')).toBe(
+      'https://git.example.gitea.io/acme/app/raw/abc/.kici/kici.lock.json',
+    );
   });
 });
 

@@ -76,7 +76,7 @@ function job(options: JobOptions): Job;
 | `options.maxParallel`          | `number`                                                                         | no                    | Fan-out concurrency width -- the maximum number of fan-out children (matrix combinations or `runsOnAll` hosts) running at once. A sliding window; `1` is strictly serial. Must be `>= 1`.                                                                                         |
 | `options.failFast`             | `boolean`                                                                        | no (default: `false`) | Halt the fan-out on the first child failure: stop releasing new children and skip the ones still held. Applies to both matrix and `runsOnAll` fan-out.                                                                                                                            |
 | `options.invoke`               | `InvokeConfig`                                                                   | no                    | Run the source repo's opt-in workflows and gate on them, built with `invokeSource()`. An invoke job needs no `runsOn` and is mutually exclusive with `steps` / `run`. See [Invoking a source repo's own workflows](../global-workflows.md#invoking-a-source-repos-own-workflows). |
-| `options.checkout`             | `boolean`                                                                        | no (default: `true`)  | When `false`, agent skips git clone. Useful for deploy/notify jobs.                                                                                                                                                                                                               |
+| `options.checkout`             | `boolean \| CheckoutOptions`                                                     | no (default: `true`)  | The job's git clone. `true` clones at depth 1 with git's default tags. `false` skips the clone (deploy/notify jobs). `{ fetchDepth?, fetchTags? }` sets the depth and the tags. See [Checkout depth and tags](#checkout-depth-and-tags).                                          |
 | `options.gitCredentials`       | `GitCredentialMap`                                                               | no                    | Named git credentials every step of the job can use. Values name secrets, never secret material. See [Git credentials](../patterns/git-credentials.md).                                                                                                                           |
 | `options.container`            | `string \| ContainerConfig`                                                      | no                    | Docker image for job execution. String form is the image name; object form builds from a `dockerfile` instead and adds `env` and registry `auth`. All steps run inside the container. See [Container jobs](../container-jobs.md).                                                 |
 | `options.sandbox`              | `{ capabilities?: string[]; network?: 'default' \| 'none' \| 'host' }`           | no                    | Per-job container sandbox escape hatch (container jobs only). Request extra Linux capabilities / host networking; granted only within your operator's allow-list, else the run fails at dispatch. See below.                                                                      |
@@ -114,6 +114,58 @@ const build = job({
 });
 ```
 
+#### Checkout depth and tags
+
+Before the steps run, the agent clones the repository at the commit the run is for. By default, the clone holds that commit only (depth 1) and git's default tags: the tags that point at a fetched commit. `checkout` changes the clone:
+
+| Value                  | Clone                                                        |
+| ---------------------- | ------------------------------------------------------------ |
+| `true` or omitted      | Depth 1, git's default tags                                  |
+| `false`                | No clone. The job gets only the `.kici/` directory           |
+| `{ fetchDepth: n }`    | The last `n` commits, git's default tags                     |
+| `{ fetchDepth: 0 }`    | The full history, every branch and every tag                 |
+| `{ fetchTags: true }`  | Every tag, at the selected depth                             |
+| `{ fetchTags: false }` | No tags. With `fetchDepth: 0`, the full history without tags |
+
+`fetchDepth` must be a non-negative integer, and `fetchTags` must be `true` or `false`. Any other value, or another key, fails `kici compile` with an error that names the job.
+
+```typescript
+// A release job that reads every tag and the full history (git describe, changelogs)
+const release = job('release', {
+  runsOn: 'linux',
+  checkout: { fetchDepth: 0 },
+  run: async ({ $ }) => {
+    await $`git describe --tags`;
+  },
+});
+
+// A job that compares the last 20 commits and needs every tag
+const changes = job('changes', {
+  runsOn: 'linux',
+  checkout: { fetchDepth: 20, fetchTags: true },
+  run: async ({ $ }) => {
+    await $`git log --oneline -20`;
+  },
+});
+
+// A notify job that reads no repository files
+const notify = job('notify', {
+  runsOn: 'linux',
+  checkout: false,
+  run: async ({ $ }) => {
+    await $`echo done`;
+  },
+});
+```
+
+A job with `checkout: false` still loads its workflow from `.kici/`. The agent restores `.kici/` from the orchestrator's cached workflow source. Without a cache, it fetches only `.kici/` from the repository. The workspace holds no other repository files, so remove `checkout: false` from a job whose steps read them.
+
+An agent older than 0.29.0 cannot skip the clone. On such an agent, a `checkout: false` job clones the repository as a job without the option does.
+
+In a [global workflow](../global-workflows.md), `checkout` applies to the source repository clone. The workflow repository clone stays at depth 1.
+
+[`kici run remote`](../cli/runs-and-approvals.md#what-the-remote-workspace-contains) builds the remote workspace's `.git` from the `checkout` options of the jobs that can run. [Generated jobs](./rules-matrix-dynamic.md#dynamicjobfn) take the same option.
+
 #### runsOn forms
 
 A job's `runsOn` selects which agents may run it. Every label listed must be present on the agent (a subset match). It accepts three forms, and each label can be an exact string, a glob, or a regular expression (see [Targeting by pattern](#targeting-by-pattern) below):
@@ -142,7 +194,7 @@ runsOn: { labels: ['kici:os:linux'], exclude: ['kici:host:box-01'] }
 - **Required labels:** The agent must have every label in the `labels` array (or the string/array form).
 - **Excluded labels:** The agent must NOT have any label in the `exclude` array. This includes auto-derived labels like `kici:arch:arm64`, `kici:os:linux`, etc.
 - **Case:** Label matching is **case-insensitive** at every step. `runsOn: 'gpu'` matches an agent that reports `GPU`, and a pool declaring `["Docker"]` serves a `runsOn: ["docker"]` job (see [auto-scaler matching rules](../../operator/orchestrator/auto-scaler/operations.md#matching-rules)). KiCI stores and displays every label in lowercase, so the dashboard, `kici-admin agent list`, and `ctx.kici.inventory[…].labels` report the folded form. Compare against a lowercase value when you read a label back in workflow code: `h.labels.includes('gpu')`, not `h.labels.includes('GPU')`.
-- **Compile-time validation:** The compiler will error if any label appears in both `labels` and `exclude` (overlap detection).
+- **Compile-time validation:** The compiler errors if any label appears in both `labels` and `exclude` (overlap detection).
 - **Operator-declared mandatory labels:** Operators may mark a scaler with `mandatoryLabels` (Kubernetes-taint-style opt-in). When a scaler declares a mandatory label, a job is only allowed to land on it if `runsOn.labels` includes that label. A workflow targeting such a scaler must explicitly list the mandatory label in `runsOn`. See the [auto-scaler mandatory labels](../../operator/orchestrator/auto-scaler/common-config.md#mandatory--exclude-labels) for details.
 
 ```typescript
@@ -230,7 +282,7 @@ const fanout = job('deploy', {
 });
 ```
 
-**Edge case — custom labels that contain glob metacharacters.** Because the matching mode is inferred from the value, a custom label that literally contains `*`, `?`, `[]`, or `{}` is always treated as a glob and can no longer be matched exactly. Avoid glob metacharacters in label names you intend to target by exact string.
+**Edge case — custom labels that contain glob metacharacters.** The matching mode is inferred from the value. A custom label that literally contains `*`, `?`, `[]`, or `{}` is therefore always treated as a glob and can no longer be matched exactly. Avoid glob metacharacters in label names you intend to target by exact string.
 
 **ReDoS protection.** Glob patterns are linear by construction. A regular expression you supply is validated for catastrophic-backtracking (ReDoS) when you run `kici compile` — a pattern that could hang on a crafted input is rejected with an error, so it never reaches the orchestrator. The orchestrator re-validates every pattern when it loads the lock file.
 
@@ -432,7 +484,7 @@ export const build = workflow('build', {
 
 The agent reads both files after the command succeeds, applies the delta, and the resulting environment is visible to all steps that follow (and to any later init command).
 
-**Failure before steps.** If the init command exits non-zero or exceeds its `timeout`, the job **fails before any step runs** -- the init surfaces as a failed `init:<n>` pseudo-step in the run timeline (alongside the step list), its logs are attached, and the step loop never executes. This makes a broken toolchain a clear, early failure rather than a confusing mid-run error.
+**Failure before steps.** If the init command exits non-zero or exceeds its `timeout`, the job **fails before any step runs**. The init surfaces as a failed `init:<n>` pseudo-step in the run timeline (alongside the step list), its logs are attached, and the step loop never executes. This makes a broken toolchain a clear, early failure rather than a confusing mid-run error.
 
 The job's error message names the failed init and its exit code, then the last lines the command wrote to standard error: `init[<n>] failed (exit <code>): <lines>`. It keeps up to 20 lines and 1,500 characters. A progress bar that redraws one line shows only its final state, and color codes are removed. When the command wrote nothing to standard error, the lines come from standard output. The init step's log keeps the full output.
 

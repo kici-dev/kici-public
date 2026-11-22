@@ -20,7 +20,7 @@ The default `kici login` flow:
 kici login
 ```
 
-The CLI auto-detects headless environments (SSH sessions, CI runners, containers) and switches to device flow automatically. On WSL, `kici login` opens your Windows browser when Windows interop is reachable; if it is not (interop disabled, or the Windows drive not mounted), the CLI falls back to the device flow rather than waiting for a browser that cannot open.
+The CLI auto-detects headless environments (SSH sessions, CI runners, containers) and switches to device flow automatically. On WSL, `kici login` opens your Windows browser when Windows interop is reachable. If interop is not reachable (it is disabled, or the Windows drive is not mounted), the CLI falls back to the device flow rather than waiting for a browser that cannot open.
 
 ### Device flow (headless)
 
@@ -113,7 +113,7 @@ Personal access tokens (PATs) are created automatically when you log in via OAut
 ### How PATs work
 
 - **User-scoped**: PATs work across all organizations you belong to
-- **120-day default expiry**: Configurable when creating from the dashboard
+- **120-day default expiry**: Configurable when creating from the dashboard or with `kici pat create --expires-in-days <n>` (1 to 365 days)
 - **Named per machine**: Each login creates a PAT named after the machine hostname
 - **Permission inheritance**: PATs inherit your effective role permissions in each org
 
@@ -147,22 +147,22 @@ The Platform exposes a versioned REST API under `/api/v1/*`. The same endpoints 
 
 ### Base URL
 
-The hosted KiCI Platform serves the API at `https://api.kici.dev/api/v1/`. The dashboard at `app.kici.dev` calls this host too. If you log in against another KiCI environment (`--platform-endpoint` or `KICI_PLATFORM_URL`), use that endpoint as the base instead.
+The hosted KiCI Platform serves the API at `https://api.kici.dev/api/v1/`. The dashboard at `app.kici.dev` calls this host too. If you log in against another KiCI environment (`--platform-endpoint` or `KICI_PLATFORM_URL`), use that endpoint as the base instead. For that login, `kici login` reads the identity provider the endpoint publishes at `/api/v1/cli/login-config`, unless you pass `--oidc-issuer`.
 
-`/api/v1/*` requires authentication (see below). `/health`, `/metrics`, and `/ws` (WebSocket) sit outside that prefix and have their own access posture (`/metrics` is meant for Prometheus scrape, not public exposure).
+`/api/v1/*` requires authentication (see below), except two public reads: `/api/v1/billing/plans` and `/api/v1/cli/login-config`. `/health`, `/metrics`, and `/ws` (WebSocket) sit outside that prefix and have their own access posture (`/metrics` is meant for Prometheus scrape, not public exposure).
 
 ### Authentication
 
 Every request to `/api/v1/*` carries an `Authorization: Bearer <token>` header. The Platform routes on the prefix:
 
-| Prefix      | Token type                    | Created via                             | Scope            |
-| ----------- | ----------------------------- | --------------------------------------- | ---------------- |
-| `kici_pat_` | Personal access token         | `kici login` or dashboard               | User (cross-org) |
-| `kici_sk_`  | User API key                  | Dashboard → Settings → API keys         | Org              |
-| `kici_sa_`  | Service account key           | Dashboard → Settings → Service accounts | Org              |
-| (other)     | OIDC JWT or opaque OIDC token | OIDC login (browser SPA)                | User (cross-org) |
+| Prefix      | Token type            | Created via                             | Scope            |
+| ----------- | --------------------- | --------------------------------------- | ---------------- |
+| `kici_pat_` | Personal access token | `kici login` or dashboard               | User (cross-org) |
+| `kici_sk_`  | User API key          | Dashboard → Settings → API keys         | Org              |
+| `kici_sa_`  | Service account key   | Dashboard → Settings → Service accounts | Org              |
+| (other)     | OIDC JWT              | OIDC login (browser SPA)                | User (cross-org) |
 
-JWT and opaque OIDC tokens are validated against the configured OIDC issuer (JWKS for JWTs, the issuer's UserInfo endpoint for opaque ones). All `kici_*` tokens are validated by SHA-256 hash lookup against the Platform DB. See [RBAC: authentication methods](../architecture/security/rbac.md#authentication-methods) for the full model.
+The Platform validates an OIDC JWT against the keys its issuer publishes (JWKS), and refuses any other token with 401. All `kici_*` tokens are validated by SHA-256 hash lookup against the Platform DB. See [RBAC: authentication methods](../architecture/security/rbac.md#authentication) for the full model.
 
 > **Note:** `kici_ok_` keys are **not** for the HTTP API — they authenticate orchestrator-to-Platform WebSocket connections only. Use `kici_sk_` (or `kici_pat_`) for HTTP calls.
 
@@ -174,13 +174,13 @@ Tokens authenticate; RBAC authorizes. Every org-scoped route first verifies that
 
 The dashboard is a browser SPA on top of the same `/api/v1/*` surface, so nearly everything you can configure in the dashboard you can configure over HTTP. The exception is a short list of routes that only a **browser session** may call, marked † below. The mounted route groups include:
 
-- **Auth & identity:** `/cli/exchange-token`†, `/pats`, `/user`, `/identity-links`, `/identity-links/:id` (DELETE)†, `/github-oauth`, `/auth/github/link`†, `/invites`, `/invites/pending`, `/invites/:inviteId/{accept,decline}`†
+- **Auth & identity:** `/cli/exchange-token`†, `/pats`, `/user`, `/identity-links`, `/identity-links/:id` (DELETE)†, `/github-oauth`, `/auth/github/link`†, `/invites`, `/invites/pending`, `/invites/token-preview`†, `/invites/:inviteId/{accept,decline}`†
 - **Org & membership:** `/orgs` (POST)†, `/orgs/:customerId`, `/orgs/:customerId/{members,roles,api-keys,orchestrator-keys,service-accounts,billing,trust-policies}`
 - **Workflows & runs:** `/orgs/:customerId/{runs,registrations,workflows,held-runs,contexts,secrets,global-workflows}`
 - **Webhooks & event log:** `/orgs/:customerId/{sources,webhook-endpoints,event-log}`
 - **Diagnostics & activity:** `/orgs/:customerId/{diagnostics,activity,access-log}`
 
-**† Browser session only.** These routes answer **403** with `This endpoint requires an interactive login` to a `kici_pat_`, `kici_sk_` or `kici_sa_` token. They are the routes that create an organization, join or decline one, unlink a provider identity, start a GitHub account link, and exchange your session for a personal access token. Each mints a credential wider than the credential presenting it, or changes which organizations and provider identities your account reaches. A `kici_sk_` or `kici_sa_` token is bound to one organization and one permission set, so letting it take those actions would hand it access it was never granted. Do them in the dashboard, or with `kici login`, which runs the browser flow for you.
+**† Browser session only.** These routes answer **403** with `This endpoint requires an interactive login` to a `kici_pat_`, `kici_sk_` or `kici_sa_` token. They are the routes that create an organization, look up or answer an invite sent to your email, and unlink a provider identity. They also start a GitHub account link and exchange your session for a personal access token. Each mints a credential wider than the credential presenting it, acts on an invite bound to your email address, or changes which organizations and provider identities your account reaches. A `kici_sk_` or `kici_sa_` token is bound to one organization and one permission set, so letting it take those actions would hand it access it was never granted. Do them in the dashboard, or with `kici login`, which runs the browser flow for you.
 
 `POST /pats` is the one route in between: it accepts a browser session **or** an existing `kici_pat_` (so `kici pat create` keeps working), and refuses `kici_sk_` and `kici_sa_`. A token minted from another token can never be wider than that token. The new token is capped by your own permissions **and** by the scopes of the token you called with, whether or not you pass `permissions` explicitly. Mint from an unscoped session when you need a broader token.
 

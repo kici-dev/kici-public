@@ -105,6 +105,50 @@ function validateSandbox(sandbox: JobOptions['sandbox'], jobName: string): void 
   }
 }
 
+/** The keys `checkout: { … }` accepts. */
+const CHECKOUT_OPTION_KEYS: ReadonlySet<string> = new Set(['fetchDepth', 'fetchTags']);
+
+/** A rejected value as the error message shows it (`NaN` and `Infinity` stay readable). */
+function describeValue(value: unknown): string {
+  return typeof value === 'number' ? String(value) : JSON.stringify(value);
+}
+
+/**
+ * Reject a `checkout` that is not `true`, `false` or `{ fetchDepth?, fetchTags? }`
+ * with a valid depth and tag flag, so a bad value never reaches the lock.
+ */
+function validateCheckout(checkout: unknown, jobName: string): void {
+  if (checkout === undefined || typeof checkout === 'boolean') return;
+  if (typeof checkout !== 'object' || checkout === null || Array.isArray(checkout)) {
+    throw new Error(
+      `job('${jobName}'): checkout must be true, false or { fetchDepth?, fetchTags? }, ` +
+        `got ${describeValue(checkout)}`,
+    );
+  }
+  for (const key of Object.keys(checkout)) {
+    if (!CHECKOUT_OPTION_KEYS.has(key)) {
+      throw new Error(
+        `job('${jobName}'): checkout has unknown option '${key}'; expected fetchDepth or fetchTags`,
+      );
+    }
+  }
+  const { fetchDepth, fetchTags } = checkout as { fetchDepth?: unknown; fetchTags?: unknown };
+  if (
+    fetchDepth !== undefined &&
+    (typeof fetchDepth !== 'number' || !Number.isInteger(fetchDepth) || fetchDepth < 0)
+  ) {
+    throw new Error(
+      `job('${jobName}'): checkout.fetchDepth must be a non-negative integer (0 = full history), ` +
+        `got ${describeValue(fetchDepth)}`,
+    );
+  }
+  if (fetchTags !== undefined && typeof fetchTags !== 'boolean') {
+    throw new Error(
+      `job('${jobName}'): checkout.fetchTags must be true or false, got ${describeValue(fetchTags)}`,
+    );
+  }
+}
+
 /**
  * Create a job with an explicit name; run shorthand with typed `ctx.needs`.
  *
@@ -236,6 +280,7 @@ export function job(nameOrOptions: string | JobOptions, maybeOptions?: JobOption
 
   validateInit(options.init, name);
   validateSandbox(options.sandbox, name);
+  validateCheckout(options.checkout, name);
 
   // With no explicit group, the concurrency group defaults to the first bound
   // context's name; a dynamic (function) first context resolves at dispatch.

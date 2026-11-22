@@ -2,13 +2,50 @@
 
 import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
-import { setContextSecretDirect } from '@kici-dev/shared';
-import { assertValidSecretKey } from '@kici-dev/engine';
 import { resolveSecretInput, fingerprintValue } from './shared/secret-input.js';
 import { warnIfContextUnbound } from './shared/unbound-context-warning.js';
 import { confirmPrompt } from './shared/confirm.js';
 import { cliAction, resolveDirectDbUrl } from './shared/cli-action.js';
 import { ORG_ID_HELP, ORG_LIST_HINT } from './shared/org-id.js';
+import {
+  resolveDirectSecretSettings,
+  secretEnvFromEnvFile,
+  setSecretDirect,
+  verifySecretsDirect,
+  type DirectSecretSettings,
+} from './shared/secret-direct.js';
+import type { SecretLocation } from '../../secrets/pg-secret-store.js';
+
+/** Help text of `--env-file` on the direct-database secret commands. */
+const SECRET_ENV_FILE_HELP =
+  'Direct-DB mode: read KICI_SECRET_KEY* and KICI_PG_CUSTOMER_SECRETS from this orchestrator ' +
+  'env file instead of the shell';
+
+/**
+ * Refuse `--env-file` outside direct-database mode: the admin API reads no env file, so the
+ * option would be ignored.
+ */
+function assertEnvFileNeedsDirectMode(envFile: string | undefined, dbUrl: string | null) {
+  // fails-when: --env-file is silently ignored, so the operator believes its key was used
+  if (envFile !== undefined && !dbUrl) {
+    throw new Error(
+      '--env-file is read only in direct-database mode: pass --database-url or set ' +
+        "KICI_DATABASE_URL. The admin API uses the orchestrator's own key.",
+    );
+  }
+}
+
+/** The warning a direct write prints when no stored secret confirmed the master key. */
+export const UNCONFIRMED_KEY_WARNING =
+  'Warning: no secret stored in this database confirms the master key (none is encrypted yet). ' +
+  'Once the orchestrator runs, check the write with "kici-admin secret verify" against its ' +
+  'admin API (--url and --token, without --database-url): it lists every secret its key ' +
+  'cannot decrypt.';
+
+/** The direct-mode settings: from `--env-file` when given, else from the shell. */
+function directSettings(envFile: string | undefined): DirectSecretSettings {
+  return resolveDirectSecretSettings(envFile ? secretEnvFromEnvFile(envFile) : process.env);
+}
 
 export function registerSecretCommands(program: Command, getClient: () => AdminApiClient): void {
   const sec = program.command('secret').description('Manage scoped secrets');
@@ -84,8 +121,10 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
     .option('--dry-run', 'Parse + validate the value, print fingerprint + length, do not write')
     .option(
       '--database-url <url>',
-      'Direct-DB mode: write encrypted_value verbatim to scoped_secrets (offline; skips HTTP + encryption)',
+      'Direct-DB mode: encrypt under the orchestrator master key (KICI_SECRET_KEY / ' +
+        'KICI_SECRET_KEY_FILE) and write to scoped_secrets (offline; skips HTTP)',
     )
+    .option('--env-file <path>', SECRET_ENV_FILE_HELP)
     .action(
       cliAction(
         async (
@@ -95,6 +134,7 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
           opts: {
             value?: string;
             databaseUrl?: string;
+            envFile?: string;
             org?: string;
             context?: string;
             key?: string;
@@ -148,17 +188,17 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
           }
 
           const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
+          assertEnvFileNeedsDirectMode(opts.envFile, dbUrl);
           if (dbUrl) {
-            // Direct-DB bypasses the route, the dashboard handler and PgSecretStore,
-            // so it guards here against a key that makes the at-rest AAD ambiguous.
-            assertValidSecretKey(key);
-            await setContextSecretDirect(dbUrl, {
-              orgId,
-              context: scope,
-              key,
-              encryptedValue: value,
-            });
+            // Encrypted under the master key by the orchestrator's own store, never stored
+            // as given.
+            const { keyConfirmed } = await setSecretDirect(
+              dbUrl,
+              { orgId, scope, key, value },
+              directSettings(opts.envFile),
+            );
             console.log(`Secret '${key}' set in scope '${scope}' for org ${orgId} (direct).`);
+            if (!keyConfirmed) console.error(UNCONFIRMED_KEY_WARNING);
           } else {
             await getClient().setSecret(orgId, scope, key, value);
             console.log(`Secret '${key}' set in scope '${scope}' for org ${orgId}.`);
@@ -194,6 +234,45 @@ export function registerSecretCommands(program: Command, getClient: () => AdminA
         }
         await getClient().deleteSecret(orgId, scope, key);
         console.log(`Secret '${key}' deleted from scope '${scope}' for org ${orgId}.`);
+      }),
+    );
+
+  sec
+    .command('verify')
+    .description(
+      'List every stored secret the orchestrator master key cannot decrypt (org, scope and key ' +
+        'name, never a value), and exit 1 when there is one. Re-set each listed secret with ' +
+        '"secret set".',
+    )
+    .option(
+      '--database-url <url>',
+      'Direct-DB mode: decrypt with the master key (KICI_SECRET_KEY / KICI_SECRET_KEY_FILE) ' +
+        'instead of asking the admin API',
+    )
+    .option('--env-file <path>', SECRET_ENV_FILE_HELP)
+    .option('--json', 'Emit JSON output')
+    .action(
+      cliAction(async (opts: { databaseUrl?: string; envFile?: string; json?: boolean }) => {
+        const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
+        assertEnvFileNeedsDirectMode(opts.envFile, dbUrl);
+        const undecryptable: SecretLocation[] = dbUrl
+          ? await verifySecretsDirect(dbUrl, directSettings(opts.envFile))
+          : (await getClient().verifySecrets()).undecryptable;
+        if (opts.json) {
+          console.log(JSON.stringify({ undecryptable }));
+        } else if (undecryptable.length === 0) {
+          console.log('Every stored secret decrypts with the orchestrator master key.');
+        } else {
+          console.log(
+            `${undecryptable.length} stored secret(s) do not decrypt with the master key:`,
+          );
+          for (const s of undecryptable) {
+            console.log(`  - org ${s.orgId}  scope ${s.scope}  key ${s.key}`);
+          }
+          console.log('Re-set each one with "kici-admin secret set <orgId> <scope> <key>".');
+        }
+        // fails-when: verify exits 0 while a row the orchestrator cannot read is stored
+        if (undecryptable.length > 0) process.exit(1);
       }),
     );
 

@@ -10,11 +10,11 @@ description: 'Webhook source and remote-run anchor management'
 ```bash
 # GitHub App sources
 # One-click setup: create AND configure a brand-new GitHub App via the App Manifest flow
-kici-admin source add github --name <name> --manifest [--github-org <slug>] [--webhook-url <url>] [--org <orgId>] [--no-browser] [--json]
+kici-admin source add github --name <name> --manifest [--github-org <slug>] [--github-url <url>] [--webhook-url <url>] [--org <orgId>] [--no-browser] [--json]
 # Manual: store credentials for a GitHub App you already created
-kici-admin source add github --name <name> --app-id <id> --private-key <value|@file> [--webhook-secret <secret>] [--from-env <var>] [--stdin] [--org <orgId>]
-# Move a GitHub source and its registrations to another org
-kici-admin source update <routingKey> [--name <name>] [--private-key <value|@file>] [--webhook-secret <secret>] [--from-env <var>] [--stdin] [--org <orgId>]
+kici-admin source add github --name <name> --app-id <id> --private-key <value|@file> [--webhook-secret <secret>] [--from-env <var>] [--stdin] [--github-url <url>] [--org <orgId>]
+# Update a GitHub source: its name, key or server, or move it and its registrations to another org
+kici-admin source update <routingKey> [--name <name>] [--private-key <value|@file>] [--webhook-secret <secret>] [--from-env <var>] [--stdin] [--github-url <url>] [--org <orgId>]
 # Re-sync a GitHub source's display name + slug from GitHub (GitHub is the source of truth);
 # also reports missing events, permissions and installations pending approval
 kici-admin source refresh <routingKey> [--json]
@@ -36,28 +36,32 @@ kici-admin source disable <id>
 # filesystem (see the Local filesystem source guide). verification='none'.
 kici-admin source add local --org <orgId> --path <abs-dir> [--name <name>] [--clone-url-base <url>]
 kici-admin source update-local <id> [--path <abs-dir>] [--name <name>] [--clone-url-base <url>]
-kici-admin source remove <routingKey> --local [--hard] [--yes]
+kici-admin source remove <id> --local [--hard] [--yes]
 kici-admin source trigger-local <id> [--event push|pull_request] [--ref <ref>] [--sha <sha>] [--repo-full-name <name>] [--base-url <url>]
 kici-admin source install-hook <id> [--repo <path>] [--base-url <url>]
 
 # List all sources (without --org, only GitHub sources are shown).
-# GitHub rows end with the source's org (`org:`) and show the direct ingress URL (`ingress:`)
+# GitHub rows end with the source's org (`org:`) and show the GitHub Enterprise Server the App
+# lives on (`server:`, absent for github.com) and the direct ingress URL (`ingress:`)
 kici-admin source list [--org <orgId>] [--include-deleted]
 ```
 
 **One-click manifest setup** (`--manifest`): the recommended path for a brand-new App. The CLI builds a pre-filled GitHub App manifest (permissions, events, webhook URL), opens GitHub for you to click **"Create GitHub App"** once, captures the returned credentials, stores them encrypted on the orchestrator, and walks you through installing the App on your repos. It always creates a **new** App on GitHub. Flags:
 
-| Flag                  | Description                                                                                                                                                                                             |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--manifest`          | Enable one-click setup via GitHub's App Manifest flow (mutually exclusive with `--app-id` / `--private-key`)                                                                                            |
-| `--github-org <slug>` | Create the App under a GitHub organization instead of your personal account                                                                                                                             |
-| `--webhook-url <url>` | Advanced/self-hosted: bake this `https://` URL into the App webhook verbatim instead of the URL the orchestrator resolves for its mode. KiCI adds no ingress at this URL — your own infra owns delivery |
-| `--no-browser`        | Headless mode: print a `kici.dev` URL to open, then read the short-lived setup code you paste back via stdin                                                                                            |
-| `--json`              | Emit raw JSON (the API response) instead of formatted text                                                                                                                                              |
+| Flag                  | Description                                                                                                                                                                                                                |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--manifest`          | Enable one-click setup via GitHub's App Manifest flow (mutually exclusive with `--app-id` / `--private-key`)                                                                                                               |
+| `--github-org <slug>` | Create the App under a GitHub organization instead of your personal account                                                                                                                                                |
+| `--github-url <url>`  | Create the App on the GitHub Enterprise Server at this web URL, such as `https://ghe.example.com`. The CLI exchanges the setup code on that server, stores the server with the source and prints the server's install page |
+| `--webhook-url <url>` | Advanced/self-hosted: bake this `https://` URL into the App webhook verbatim instead of the URL the orchestrator resolves for its mode. KiCI adds no ingress at this URL — your own infra owns delivery                    |
+| `--no-browser`        | Headless mode: print a `kici.dev` URL to open, then read the short-lived setup code you paste back via stdin                                                                                                               |
+| `--json`              | Emit raw JSON (the API response) instead of formatted text                                                                                                                                                                 |
 
 **`source refresh`**: re-reads a GitHub source's display name + slug from GitHub (`GET /app`) and updates the orchestrator + dashboard if they drifted (e.g. after renaming the App in GitHub's UI). For GitHub App sources GitHub is the source of truth for the displayed name — `--name` is only the name requested at creation. Pass a `<routingKey>` for one source or `--all` for every GitHub source; the command prints `old → new` for any changed field and is a no-op when GitHub already matches. The orchestrator also runs this refresh automatically once a day (`KICI_GITHUB_APP_NAME_REFRESH_INTERVAL_MS`, default 24h). Non-GitHub routing keys are rejected. It also compares the App with what KiCI needs: it warns when the App lacks a permission or an event, and lists the installations that have not accepted a new permission yet. `--json` carries the same findings as `missingEvents`, `missingPermissions` and `installationsPendingApproval`.
 
 See the [GitHub provider guide](../../../user/providers/github.md) for the full one-click walkthrough. The manifest flow works in every mode. In **platform** and **hybrid** mode it bakes the hosted Platform's webhook URL into the App. In **observed** and **independent** mode it bakes the orchestrator's own org-scoped URL, `<KICI_WEBHOOK_PUBLIC_URL>/webhook/<orgId>/github`, so set `KICI_WEBHOOK_PUBLIC_URL` first.
+
+**GitHub Enterprise Server** (`--github-url <url>`): a GitHub App on a GitHub Enterprise Server takes the server's `https://` web URL, on the `--manifest` path and on the `--app-id` path. The orchestrator checks the App at `<url>/api/v3` before it stores the source, then sends every call for the App to that server. The routing key stays `github:<appId>`. `source list` prints the server on a `server:` line under the source, and `--json` carries it as `githubUrl`. `source update --github-url <url>` moves the source to another server: the orchestrator checks the App there first and keeps the stored server when the check fails, and `https://github.com` moves it back to github.com. This update needs the admin API: `--database-url` mode refuses it. The URL can have at most 128 characters, and kici-admin refuses `api.github.com`, `www.github.com` and GHE.com hosts before it sends any request. An orchestrator holds one source per numeric App id, whatever server the App lives on. The CA trust, webhook and approval settings are in the [GitHub provider guide](../../../user/providers/github.md#github-enterprise-server).
 
 #### Which org a source belongs to
 
@@ -77,7 +81,7 @@ To move a source to the attached org:
 1. Make sure that the attached org has the contexts, the secrets and the trust policy that the source's workflows use (`kici-admin context list --org <attachedOrg>`).
 2. Run `kici-admin source update <routingKey> --org <attachedOrg>`. The source's workflow registrations move with it. Its next runs use the attached org.
 
-`source update --org` with an org other than the attached one still succeeds, and prints a warning on stderr.
+`source update --org` with an org other than the attached one still succeeds, and prints a warning on stderr. Moving a source to another org takes an unscoped admin token: a token scoped to the source with `--routing-key` is refused with `403`, as it is for `--github-url`.
 
 **Secret input modes** (for private keys and webhook secrets — the manual path):
 
@@ -224,6 +228,7 @@ Synopsis: `kici-admin source add github [options]`
 | `--manifest`                  |         | One-click setup: create and configure a new GitHub App via the App Manifest flow                                                                                                                       |
 | `--no-browser`                |         | Headless manifest setup: print a URL and paste the setup code back                                                                                                                                     |
 | `--github-org <slug>`         |         | Create the App under a GitHub org instead of your personal account                                                                                                                                     |
+| `--github-url <url>`          |         | GitHub web URL of the server the App lives on (default: https://github.com); set it for GitHub Enterprise Server                                                                                       |
 | `--webhook-url <url>`         |         | Advanced/self-hosted: bake this https:// URL into the App webhook verbatim instead of the URL the orchestrator resolves for its mode. KiCI adds no ingress at this URL — your own infra owns delivery. |
 | `--org <orgId>`               |         | Org the source belongs to (default: the org this orchestrator is attached to; kici-admin org list prints the org ids)                                                                                  |
 | `--json`                      |         | Emit raw JSON (the API response) instead of formatted text                                                                                                                                             |
@@ -465,15 +470,16 @@ Synopsis: `kici-admin source update <routingKey> [options]`
 
 **Options**
 
-| Option                        | Default | Description                                                                                                             |
-| ----------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `--name <name>`               |         | New name                                                                                                                |
-| `--private-key <pathOrValue>` |         | New private key (prefix with @ for file)                                                                                |
-| `--webhook-secret <secret>`   |         | New webhook secret                                                                                                      |
-| `--from-env <varName>`        |         | Read new private key from environment variable                                                                          |
-| `--stdin`                     |         | Read new private key from stdin                                                                                         |
-| `--org <orgId>`               |         | Move the source and its workflow registrations to this org (its runs use that org's contexts, secrets and trust policy) |
-| `--database-url <url>`        |         | Use direct DB access instead of HTTP (offline mode)                                                                     |
+| Option                        | Default | Description                                                                                                                                                                    |
+| ----------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--name <name>`               |         | New name                                                                                                                                                                       |
+| `--private-key <pathOrValue>` |         | New private key (prefix with @ for file)                                                                                                                                       |
+| `--webhook-secret <secret>`   |         | New webhook secret                                                                                                                                                             |
+| `--from-env <varName>`        |         | Read new private key from environment variable                                                                                                                                 |
+| `--stdin`                     |         | Read new private key from stdin                                                                                                                                                |
+| `--org <orgId>`               |         | Move the source and its workflow registrations to this org (its runs use that org's contexts, secrets and trust policy)                                                        |
+| `--github-url <url>`          |         | GitHub web URL of the server the App lives on (default: https://github.com); set it for GitHub Enterprise Server; https://github.com resets it (needs an unscoped admin token) |
+| `--database-url <url>`        |         | Use direct DB access instead of HTTP (offline mode)                                                                                                                            |
 
 ### `kici-admin source update-generic`
 

@@ -7,7 +7,11 @@ import { execFileSync, fork, spawn, type ChildProcess } from 'node:child_process
 import { existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { JobDispatch, CheckMode } from '@kici-dev/engine';
-import { ExecutionJobStatus, ExecutionStepStatus } from '@kici-dev/engine';
+import {
+  ExecutionJobStatus,
+  ExecutionStepStatus,
+  parseLockCheckoutOptions,
+} from '@kici-dev/engine';
 import type { JobExecutionOptions, JobExecutionResult } from './types.js';
 import { createSecretMasker, type LogMasker } from './log-masker.js';
 import { createDepRestoreReportRelay, type DepRestoreReportRelay } from '../dep-restore-report.js';
@@ -86,6 +90,16 @@ interface ForkRunnerOptions {
    * dirs the runner's `git clone` reads. Ignored without useBwrap.
    */
   extraReadOnlyBinds?: string[];
+  /**
+   * Host paths bound read-only at a different path inside bwrap (`--ro-bind
+   * <source> <target>`), e.g. the host TLS trust paths. Ignored without useBwrap.
+   */
+  readOnlyMounts?: ReadonlyArray<{ source: string; target: string }>;
+  /**
+   * Variables the child must not receive, removed after sanitizing (which
+   * would otherwise re-add the host's value from the allowlist).
+   */
+  unsetEnv?: readonly string[];
   /** Agent cap on the grace period, ms; effective grace is min(job, this). Default 30_000. */
   maxGracePeriodMs?: number;
   /** Opt-in dedicated user (uid, `uid:gid`, or name); unset runs as the agent's uid. */
@@ -157,6 +171,8 @@ export function buildCloneRequest(
     workflowRef: jobConfig.workflowRef as string | undefined,
     workflowSha: jobConfig.workflowSha as string | undefined,
     checkout: (jobConfig.checkout as boolean | undefined) ?? true,
+    checkoutOptions: parseLockCheckoutOptions(jobConfig.checkoutOptions),
+    sourceCached: Boolean(dispatch.sourceTarUrl),
     fullRepo: (jobConfig.fullRepo as boolean | undefined) ?? false,
   };
 }
@@ -285,6 +301,7 @@ export function buildBwrapArgs(
   networkIsolation: boolean = false,
   runnerPath?: string,
   extraReadOnlyBinds: string[] = [],
+  readOnlyMounts: ReadonlyArray<{ source: string; target: string }> = [],
 ): string[] {
   const args: string[] = [
     '--ro-bind',
@@ -441,6 +458,10 @@ export function buildBwrapArgs(
     boundDirs.add(extra);
   }
 
+  for (const { source, target } of readOnlyMounts) {
+    args.push('--ro-bind', source, target);
+  }
+
   return args;
 }
 
@@ -536,6 +557,7 @@ function spawnRunnerChild(
     useBwrap = false,
     networkIsolation = false,
     extraReadOnlyBinds = [],
+    readOnlyMounts = [],
   } = options;
 
   // Applied under bwrap too: its namespaces do not change the uid, so the child
@@ -552,6 +574,7 @@ function spawnRunnerChild(
       networkIsolation,
       runnerPath,
       extraReadOnlyBinds,
+      readOnlyMounts,
     );
     child = spawn('bwrap', [...bwrapArgs, process.execPath, runnerPath], {
       env: sanitizedEnv,
@@ -1076,6 +1099,7 @@ export function createForkRunner(
   execOptions: JobExecutionOptions,
 ): ForkRunnerHandle {
   const sanitizedEnv = buildSanitizedEnv(options.env);
+  for (const key of options.unsetEnv ?? []) delete sanitizedEnv[key];
   // bwrap's fresh `--tmpfs /tmp` lacks any host TMPDIR subdirectory (e.g.
   // /tmp/<uid> under PrivateTmp), so every mkdtemp(tmpdir()) would fail ENOENT
   // before any step runs. The tmpfs root always exists.

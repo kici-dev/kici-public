@@ -8,7 +8,7 @@ import type { Command } from 'commander';
 import type { AdminApiClient } from '../api-client.js';
 import { purgeSecretBackendsDirect } from '@kici-dev/shared';
 import { confirmPrompt } from './shared/confirm.js';
-import { cliAction, resolveDirectDbUrl } from './shared/cli-action.js';
+import { cliAction, requireDbOnlyUrl } from './shared/cli-action.js';
 
 export function registerBackendCommands(program: Command, getClient: () => AdminApiClient): void {
   const backend = program.command('backend').description('Manage secret backends');
@@ -189,17 +189,11 @@ export function registerBackendCommands(program: Command, getClient: () => Admin
     .description(
       'Delete backends with encrypted config that can no longer be decrypted (direct-DB, pre-orchestrator)',
     )
-    .option('--database-url <url>', 'Orchestrator DB URL (or KICI_DATABASE_URL / DATABASE_URL)')
+    .option('--database-url <url>', 'Orchestrator DB URL (or KICI_DATABASE_URL)')
     .option('--json', 'Emit JSON output')
     .action(
       cliAction(async (opts) => {
-        const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
-        if (!dbUrl) {
-          console.error(
-            'Error: --database-url or KICI_DATABASE_URL / DATABASE_URL is required (direct-DB only)',
-          );
-          process.exit(1);
-        }
+        const dbUrl = requireDbOnlyUrl(opts.databaseUrl);
         const { deleted } = await purgeSecretBackendsDirect(dbUrl);
         if (opts.json) {
           console.log(JSON.stringify({ deleted }));

@@ -7,6 +7,7 @@ import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import path from 'node:path';
 import { moveSourceToOrg } from '../../sources/source-org.js';
+import { displayedSourceConfig } from '../../sources/github-source-config.js';
 import { Option, type Command } from 'commander';
 import { DEFAULT_ADMIN_URL } from '../api-client.js';
 import type { AdminApiClient, GenericSourceResponse } from '../api-client.js';
@@ -24,6 +25,7 @@ import {
 import { renderPostReceiveHook, installPostReceiveHook } from './local-hook.js';
 import { webhookNoteReason, webhookNoteHint } from '../webhook-url-notes.js';
 import { runGithubManifestSetup } from './source-manifest.js';
+import { DEFAULT_GITHUB_URL, parseGithubWebUrl } from '../../providers/github/github-host.js';
 import { confirmPrompt } from './shared/confirm.js';
 import { orgSplitNote } from './shared/org-split.js';
 import type { PlatformAttachment } from '../../db/repos/org-ids-repo.js';
@@ -33,6 +35,21 @@ import {
   DIRECT_DB_URL_FLAG,
   DIRECT_DB_URL_HELP,
 } from './shared/cli-action.js';
+
+/** Help text of `--github-url` on `source add github` and `source update`. */
+const GITHUB_URL_HELP =
+  `GitHub web URL of the server the App lives on (default: ${DEFAULT_GITHUB_URL}); ` +
+  'set it for GitHub Enterprise Server';
+
+/**
+ * Read `source update --github-url`: `null` resets the source to github.com
+ * (`https://github.com`), otherwise the validated origin. A value without a
+ * scheme is refused, as `source add github` refuses it.
+ */
+function parseGithubUrlUpdate(value: string): string | null {
+  const origin = parseGithubWebUrl(value);
+  return origin === DEFAULT_GITHUB_URL ? null : origin;
+}
 
 /** Run `fn` on a one-shot pool, always closing it. GenericSourceManager needs
  *  no secret store, so this is the full offline path for generic + local sources. */
@@ -57,6 +74,8 @@ interface GithubSourceRow {
   provider: string;
   customerId: string;
   config: Record<string, unknown>;
+  /** The GitHub Enterprise Server web URL; absent for github.com. */
+  githubUrl?: string;
   createdAt: string;
   updatedAt: string;
   /** Direct-ingress URL; HTTP route only, since it needs the running orchestrator. */
@@ -75,7 +94,8 @@ async function listGithubSourcesDirect(dbUrl: string): Promise<GithubSourceRow[]
       name: r.name,
       provider: r.provider,
       customerId: r.customer_id,
-      config: typeof r.config === 'string' ? JSON.parse(r.config) : (r.config ?? {}),
+      config: displayedSourceConfig(r.config),
+      ...(r.github_url && { githubUrl: r.github_url }),
       createdAt: String(r.created_at),
       updatedAt: String(r.updated_at),
     }));
@@ -122,6 +142,7 @@ export function renderSourceListText(
     provider: string;
     ingressUrl?: string | null;
     customerId?: string | null;
+    githubUrl?: string;
   }>,
   genericSources: ListableGenericRow[],
   hasOrg: boolean,
@@ -132,6 +153,7 @@ export function renderSourceListText(
     for (const s of githubSources) {
       const org = s.customerId ? `  org: ${s.customerId}` : '';
       console.log(`  ${s.routingKey.padEnd(20)} ${s.name.padEnd(30)} (${s.provider})${org}`);
+      if (s.githubUrl) console.log(`    server: ${s.githubUrl}`);
       if (s.ingressUrl) console.log(`    ingress: ${s.ingressUrl}`);
     }
     if (opts.directDb) {
@@ -287,7 +309,7 @@ interface RefreshResultJson {
 
 /** One delivery in a `source redeliver` response. */
 interface RedeliverEntryJson {
-  deliveryId: number;
+  deliveryId: number | string;
   guid: string;
   deliveredAt: string;
   event: string;
@@ -557,6 +579,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       '--github-org <slug>',
       'Create the App under a GitHub org instead of your personal account',
     )
+    .option('--github-url <url>', GITHUB_URL_HELP)
     .option(
       '--webhook-url <url>',
       'Advanced/self-hosted: bake this https:// URL into the App webhook verbatim instead of the ' +
@@ -570,6 +593,16 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
     )
     .option('--json', 'Emit raw JSON (the API response) instead of formatted text')
     .action(async (opts) => {
+      // Checked before anything is asked of the orchestrator or GitHub.
+      let githubUrl: string | undefined;
+      if (opts.githubUrl !== undefined) {
+        try {
+          githubUrl = parseGithubWebUrl(opts.githubUrl);
+        } catch (err) {
+          console.error(`Error: ${toErrorMessage(err)}`);
+          process.exit(1);
+        }
+      }
       // Manifest setup creates the App; the manual path only stores existing credentials.
       if (opts.manifest) {
         try {
@@ -580,6 +613,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
               githubOrg: opts.githubOrg,
               webhookUrl: opts.webhookUrl,
               ...(opts.org && { customerId: opts.org }),
+              ...(githubUrl && { githubUrl }),
             },
             getClient(),
           );
@@ -625,6 +659,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
           appId: opts.appId,
           privateKey,
           webhookSecret,
+          ...(githubUrl && githubUrl !== DEFAULT_GITHUB_URL && { githubUrl }),
           ...(opts.org && { customerId: opts.org }),
         });
         if (opts.json) {
@@ -908,17 +943,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
         } = await getClient().get<{
           platformAttachment?: PlatformAttachment;
           attachedOrgId?: string | null;
-          sources: Array<{
-            id: string;
-            routingKey: string;
-            name: string;
-            provider: string;
-            customerId: string;
-            config: Record<string, unknown>;
-            createdAt: string;
-            updatedAt: string;
-            ingressUrl?: string | null;
-          }>;
+          sources: GithubSourceRow[];
         }>('/api/v1/admin/sources');
 
         let genericSources: GenericSourceResponse[] = [];
@@ -1000,17 +1025,29 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
       "Move the source and its workflow registrations to this org (its runs use that org's " +
         'contexts, secrets and trust policy)',
     )
+    .option(
+      '--github-url <url>',
+      `${GITHUB_URL_HELP}; ${DEFAULT_GITHUB_URL} resets it (needs an unscoped admin token)`,
+    )
     .option(DIRECT_DB_URL_FLAG, DIRECT_DB_URL_HELP)
     .action(
       cliAction(async (routingKey: string, opts) => {
         const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
         if (dbUrl) {
           // Direct-DB mode reassigns only customer_id: other updates touch the
-          // secret store, which needs a master key. Reject them, never drop them silently.
-          if (opts.privateKey || opts.webhookSecret || opts.stdin || opts.fromEnv || opts.name) {
+          // secret store, which needs a master key, or (a new GitHub server) need the
+          // App validated there. Reject them, never drop them silently.
+          if (
+            opts.privateKey ||
+            opts.webhookSecret ||
+            opts.stdin ||
+            opts.fromEnv ||
+            opts.name ||
+            opts.githubUrl !== undefined
+          ) {
             console.error(
               'Error: --database-url mode supports only --org updates; ' +
-                'secret/key/name updates require HTTP (drop --database-url)',
+                'secret/key/name/GitHub server updates require HTTP (drop --database-url)',
             );
             process.exit(1);
           }
@@ -1033,6 +1070,7 @@ export function registerSourceCommands(program: Command, getClient: () => AdminA
         if (privateKey) body.privateKey = privateKey;
         if (opts.webhookSecret) body.webhookSecret = opts.webhookSecret;
         if (opts.org) body.customerId = opts.org;
+        if (opts.githubUrl !== undefined) body.githubUrl = parseGithubUrlUpdate(opts.githubUrl);
 
         const result = await getClient().patch<{ routingKey: string; warning?: string }>(
           `/api/v1/admin/sources/${encodeURIComponent(routingKey)}`,

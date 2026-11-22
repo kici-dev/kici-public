@@ -17,6 +17,8 @@ export const LoggerEnvSchema = z.object({
   KICI_LOG_RETENTION_DAYS: z.coerce.number().default(7),
   /** Runtime services pin `json` so a journal-attached PTY cannot flip them to plain. */
   KICI_LOG_FORMAT: z.enum(['auto', 'plain', 'json']).default('auto'),
+  /** Set by the kici-admin and kici-platform-admin launchers before any module loads. */
+  KICI_LOG_STDERR: z.string().optional(),
   /** Set by the orchestrator process; used as a filename suffix. */
   KICI_CLUSTER_INSTANCE_ID: z.string().optional(),
   /** Set by the agent process; used as a filename suffix. */
@@ -35,6 +37,7 @@ export const LOGGER_ENV_VARS = [
   'KICI_LOG_MAX_SIZE',
   'KICI_LOG_RETENTION_DAYS',
   'KICI_LOG_FORMAT',
+  'KICI_LOG_STDERR',
   'KICI_CLUSTER_INSTANCE_ID',
   'KICI_AGENT_ID',
   'KICI_PLATFORM_INSTANCE_ID',
@@ -89,6 +92,15 @@ export const LOGGER_ENV_FIELD_SPECS: EnvFieldSpec[] = [
     type: 'enum:auto|plain|json',
     description:
       'Output format for stdout/stderr. `auto` (default) emits JSON when stdout is piped and plain coloured text when stdout is a TTY. `plain` and `json` force the corresponding format regardless of TTY. Runtime services (orchestrator, agent, platform, dashboard SSR) pin `json` so a journal-attached PTY cannot flip them into plain mode.',
+  },
+  {
+    envVar: 'KICI_LOG_STDERR',
+    aliases: [],
+    fieldPath: 'KICI_LOG_STDERR',
+    required: false,
+    type: 'string',
+    description:
+      'Any non-empty value sends every log line to stderr, so a command keeps its stdout for data (an empty value does nothing). The kici-admin and kici-platform-admin launchers set it.',
   },
   {
     envVar: 'KICI_LOG_MAX_SIZE',

@@ -1,6 +1,6 @@
 {
   "name": "@kici-dev/shared",
-  "version": "0.28.0",
+  "version": "0.29.0",
   "description": "Shared utilities for the KiCI CI/CD stack — logging, zx setup, crypto, telemetry, health and metrics routes. No business logic.",
   "keywords": [
     "ci",
@@ -109,6 +109,10 @@
     "./net": {
       "import": "./dist/net.js",
       "types": "./dist/net.d.ts"
+    },
+    "./lazy-deps": {
+      "import": "./dist/lazy-deps.js",
+      "types": "./dist/lazy-deps.d.ts"
     }
   },
   "scripts": {

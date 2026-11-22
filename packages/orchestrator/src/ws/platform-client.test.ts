@@ -158,25 +158,34 @@ describe('PlatformClient', () => {
     });
   });
 
-  describe('getDashboardUrl', () => {
-    /** Authenticates once per frame on one socket, returning the base after each. */
-    function basesAfter(...extras: Array<Record<string, unknown>>): Array<string | undefined> {
-      const client = createClient();
-      client.connect();
-      const mock = getLatestMock();
-      simulateOpen(mock);
-      return extras.map((extra) => {
-        simulateMessage(mock, {
-          type: 'auth.success',
-          connectionId: 'c1',
-          orgId: 'org_a',
-          orgPublicAlias: 'oal_test',
-          githubWebhookUrl: null,
-          ...extra,
-        });
-        return client.getDashboardUrl();
+  /**
+   * Authenticates once per frame on one socket, returning what `read` reports
+   * after each auth.success.
+   */
+  function readAfterEachAuth(
+    read: (client: PlatformClient) => string | undefined,
+    ...extras: Array<Record<string, unknown>>
+  ): Array<string | undefined> {
+    const client = createClient();
+    client.connect();
+    const mock = getLatestMock();
+    simulateOpen(mock);
+    return extras.map((extra) => {
+      simulateMessage(mock, {
+        type: 'auth.success',
+        connectionId: 'c1',
+        orgId: 'org_a',
+        orgPublicAlias: 'oal_test',
+        githubWebhookUrl: null,
+        ...extra,
       });
-    }
+      return read(client);
+    });
+  }
+
+  describe('getDashboardUrl', () => {
+    const basesAfter = (...extras: Array<Record<string, unknown>>) =>
+      readAfterEachAuth((client) => client.getDashboardUrl(), ...extras);
 
     it('is undefined before auth', () => {
       expect(createClient().getDashboardUrl()).toBeUndefined();
@@ -193,6 +202,30 @@ describe('PlatformClient', () => {
 
     it('treats an empty base as absent', () => {
       expect(basesAfter({ dashboardUrl: '' })).toEqual([undefined]);
+    });
+  });
+
+  describe('getGithubManifestCallbackUrl', () => {
+    const pagesAfter = (...extras: Array<Record<string, unknown>>) =>
+      readAfterEachAuth((client) => client.getGithubManifestCallbackUrl(), ...extras);
+
+    it('is undefined before auth', () => {
+      expect(createClient().getGithubManifestCallbackUrl()).toBeUndefined();
+    });
+
+    // fails-when: handleAuthSuccess only assigns when the field is present, so a
+    //   reconnect to a Platform that serves no page keeps advertising the old one.
+    it('tracks the page of the last auth.success, clearing it when omitted', () => {
+      expect(
+        pagesAfter(
+          { githubManifestCallbackUrl: 'https://kici.corp.example/github/manifest-callback' },
+          {},
+        ),
+      ).toEqual(['https://kici.corp.example/github/manifest-callback', undefined]);
+    });
+
+    it('treats an empty page URL as absent', () => {
+      expect(pagesAfter({ githubManifestCallbackUrl: '' })).toEqual([undefined]);
     });
   });
 
@@ -230,6 +263,52 @@ describe('PlatformClient', () => {
         // fails-when: the auth.request advertises the removed dashboard-request manifest.
         capabilities: { orchRole: 'coordinator' },
       });
+    });
+
+    // fails-when: the orchestrator sends no release version, so a Platform cannot refuse a
+    // newer one
+    it('auth.request carries componentVersion', () => {
+      for (const componentVersion of ['0.30.0', '0.30.0-4512']) {
+        const client = createClient({ componentVersion });
+        client.connect();
+        const mock = getLatestMock();
+        simulateOpen(mock);
+        expect(getSentMessages(mock)[0]).toMatchObject({
+          type: 'auth.request',
+          protocolVersion: PROTOCOL_VERSION,
+          componentVersion,
+        });
+      }
+    });
+
+    // breaks-if-wrong: a build whose version the Platform's schema refuses must still connect
+    it('omits a componentVersion that is not a release version', () => {
+      const client = createClient({ componentVersion: 'unknown' });
+      client.connect();
+      const mock = getLatestMock();
+      simulateOpen(mock);
+      expect(getSentMessages(mock)[0]).not.toHaveProperty('componentVersion');
+    });
+
+    // fails-when: the default ignores the build's KICI_PKG_VERSION
+    it('defaults componentVersion to the build release version', async () => {
+      vi.stubGlobal('KICI_PKG_VERSION', '0.31.2');
+      vi.resetModules();
+      try {
+        const { PlatformClient: Fresh } = await import('./platform-client.js');
+        const client = new Fresh({
+          url: 'ws://localhost:9999/ws',
+          token: 'test-api-key',
+          onWebhookRelay: vi.fn().mockResolvedValue(undefined),
+        });
+        client.connect();
+        const mock = getLatestMock();
+        simulateOpen(mock);
+        expect(getSentMessages(mock)[0]).toMatchObject({ componentVersion: '0.31.2' });
+        client.disconnect();
+      } finally {
+        vi.unstubAllGlobals();
+      }
     });
 
     it('transitions to authenticated on auth.success', () => {

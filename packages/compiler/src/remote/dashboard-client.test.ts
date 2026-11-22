@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { DashboardClient, DashboardClientError } from './dashboard-client.js';
+import { ClientNewerThanPlatformError } from './platform-fetch.js';
 import type { GlobalConfig } from './config.js';
 
 const baseConfig: GlobalConfig = {
@@ -61,6 +62,36 @@ describe('DashboardClient.fromConfig', () => {
     // breaks-if-wrong: a bare provider still filters by prefix.
     expect(urls[1]!.searchParams.get('source')).toBe('github');
     expect(urls[1]!.searchParams.has('routingKey')).toBe(false);
+  });
+
+  it('passes a newer-client refusal through as the refusal, read once', async () => {
+    // fails-when: send wraps the refusal in DashboardClientError('http', 'Network error: …'),
+    // so the user reads a dropped connection instead of the Platform's message
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockImplementation(
+        async () =>
+          new Response(
+            JSON.stringify({ error: 'client_newer_than_platform', message: 'Upgrade it (test).' }),
+            { status: 409 },
+          ),
+      );
+    const client = DashboardClient.fromConfig(baseConfig);
+    const err = await client.getJson('/runs').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ClientNewerThanPlatformError);
+    expect(err).not.toBeInstanceOf(DashboardClientError);
+    expect((err as Error).message).toBe('Upgrade it (test).');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('a dropped connection is still a network DashboardClientError', async () => {
+    // breaks-if-wrong: the rethrow is for the refusal only
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('ECONNREFUSED'));
+    const client = DashboardClient.fromConfig(baseConfig);
+    await expect(client.getJson('/runs')).rejects.toMatchObject({
+      kind: 'http',
+      message: expect.stringContaining('Network error'),
+    });
   });
 
   it('maps 403 to a permission DashboardClientError', async () => {

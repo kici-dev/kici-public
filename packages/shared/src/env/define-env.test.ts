@@ -200,6 +200,44 @@ describe('defineEnv', () => {
     expect(byEnv['KICI_STATIC_PORT']?.defaultValue).toBe('8080');
   });
 
+  // fails-when: an array default is compared by identity, which a fresh copy per read never matches
+  it('describe() renders array defaults literally', () => {
+    const schema = z.object({
+      algorithms: z.array(z.string()).default(['RS256']),
+      audiences: z.array(z.string()).default([]),
+    });
+    const envDef = defineEnv({
+      service: 'test',
+      schema,
+      envMap: { algorithms: 'KICI_ALGORITHMS', audiences: 'KICI_AUDIENCES' },
+    });
+    const byEnv = Object.fromEntries(envDef.describe().map((s) => [s.envVar, s]));
+    expect(byEnv['KICI_ALGORITHMS']?.defaultValue).toBe('["RS256"]');
+    expect(byEnv['KICI_AUDIENCES']?.defaultValue).toBe('[]');
+  });
+
+  // fails-when: rendering a default that JSON cannot represent throws out of describe(),
+  // or a Set/Map default renders as an empty `{}`
+  it('describe() renders defaults JSON cannot represent as <computed>', () => {
+    const schema = z.object({
+      big: z.bigint().default(10n),
+      tags: z.set(z.string()).default(new Set(['a'])),
+      lookup: z.map(z.string(), z.string()).default(new Map([['k', 'v']])),
+      port: z.coerce.number().default(8080),
+    });
+    const envDef = defineEnv({
+      service: 'test',
+      schema,
+      envMap: { big: 'KICI_BIG', tags: 'KICI_TAGS', lookup: 'KICI_LOOKUP', port: 'KICI_PORT' },
+    });
+    const byEnv = Object.fromEntries(envDef.describe().map((s) => [s.envVar, s]));
+    expect(byEnv['KICI_BIG']?.defaultValue).toBe('"<computed>"');
+    expect(byEnv['KICI_TAGS']?.defaultValue).toBe('"<computed>"');
+    expect(byEnv['KICI_LOOKUP']?.defaultValue).toBe('"<computed>"');
+    // breaks-if-wrong: a plain default beside them must still render literally
+    expect(byEnv['KICI_PORT']?.defaultValue).toBe('8080');
+  });
+
   it('describe() emits a sorted list with required/default/type metadata', () => {
     const schema = z.object({
       url: z.string(),
@@ -320,6 +358,25 @@ describe('validateUnknownKiciVars', () => {
     ).not.toThrow();
   });
 
+  it('allowlists the per-run test temp folder variables', () => {
+    // Set by every vitest config (hack/lib/vitest-isolation.ts) and inherited
+    // by every test-spawned service.
+    // fails-when: a name leaves RESERVED_NON_SCHEMA_KICI_VARS — a service a
+    // test spawns refuses to boot with "Unknown KICI_* env var".
+    expect(() =>
+      validateUnknownKiciVars(
+        ['KICI_SECRET_KEY'],
+        {},
+        {
+          KICI_SECRET_KEY: 'x',
+          KICI_TEST_RUN_DIR: '/tmp/kici-test/run-abc123',
+          KICI_TEST_RUN_ORIG_TMPDIR: '',
+          KICI_TEST_RUN_ORIG_KICI_TMPDIR: '/srv/tmp',
+        },
+      ),
+    ).not.toThrow();
+  });
+
   it('allowlists KICI_ORCHESTRATOR_TOKEN (the CLI direct-target credential)', () => {
     // A developer or CI job exports it for `kici run remote` against an
     // orchestrator; a service started from that shell inherits it.
@@ -354,6 +411,8 @@ describe('validateUnknownKiciVars', () => {
       'KICI_CONFIGX',
       'KICI_CONFG',
       'KICI_CONFIG_DIRX',
+      'KICI_TEST_RUN_DIRX',
+      'KICI_TEST_RUN_ORIG',
       'KICI_ORCHESTRATOR_TOKN',
     ]) {
       expect(() =>

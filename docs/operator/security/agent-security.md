@@ -277,6 +277,35 @@ The sandbox environment is constructed from a 7-layer merge (later overrides ear
    platform where the host sets them; on Linux and macOS the host normally does
    not.
 
+   The allowlist also copies the TLS trust settings, when the host sets them:
+   `GIT_SSL_CAINFO`, `GIT_SSL_CAPATH`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, and
+   `NODE_EXTRA_CA_CERTS`. They hold the paths of the CA bundles that make git,
+   Node.js and OpenSSL-based tools trust a private CA, such as the CA of a
+   GitHub Enterprise Server. They are file paths, not credentials. With them, a
+   job clones from a server that the agent trusts.
+
+   These paths are on the agent host. A job with its own filesystem gets each
+   path mounted read-only under `/run/kici/trust/<n>/`, and the setting points
+   at that mount. A job that the agent starts in its container sandbox gets a
+   bind mount, and a bubblewrap job gets `--ro-bind`.
+   The mount never covers a path of the job's filesystem. An image keeps its
+   own CA store at `/etc/ssl/certs`, and `update-ca-certificates` in the job
+   still works.
+
+   The agent resolves symbolic links and mounts the target, under the
+   target's own name. The target must be a regular file, or a directory for
+   `SSL_CERT_DIR` and `GIT_SSL_CAPATH`, and never `/`. Otherwise the job
+   does not receive the setting. A mounted directory keeps
+   its symbolic links, so a link to a file outside the directory resolves in
+   the job's filesystem. A value that the job, its source or its org sets is
+   used as it is, and the agent mounts nothing for it.
+
+   On the container scaler, the image of a `container:` job runs as the agent
+   and receives the label set's `env` and `volumes` as given. The bare-metal
+   scaler copies the same allowlist from the orchestrator's environment into
+   each agent that it starts, so the agents receive the orchestrator's TLS
+   trust settings.
+
 2. **Sandbox defaults** -- `FORCE_COLOR=1` and similar defaults to ensure correct tool behavior in non-TTY environments
 
 3. **KICI\_\* system vars** -- Orchestrator-generated variables passed via `userEnv`
@@ -471,6 +500,7 @@ apt install slirp4netns
 | /etc/hosts (if exists)         | /etc/hosts         | read-only       |
 | /etc/nsswitch.conf (if exists) | /etc/nsswitch.conf | read-only       |
 | Node.js binary dir             | (same path)        | read-only       |
+| Host TLS trust paths (if set)  | /run/kici/trust/…  | read-only       |
 | Workspace                      | /workspace         | read-write      |
 | (new)                          | /dev               | private         |
 | (new)                          | /proc              | private         |

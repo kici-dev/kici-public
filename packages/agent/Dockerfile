@@ -8,7 +8,7 @@ ARG DHI_PREFIX=dhi.io
 # Stage 1: Build (on the -dev variant — keeps apt + shell + corepack so we
 # can install/compile/rebuild oxc-transform in the usual pnpm flow). DHI
 # ships ca-certificates by default, so no apt-get for certs is needed.
-FROM ${DHI_PREFIX}/node:24.22.1-0-debian13-dev@sha256:20cf36e12660c68b1e28887d1e71a7f2494bcea9d034709368e0afce77728eb0 AS builder
+FROM ${DHI_PREFIX}/node:24.22.3-0-debian13-dev@sha256:9354eb131b6856f43fc9c7eba8cb54f5d0200fe7fbf5495bf6065be8a4a43e3b AS builder
 WORKDIR /app
 
 # Enable pnpm. Pin 11.28.6 to match the runtime stage (see below): the same
@@ -151,7 +151,7 @@ RUN rm -f .npmrc \
 # Runtime base is the -dev variant: the agent needs apt-installed host tools
 # (git/bash/iptables), and a job installs more Debian packages with apt.
 # ca-certificates ships with the DHI base, so it isn't installed here.
-FROM ${DHI_PREFIX}/node:24.22.1-0-debian13-dev@sha256:20cf36e12660c68b1e28887d1e71a7f2494bcea9d034709368e0afce77728eb0
+FROM ${DHI_PREFIX}/node:24.22.3-0-debian13-dev@sha256:9354eb131b6856f43fc9c7eba8cb54f5d0200fe7fbf5495bf6065be8a4a43e3b
 
 # Install the CI userland: what the agent needs (listed above), then the
 # baseline a CI job expects on a Debian host — ps, hostname, ip, ping, unzip,
@@ -194,6 +194,16 @@ FROM ${DHI_PREFIX}/node:24.22.1-0-debian13-dev@sha256:20cf36e12660c68b1e28887d1e
 # library it does not contain and OSV-Scanner reports every curl CVE twice —
 # once against the library that is installed, once against a phantom.
 #
+# libncursesw6 and libtinfo6 are a matched pair for the same reason. The base
+# ships `libtinfo6` at `6.5+20250216-2+dhi4`, which the DHI apt repository no
+# longer carries: it republished the same `Source: ncurses` build as
+# `6.5+20250216-2+deb13u0+dhi4`. procps depends on libncursesw6, which depends
+# on libtinfo6 at exactly its own version. apt orders `+deb13u0+dhi4` below
+# `+dhi4`, so the install implies a downgrade and apt refuses it. Both sides are
+# DHI's fourth rebuild of Debian's `6.5+20250216-2`, so the downgrade changes no
+# patch level. The version comes from libncursesw6's candidate, for the reason
+# given for curl, and the SBOM stub is removed for the reason given for libcurl.
+#
 # pam-auth-update writes /etc/pam.d/common-*. The DHI base carries
 # libpam-runtime without having run its postinst, so the files are missing and
 # every sudo call aborts with "unable to initialize PAM". `--force` is needed
@@ -213,10 +223,13 @@ FROM ${DHI_PREFIX}/node:24.22.1-0-debian13-dev@sha256:20cf36e12660c68b1e28887d1e
 RUN apt-get update \
   && CURL_VER="$(apt-cache policy curl | awk '/Candidate:/{print $2}')" \
   && { [ -n "$CURL_VER" ] && [ "$CURL_VER" != '(none)' ]; } \
+  && NCURSES_VER="$(apt-cache policy libncursesw6 | awk '/Candidate:/{print $2}')" \
+  && { [ -n "$NCURSES_VER" ] && [ "$NCURSES_VER" != '(none)' ]; } \
   && apt-get install -y --no-install-recommends --allow-downgrades \
        git bash "curl=$CURL_VER" "libcurl4t64=$CURL_VER" gzip xz-utils iptables tini \
+       "libncursesw6=$NCURSES_VER" "libtinfo6=$NCURSES_VER" \
        procps hostname iproute2 iputils-ping unzip zstd jq file less rsync sudo passwd \
-  && rm -f /var/lib/dpkg/status.d/libcurl4t64 \
+  && rm -f /var/lib/dpkg/status.d/libcurl4t64 /var/lib/dpkg/status.d/libtinfo6 \
   && DEBIAN_FRONTEND=noninteractive pam-auth-update --package --force \
   && update-alternatives --install /usr/bin/which which /usr/bin/which.debianutils 0 \
   && groupadd --system --gid 1990 kici-sudo \
@@ -281,9 +294,9 @@ ENV COREPACK_DEFAULT_TO_LATEST=0
 # an unverified tarball here would execute in every customer job container.
 # The download retries on any error, like the corepack steps above: a single
 # dropped TLS handshake must not fail the whole image build.
-ARG KICI_RUNTIME_NODE_VERSION=24.22.1
-ARG KICI_RUNTIME_NODE_SHA256_X64=6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6
-ARG KICI_RUNTIME_NODE_SHA256_ARM64=dbabf7a1cbf947e6059ffad2c27b80041db97dea1e553b62afdee7f13fca336e
+ARG KICI_RUNTIME_NODE_VERSION=24.22.3
+ARG KICI_RUNTIME_NODE_SHA256_X64=4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb
+ARG KICI_RUNTIME_NODE_SHA256_ARM64=6e51a2ada00f0011cc266f65d98922b403d7ad88f809ca2aa615a5fe1ce6e86c
 RUN set -eu; \
   arch="$(dpkg --print-architecture)"; \
   case "$arch" in \

@@ -135,6 +135,9 @@ describe('retention-policy — audit_log (Platform)', () => {
   it('compliance prefixes return 365d', () => {
     expect(auditLogWarmDays('plan.change')).toBe(365);
     expect(auditLogWarmDays('plan_config.update')).toBe(365);
+    // fails-when: a license load or refresh request is purged with ordinary tenant actions
+    expect(auditLogWarmDays('license.load')).toBe(365);
+    expect(auditLogColdDays('license.refresh_requested')).toBe('forever');
     expect(auditLogWarmDays('member.removed')).toBe(365);
     expect(auditLogWarmDays('member.invite')).toBe(365);
     expect(auditLogWarmDays('invite.declined')).toBe(365);

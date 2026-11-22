@@ -27,6 +27,7 @@ import type { RegistrationIndex } from '../registration/registration-index.js';
 import { definingRepoOfRun, runsDefinedByRepos } from '../registration/registration-run-match.js';
 import type { AccessLogWriter } from '../audit/access-log.js';
 import { genericProviderTypeToSubtype } from '../entry-helpers.js';
+import { githubUrlOfSource } from '../sources/github-source-config.js';
 import { cleanupPendingJobContexts } from '../pipeline/processor.js';
 import type { DashboardWriteOperation } from '@kici-dev/engine/protocol/dashboard-write-operations';
 import {
@@ -41,6 +42,10 @@ interface RegistrationSourceMetadata {
   name: string | null;
   subtype: SourceSubtype | null;
   provider: string;
+  /** The source's GitHub Enterprise Server web URL; absent for github.com. */
+  webUrl?: string;
+  /** The stored server is refused, so the source's web host is unknown. */
+  refused?: true;
 }
 
 const logger = createLogger({ prefix: 'dashboard-registrations-handler' });
@@ -411,15 +416,21 @@ export class DashboardRegistrationsHandler {
     try {
       const nativeRows = await this.deps.db
         .selectFrom('sources')
-        .select(['routing_key', 'name', 'provider'])
+        .select(['routing_key', 'name', 'provider', 'github_url'])
         .where('routing_key', 'in', routingKeys)
         .execute();
       for (const row of nativeRows) {
+        const server = sourceWebUrl(row.routing_key, row);
         result.set(row.routing_key, {
           routingKey: row.routing_key,
           name: row.name,
           subtype: SourceSubtype.enum.github_app,
           provider: row.provider,
+          // fails-when: a GHES registration's workflow link goes to github.com
+          // breaks-if-wrong: a github.com source's descriptor gains no webUrl key
+          ...(server.webUrl && { webUrl: server.webUrl }),
+          // fails-when: a refused source's registration links to github.com
+          ...(server.refused && { refused: true as const }),
         });
       }
     } catch (err) {
@@ -633,6 +644,27 @@ export class DashboardRegistrationsHandler {
         error: message,
       });
     }
+  }
+}
+
+/**
+ * The GitHub Enterprise Server web URL a native source stores (never its
+ * private key). A stored server that is refused names no server and marks the
+ * source refused, so its registrations build no link.
+ */
+function sourceWebUrl(
+  routingKey: string,
+  source: { github_url: string | null },
+): { webUrl?: string; refused?: true } {
+  try {
+    const webUrl = githubUrlOfSource(source);
+    return webUrl ? { webUrl } : {};
+  } catch (err) {
+    logger.warn('Refused source server; its registrations build no link', {
+      routingKey,
+      error: toErrorMessage(err),
+    });
+    return { refused: true };
   }
 }
 

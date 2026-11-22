@@ -7,6 +7,7 @@ import {
 } from './reroute-dispatch.js';
 
 const IDS = { messageId: 'msg-1', timestamp: 1_700_000_000_000, concurrencyWaitTimeoutMs: 900_000 };
+const AGENT = { agentId: 'agent-1', version: '0.29.0' };
 
 function reroute(over: Partial<JobReroute> = {}): JobReroute {
   return {
@@ -47,7 +48,7 @@ function queuedJob(msg: JobReroute) {
 describe('worker dispatch of a rerouted job', () => {
   it("authenticates the workflow repo with the workflow repo's clone token", () => {
     const msg = reroute({ cloneToken: 'src-tok', workflowCloneToken: 'wf-tok' });
-    const dispatch = buildWorkerDispatchMessage(queuedJob(msg), IDS);
+    const dispatch = buildWorkerDispatchMessage(queuedJob(msg), IDS, AGENT);
     // fails-when: the worker drops workflowCloneToken, so the agent clones A with B's token
     expect(dispatch.workflowAuth).toEqual({
       kind: 'basic',
@@ -70,7 +71,7 @@ describe('worker dispatch of a rerouted job', () => {
   it('dispatches a reroute that carries no workflow clone token with source auth alone', () => {
     // breaks-if-wrong: a non-global reroute must reach the agent with its source token as sourceAuth
     const msg = reroute({ cloneToken: 'src-tok' });
-    expect(buildWorkerDispatchMessage(queuedJob(msg), IDS)).toEqual({
+    expect(buildWorkerDispatchMessage(queuedJob(msg), IDS, AGENT)).toEqual({
       type: 'job.dispatch',
       messageId: 'msg-1',
       timestamp: 1_700_000_000_000,
@@ -113,7 +114,7 @@ describe('worker dispatch of a rerouted job', () => {
         workflowRepoIdentifier: 'org/ci',
       },
     });
-    const dispatch = buildWorkerDispatchMessage(queuedJob(msg), IDS);
+    const dispatch = buildWorkerDispatchMessage(queuedJob(msg), IDS, AGENT);
     expect(dispatch.jobConfig).not.toHaveProperty('workflowRoutingKey');
     expect(dispatch.jobConfig).not.toHaveProperty('workflowProviderContext');
     // breaks-if-wrong: the workflow repository the agent checks out still reaches it
@@ -219,4 +220,20 @@ describe('rerouteDispatchRefusal', () => {
       ),
     ).toBeUndefined();
   });
+});
+
+describe('worker dispatch of a checkout: false job', () => {
+  const job = queuedJob(reroute({ jobConfig: { name: 'deploy', checkout: false } }));
+
+  it('sends the flag to an agent that runs checkout: false jobs', () =>
+    // breaks-if-wrong: a current agent behind a worker must still skip the clone
+    expect(buildWorkerDispatchMessage(job, IDS, AGENT).jobConfig).toMatchObject({
+      checkout: false,
+    }));
+
+  it('drops the flag for an older agent, which then clones', () =>
+    // fails-when: the worker forwards checkout: false to an agent that cannot load the workflow without a clone
+    expect(
+      buildWorkerDispatchMessage(job, IDS, { agentId: 'agent-1', version: '0.28.0' }).jobConfig,
+    ).not.toHaveProperty('checkout'));
 });

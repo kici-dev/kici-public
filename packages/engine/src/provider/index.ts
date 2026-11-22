@@ -20,6 +20,7 @@ export type {
 } from './git-credential.js';
 export { isMintedRef } from './git-credential.js';
 export { repoIdentifierFromUrl } from './repo-identifier.js';
+export { webOriginOrNull } from './web-origin.js';
 export type { RepoUrlBuilder } from './repo-url-builder.js';
 export type {
   CheckStatusPoster,

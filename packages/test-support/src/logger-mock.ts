@@ -18,6 +18,22 @@ export function silentLogger(): SilentLogger {
   return { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
 }
 
+/**
+ * Every real export, with `createLogger` returning `logger` for one prefix and
+ * the real logger for every other, so a test can read the lines one module writes.
+ */
+export function withPrefixedLogger<T extends { createLogger: (opts?: never) => unknown }>(
+  actual: T,
+  prefix: string,
+  logger: SilentLogger,
+): T {
+  return {
+    ...actual,
+    createLogger: (opts?: { prefix?: string }) =>
+      opts?.prefix === prefix ? logger : actual.createLogger(opts as never),
+  };
+}
+
 /** Every real export, a silent logger, and a deterministic `toErrorMessage`. */
 export function withSilentLogger<T extends object>(
   actual: T,

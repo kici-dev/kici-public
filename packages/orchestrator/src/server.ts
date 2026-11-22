@@ -129,7 +129,7 @@ import { buildExecutionStatusFrame } from './ws/execution-status-frame.js';
 import { buildJobStatusForwardFrame } from './ws/job-status-forward-frame.js';
 import { resolveDashboardOrgContext } from './ws/dashboard-org-context.js';
 import type { ReleaseSignal } from './contexts/held-runs.js';
-import type { OrchestratorHooks } from './orchestrator-core.js';
+import type { ModeAppDepsExtras, OrchestratorHooks } from './orchestrator-core.js';
 // Type-only: the test-only fault-injection policy. `import type` erases at
 // runtime, so the `src/testing/*` module never enters the shipped bundle.
 import type { OrchestratorFaultInjection } from './fault-injection-types.js';
@@ -1806,6 +1806,7 @@ export async function runServer(
               backfillRunToPlatform(
                 {
                   send: (m) => platformClient.send(m),
+                  githubSourceOf: (rk) => sub.providerRegistry.githubSourceOf(rk),
                   loadRun: async (rid) => {
                     const row = await sub.db
                       .selectFrom('execution_runs')
@@ -1971,6 +1972,9 @@ export async function runServer(
               globalWorkflowPolicy,
               resolveSourceWebhookUrl,
               resolveGithubWebhookUrl,
+              // The Platform's own headless manifest page, when it serves one.
+              resolveGithubManifestCallbackUrl: () =>
+                platformClient.getGithubManifestCallbackUrl() ?? null,
               resolveSourceIngressUrl,
               // Resume a workflow whose install-gate wait-timer / concurrency hold
               // released (same path as a reviewer approval).
@@ -2010,7 +2014,9 @@ export async function runServer(
                 );
               },
               // eventLogWriter is provided by orchestrator-core directly to createApp.
-            },
+              // `satisfies` makes a misspelled key a type error: the hook's return
+              // type alone does not check the keys of a returned literal.
+            } satisfies ModeAppDepsExtras,
 
             configReloaderExtras: {
               onProviderChange: async (_newConfig: any, _oldConfig: any, s: any) => {

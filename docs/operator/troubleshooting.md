@@ -233,6 +233,8 @@ The orchestrator closes an agent WebSocket with a specific close code:
 registered with a different token`) — the later one is refused. The refused agent keeps
   retrying, and registers once the other connection is gone: its agent process
   stopped, its token was revoked, or it stopped answering heartbeats.
+- **4005 (protocol error)** — the agent's protocol version is below the
+  orchestrator's floor (`Unsupported protocol version`). The agent does **not** retry.
 - **4006 (internal error)** — the orchestrator could not read its own state while
   the agent connected: the scaler's spawn record, or the agent token on a
   database error. The agent connects again on its own. See
@@ -259,6 +261,7 @@ log around the connection attempt — the close code names the cause.
   agent-ID collision, give each agent a distinct agent ID (or the same ID with the
   matching token). To move an agent to a new token, stop the old agent process or revoke
   its token; the agent with the new token then registers on its next retry.
+- 4005: upgrade the agent to the orchestrator's release.
 - 4006: fix the database or scaler-state condition. The agent registers once the
   orchestrator can read it again.
 - Provisioning: fix the host-side root cause the captured error names (install
@@ -328,7 +331,7 @@ If the run is there, follow it with `kici runs show <run-id>`. A run that could 
 
 ### Fix
 
-If no run appeared, retry the request. A retry of a rerun or a "Run now" within 30 minutes sends the first request again, when the same user or API key sends it. So it cannot start a second run. It returns the run that the first request started, if there is one. A new `kici run --remote` is always a new run. If the error repeats, the orchestrator is slow to answer requests: check its database and its connection to the Platform, as in [Database errors while the orchestrator handles a message](#database-errors-while-the-orchestrator-handles-a-message).
+If no run appeared, retry the request. A retry of a rerun or a "Run now" within 30 minutes sends the first request again, when the same user or API key sends it. So it cannot start a second run. It returns the run that the first request started, if there is one. A new `kici run remote` is always a new run. If the error repeats, the orchestrator is slow to answer requests: check its database and its connection to the Platform, as in [Database errors while the orchestrator handles a message](#database-errors-while-the-orchestrator-handles-a-message).
 
 ## Lock-file drift at the orchestrator
 

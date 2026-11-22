@@ -137,7 +137,7 @@ Common flags for `list`:
 | `--actor-type`  | `user` / `api_key` / `service_account` / `platform_operator` / `system`                 |
 | `--actor-id`    | Actor identifier (OIDC sub for user, key id, etc.)                                      |
 | `--action`      | Dotted action name (e.g. `run.detail.read`, `secret.reveal`, `run.cancel`)              |
-| `--source`      | `platform_proxy` / `admin_http` / `admin_cli`                                           |
+| `--source`      | `platform_proxy` / `admin_http` / `admin_cli` / `agent`                                 |
 | `--outcome`     | `allowed` / `denied` / `error`                                                          |
 | `--target-type` | `run` / `job` / `step` / `payload` / `event_log` / `secret_scope` / `environment` / ... |
 | `--target-id`   | Target identifier                                                                       |

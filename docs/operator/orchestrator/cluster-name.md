@@ -162,5 +162,5 @@ and GPU work to the right agents through separate scalers (see
 [How many clusters?](clustering.md#how-many-clusters)).
 
 Avoid embedding secrets, customer names, or anything else that would leak
-through the dashboard URL — the cluster name is visible to every user of the
-org with `dashboard:read` permissions.
+through the dashboard URL — the cluster name is visible to every member of the
+org who can open the orchestrator's pages.

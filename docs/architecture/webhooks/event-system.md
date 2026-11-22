@@ -217,7 +217,8 @@ GitHub Webhook -> Platform Relay -> Orchestrator Processor
     |-- extractRegisterableWorkflows(lockFile)
     |       |-- For each workflow entry in lock file:
     |       |     Check if any trigger type is in RegisterableTriggerType
-    |       |     (non-Git: kici_event, workflow_complete, job_complete,
+    |       |     (non-Git: kici_event, workflow_complete,
+    |       |       workflows_failed_batch, job_complete,
     |       |       generic_webhook, schedule, lifecycle, webhook;
     |       |      Git: push, pr, tag, comment, review, review_comment,
     |       |       release, dispatch, create, delete, status,
@@ -226,8 +227,10 @@ GitHub Webhook -> Platform Relay -> Orchestrator Processor
     |
     |-- registrationStore.replaceAll(customerId, repo, workflows)
     |       |-- BEGIN TRANSACTION
-    |       |-- DELETE FROM workflow_registrations WHERE customer_id AND repo
-    |       |-- INSERT new registrations
+    |       |-- SELECT existing rows for customer_id AND repo
+    |       |-- UPDATE the rows the lock file still names
+    |       |-- INSERT the new registrations
+    |       |-- DELETE the rows the lock file no longer names
     |       |-- COMMIT
     |
     |-- registrationStore.bumpVersion()
@@ -305,21 +308,23 @@ Infrastructure events are stored upstream so the dashboard can render the run ti
 
 The following event types are emitted during a run's lifecycle:
 
-| Event type                        | Source       | Description                                                                     |
-| --------------------------------- | ------------ | ------------------------------------------------------------------------------- |
-| orchestrator.dispatch             | orchestrator | Run dispatched to agent(s)                                                      |
-| orchestrator.agent.assigned       | orchestrator | Agent assigned to a job                                                         |
-| orchestrator.job.started          | orchestrator | Job execution started                                                           |
-| orchestrator.job.completed        | orchestrator | Job execution completed                                                         |
-| orchestrator.job.stale_detected   | orchestrator | Job marked stale by stale run detector                                          |
-| orchestrator.job.queue_expired    | orchestrator | Queued job terminalized — its dispatch deadline passed without a matching agent |
-| orchestrator.job.orphan_recovered | orchestrator | Orphaned job recovered by Raft leader                                           |
-| orchestrator.run.orphan_recovered | orchestrator | Orphaned run recovered and finalized by the Raft leader                         |
-| agent.clone.start                 | agent        | Repository clone started (build jobs)                                           |
-| agent.clone.end                   | agent        | Repository clone completed                                                      |
-| agent.execution.start             | agent        | Workflow execution started                                                      |
-| agent.execution.end               | agent        | Workflow execution completed                                                    |
-| agent.teardown                    | agent        | Agent teardown/cleanup                                                          |
+| Event type                        | Source       | Description                                                                                |
+| --------------------------------- | ------------ | ------------------------------------------------------------------------------------------ |
+| orchestrator.dispatch             | orchestrator | Run dispatched to agent(s)                                                                 |
+| orchestrator.agent.assigned       | orchestrator | Agent assigned to a job                                                                    |
+| orchestrator.job.started          | orchestrator | Job execution started                                                                      |
+| orchestrator.job.completed        | orchestrator | Job execution completed                                                                    |
+| orchestrator.job.stale_detected   | orchestrator | Job marked stale by stale run detector                                                     |
+| orchestrator.job.queue_expired    | orchestrator | Queued job terminalized — its dispatch deadline passed without a matching agent            |
+| orchestrator.job.orphan_recovered | orchestrator | Orphaned job recovered by Raft leader                                                      |
+| orchestrator.run.orphan_recovered | orchestrator | Orphaned run recovered and finalized by the Raft leader                                    |
+| agent.clone.start                 | agent        | Repository clone started (build jobs)                                                      |
+| agent.clone.end                   | agent        | Repository clone completed                                                                 |
+| agent.execution.start             | agent        | Workflow execution started                                                                 |
+| agent.execution.end               | agent        | Workflow execution completed                                                               |
+| agent.teardown                    | agent        | Agent teardown/cleanup                                                                     |
+| cache.restore                     | agent        | A cache restore step finished; the metadata carries its `hit`, `miss` or `error` outcome   |
+| cache.save                        | agent        | A cache save step finished; the metadata carries its `saved`, `skipped` or `error` outcome |
 
 ### Event flow
 
@@ -327,7 +332,7 @@ The following event types are emitted during a run's lifecycle:
 
 ## See also
 
-- [Event System Concepts](../../user/events.md) -- event types, registration model, circuit breaker, emitting custom events
-- [Operator: Event Routing](../../operator/event-routing.md) -- configuration, registration admin API, generic webhooks
-- [Architecture: Data Flows](../data-flows.md#internal-event-routing-flow) -- event routing flow diagrams
-- [Architecture: Protocol Messages](../protocol/orchestrator-agent.md#event-emit-messages) -- WS protocol schemas
+- [Event system concepts](../../user/events.md) -- event types, registration model, circuit breaker, emitting custom events
+- [Operator: event routing](../../operator/event-routing.md) -- configuration, registration admin API, generic webhooks
+- [Architecture: data flows](../data-flows.md#internal-event-routing-flow) -- event routing flow diagrams
+- [Architecture: protocol messages](../protocol/orchestrator-agent.md#event-emit-messages) -- WS protocol schemas

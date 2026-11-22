@@ -55,7 +55,7 @@ See [dynamic values](./dynamic-values.md) for how dynamic `context`, `env`, and 
 
 ## Agent time
 
-After dispatch, each job runs in its own ephemeral agent sandbox: a shallow clone at the dispatch ref (or a source-tarball extract for non-build jobs), then the workflow module is loaded fresh — TypeScript is transformed on import. On the agent, in order:
+After dispatch, each job runs in its own ephemeral agent sandbox: a clone at the dispatch ref, at the job's `checkout` depth (default 1), with the cached `.kici/` source tarball extracted over it for non-build jobs. A job with `checkout: false` gets no clone, only `.kici/`, on an agent at 0.29.0 or later. Every job then loads the workflow module fresh — TypeScript is transformed on import. On the agent, in order:
 
 1. **Job-level rules** are evaluated. By this point the agent has already spawned and the source has already been restored, so a job that its rules skip has **still** paid for that spawn and clone; only its steps are avoided.
 2. **Step-level rules**, then each step's `run()` body and its hooks.

@@ -1,8 +1,12 @@
 /** AdminApiClient against a mocked global fetch. */
 
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   AdminApiClient,
+  AdminApiHttpError,
+  AdminApiUnreachableError,
   DEFAULT_ADMIN_URL,
   fetchAdminApi,
   firstCauseMessage,
@@ -584,5 +588,162 @@ describe('toQuery', () => {
   // breaks-if-wrong: an explicit 0 limit and a false flag are still sent; order is kept
   it('sends 0 and false, in insertion order', () => {
     expect(toQuery({ limit: 0, flag: false, z: 'a b' })).toBe('?limit=0&flag=false&z=a+b');
+  });
+});
+
+/**
+ * A caller that polls (`kici run --local` following a run) retries a server-side
+ * or transport failure and stops at once on a refusal, so the thrown error has to
+ * say which one it is without the caller parsing the message text.
+ */
+describe('AdminApiClient — typed errors', () => {
+  const BASE = 'http://127.0.0.1:4000';
+
+  /** What `fetchAdminApi` rejects with when `fetch` itself rejects with `inner`. */
+  async function rejectionFor(inner: Error): Promise<Error> {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(inner));
+    return (await fetchAdminApi(`${BASE}/x`, { method: 'GET' }, BASE).then(
+      () => undefined,
+      (e: unknown) => e,
+    )) as Error;
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  // fails-when: a non-2xx answer throws a plain Error with no status to read
+  it('throws an AdminApiHttpError carrying the status and the unchanged message', async () => {
+    vi.stubGlobal('fetch', mockFetch(500, { error: 'Internal server error' }));
+    const err = await new AdminApiClient(BASE, 'tok')
+      .get('/api/v1/admin/runs/r1')
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AdminApiHttpError);
+    expect((err as AdminApiHttpError).status).toBe(500);
+    expect((err as Error).message).toBe('HTTP 500: Internal server error');
+  });
+
+  // breaks-if-wrong: a refusal keeps its own status, so a caller can tell 404 from 500
+  it('keeps a 4xx status on the error', async () => {
+    vi.stubGlobal('fetch', mockFetch(404, { error: 'Run not found' }));
+    const err = await new AdminApiClient(BASE, 'tok').get('/x').catch((e: unknown) => e);
+    expect((err as AdminApiHttpError).status).toBe(404);
+  });
+
+  // fails-when: a transport failure is not distinguishable from a malformed request
+  it('throws an AdminApiUnreachableError for a transport failure', async () => {
+    const inner = new TypeError('fetch failed');
+    (inner as { cause?: unknown }).cause = new Error('read ECONNRESET');
+    const err = await rejectionFor(inner);
+    expect(err).toBeInstanceOf(AdminApiUnreachableError);
+    expect(err.message).toContain('cannot reach the orchestrator admin API');
+    expect(err.cause).toBe(inner);
+  });
+
+  // breaks-if-wrong: a request that could not be built is never reported as unreachable
+  it('does not report a malformed request as unreachable', async () => {
+    const err = await rejectionFor(
+      new TypeError('Headers.append: "Bearer a\nb" is an invalid header value.'),
+    );
+    expect(err).not.toBeInstanceOf(AdminApiUnreachableError);
+  });
+});
+
+describe('AdminApiClient — a cut-off or stalled answer', () => {
+  async function withServer(
+    handler: (req: IncomingMessage, res: ServerResponse) => void,
+    body: (client: AdminApiClient) => Promise<void>,
+  ): Promise<void> {
+    const server = createServer(handler);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+    try {
+      await body(new AdminApiClient(`http://127.0.0.1:${port}`, 'tok'));
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }
+
+  // fails-when: a connection reset while reading a 200 body escapes as a bare TypeError,
+  // which the local plane's read retry does not retry
+  it('throws an AdminApiUnreachableError when the connection drops mid-body', async () => {
+    await withServer(
+      (req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json', 'content-length': '1000' });
+        res.write('{"run":');
+        setTimeout(() => req.socket.destroy(), 10);
+      },
+      async (client) => {
+        const err = await client.get('/api/v1/admin/runs/r1').catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(AdminApiUnreachableError);
+        expect((err as Error).message).toContain('was cut off');
+        expect((err as Error).cause).toBeInstanceOf(TypeError);
+      },
+    );
+  });
+
+  // breaks-if-wrong: a complete answer that is not JSON is not a connection problem
+  it('keeps malformed JSON a SyntaxError', async () => {
+    await withServer(
+      (_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('not json');
+      },
+      async (client) => {
+        await expect(client.get('/x')).rejects.toBeInstanceOf(SyntaxError);
+      },
+    );
+  });
+
+  // fails-when: a read the server never answers hangs, or its deadline surfaces as a
+  // "could not be built" error the local plane's read retry treats as final
+  it.each<[string, (req: IncomingMessage, res: ServerResponse) => void]>([
+    ['before the headers', () => undefined],
+    [
+      'mid-body',
+      (_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json', 'content-length': '1000' });
+        res.write('{"run":');
+      },
+    ],
+  ])('reports a deadline that passes %s as an AdminApiUnreachableError', async (_when, handler) => {
+    await withServer(handler, async (client) => {
+      const err = await client
+        .get('/x', { signal: AbortSignal.timeout(100) })
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(AdminApiUnreachableError);
+      expect((err as Error).message).toContain('no answer');
+      expect(((err as Error).cause as Error).name).toBe('TimeoutError');
+    });
+  });
+
+  // fails-when: the caller's own abort (Ctrl-C) is wrapped as a retryable unreachable error
+  it('rethrows the caller abort as it is', async () => {
+    await withServer(
+      () => undefined,
+      async (client) => {
+        const ac = new AbortController();
+        setTimeout(() => ac.abort(), 50);
+        const err = await client.get('/x', { signal: ac.signal }).catch((e: unknown) => e);
+        expect(err).not.toBeInstanceOf(AdminApiUnreachableError);
+        expect((err as Error).name).toBe('AbortError');
+      },
+    );
+  });
+
+  // breaks-if-wrong: a signal that never fires leaves a normal answer intact
+  it('returns the answer when the signal does not fire', async () => {
+    await withServer(
+      (_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"ok":true}');
+      },
+      async (client) => {
+        await expect(client.get('/x', { signal: AbortSignal.timeout(5_000) })).resolves.toEqual({
+          ok: true,
+        });
+      },
+    );
   });
 });

@@ -37,6 +37,7 @@ import {
   buildStepLoopRuleInputs,
   type CoerceState,
   buildConcurrencyGroupContext,
+  buildLocalContext,
 } from './workflow-runner.js';
 import { createTempScope } from '@kici-dev/core/tmp';
 import { existsSync, readFileSync } from 'node:fs';
@@ -1553,6 +1554,35 @@ interface InvokeResultShape {
   status: string;
   outputs: Record<string, unknown>;
 }
+
+describe('buildLocalContext', () => {
+  const req = (repoUrl: string): JobExecutionRequest =>
+    ({
+      workflowName: 'w',
+      jobName: 'j',
+      runsOn: 'linux',
+      repoUrl,
+      ref: 'main',
+      sha: 'abc',
+      runId: 'run-1',
+      jobId: 'job-1',
+    }) as JobExecutionRequest;
+
+  it('the deferred statement names the repository of a GHES clone URL', () => {
+    // fails-when: a host-blind parser names a GitHub Enterprise Server repository unknown/unknown
+    expect(buildLocalContext(req('https://ghe.corp.example/acme/app.git')).repository).toBe(
+      'acme/app',
+    );
+  });
+
+  it('still names a github.com repository, including one with a dot in its name', () => {
+    // breaks-if-wrong: github.com clone URLs keep their owner/repo
+    expect(buildLocalContext(req('https://github.com/acme/app.git')).repository).toBe('acme/app');
+    expect(buildLocalContext(req('https://github.com/acme/my.app.git')).repository).toBe(
+      'acme/my.app',
+    );
+  });
+});
 
 describe('deriveFanout', () => {
   const req = (over: Partial<JobExecutionRequest>): JobExecutionRequest =>

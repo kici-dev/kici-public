@@ -1,7 +1,8 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { SourceManager } from './source-manager.js';
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
+import { SourceManager, type SourceManagerOptions } from './source-manager.js';
 import type { SourceStore, SourceWithSecrets } from './source-store.js';
 import type { Source } from '../db/types.js';
+import type { GitHubCloneTokenProvider } from '../providers/github/auth.js';
 
 // ── Mock helpers ──────────────────────────────────────────────────
 
@@ -40,6 +41,7 @@ function makeSource(overrides: Partial<Source> = {}): Source {
     name: 'Test App',
     routing_key: 'github:42',
     config: JSON.stringify({ appId: '42' }),
+    github_url: null,
     created_at: new Date(),
     updated_at: new Date(),
     ...overrides,
@@ -71,25 +73,34 @@ function createMockSourceStore(
   } as unknown as SourceStore;
 }
 
-// Mock the github provider constructors using classes
-vi.mock('../providers/github/index.js', () => ({
-  GitHubWebhookNormalizer: class {},
-  GitHubLockFileFetcher: class {
-    constructor(_config: any) {}
-  },
-  GitHubChangedFilesFetcher: class {
-    constructor(_config: any) {}
-  },
-  GitHubCloneTokenProvider: class {
-    constructor(_config: any) {}
-  },
-  GitHubRepoUrlBuilder: class {},
-  GitHubCheckStatusPoster: class {
-    constructor(_factory: any) {}
-  },
+// Mock the github provider constructors that fetch from GitHub; the normalizer, the
+// clone-token provider and the URL builder are real, so a test reads what the bundle builds.
+const { mockInfo } = vi.hoisted(() => ({ mockInfo: vi.fn() }));
+vi.mock('@kici-dev/shared', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@kici-dev/shared')>()),
+  createLogger: () => ({ info: mockInfo, warn: vi.fn(), error: vi.fn(), debug: vi.fn() }),
 }));
 
-vi.mock('../providers/github/auth.js', () => ({
+vi.mock('../providers/github/index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../providers/github/index.js')>();
+  return {
+    GitHubWebhookNormalizer: actual.GitHubWebhookNormalizer,
+    GitHubLockFileFetcher: class {
+      constructor(_config: any) {}
+    },
+    GitHubChangedFilesFetcher: class {
+      constructor(_config: any) {}
+    },
+    GitHubCloneTokenProvider: actual.GitHubCloneTokenProvider,
+    GitHubRepoUrlBuilder: actual.GitHubRepoUrlBuilder,
+    GitHubCheckStatusPoster: class {
+      constructor(_factory: any) {}
+    },
+  };
+});
+
+vi.mock('../providers/github/auth.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../providers/github/auth.js')>()),
   createInstallationOctokit: vi.fn(),
 }));
 
@@ -98,7 +109,7 @@ vi.mock('../providers/github/auth.js', () => ({
 describe('SourceManager', () => {
   let mockClient: ReturnType<typeof createMockPoolClient>;
   let mockPool: ReturnType<typeof createMockPool>;
-  let onSourcesChanged: ReturnType<typeof vi.fn>;
+  let onSourcesChanged: Mock<SourceManagerOptions['onSourcesChanged']>;
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -144,6 +155,67 @@ describe('SourceManager', () => {
       expect(sourceStore.listSources).toHaveBeenCalled();
       expect(sourceStore.getSourceWithSecrets).toHaveBeenCalledWith('github:42');
       expect(registry.getByRoutingKey('github:42')).toBeDefined();
+    });
+
+    /** The bundle the manager builds for one github:42 source with `config` and `githubUrl`. */
+    async function bundleFor(config: Record<string, unknown>, githubUrl: string | null = null) {
+      const overrides = { config: JSON.stringify(config), github_url: githubUrl };
+      const sourceStore = createMockSourceStore(
+        [makeSource(overrides)],
+        new Map([['github:42', makeSourceWithSecrets(overrides)]]),
+      );
+      const manager = new SourceManager({ pool: mockPool as any, sourceStore, onSourcesChanged });
+      return (await manager.start()).getByRoutingKey('github:42')!;
+    }
+
+    it('a GHES source builds a bundle whose clone URLs and Octokits use its server', async () => {
+      const bundle = await bundleFor({ appId: '42' }, 'https://ghe.corp.example');
+
+      // fails-when: the bundle drops the stored server, so clones and API calls go to github.com
+      expect(bundle.repoUrlBuilder!.buildCloneUrl('acme/app')).toBe(
+        'https://ghe.corp.example/acme/app.git',
+      );
+      expect((bundle.cloneTokenProvider as GitHubCloneTokenProvider).getAppConfig().githubUrl).toBe(
+        'https://ghe.corp.example',
+      );
+      // fails-when: the bundle does not name its server, so runs and mints fall back to github.com
+      expect(bundle.githubUrl).toBe('https://ghe.corp.example');
+      // The webhook credentials never carry the server: no reader trusts a run's
+      // provider context for it.
+      expect(bundle.normalizer.extractCredentials({ installation: { id: 5 } })).toEqual({
+        installationId: 5,
+      });
+    });
+
+    it('a source whose stored server is not a GitHub web URL builds no bundle', async () => {
+      // fails-when: the planted value becomes the bundle's server, or the source
+      //   falls back to github.com instead of being refused
+      expect(await bundleFor({ appId: '42' }, 'http://evil.example/x')).toBeUndefined();
+    });
+
+    // An earlier release's generic config update lets a scoped token store
+    // config.githubUrl during a rolling upgrade.
+    it('a githubUrl an older peer stored in config has no effect', async () => {
+      const bundle = await bundleFor({ appId: '42', githubUrl: 'https://evil.example' });
+      // fails-when: the config key becomes the bundle's server
+      expect(bundle.repoUrlBuilder!.buildCloneUrl('acme/app')).toBe(
+        'https://github.com/acme/app.git',
+      );
+      expect(bundle).not.toHaveProperty('githubUrl');
+    });
+
+    it('a github.com source builds a bundle with github.com URLs and no server', async () => {
+      const bundle = await bundleFor({ appId: '42' });
+
+      // breaks-if-wrong: github.com sources keep their clone URLs and App config
+      expect(bundle.repoUrlBuilder!.buildCloneUrl('acme/app')).toBe(
+        'https://github.com/acme/app.git',
+      );
+      expect((bundle.cloneTokenProvider as GitHubCloneTokenProvider).getAppConfig()).toEqual({
+        appId: '42',
+        privateKey: 'PEM-KEY-DATA',
+      });
+      expect(bundle).not.toHaveProperty('githubUrl');
     });
   });
 
@@ -201,6 +273,174 @@ describe('SourceManager', () => {
       await vi.advanceTimersByTimeAsync(250);
 
       expect(sourceStore.listSources).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe('a reload updates the registry start returned', () => {
+    it('serves a source added after start, keeps foreign bundles, and drops a removed one', async () => {
+      const sources: Source[] = [];
+      const secrets = new Map<string, SourceWithSecrets>();
+      const sourceStore = createMockSourceStore(sources, secrets);
+      const manager = new SourceManager({ pool: mockPool as any, sourceStore, onSourcesChanged });
+      // The registry the webhook pipeline, the dispatcher and the reporter hold from boot.
+      const registry = await manager.start();
+      const foreign = { normalizer: {} as never };
+      registry.register('generic', foreign);
+      expect(registry.hasExact('github:42')).toBe(false);
+
+      sources.push(makeSource());
+      secrets.set('github:42', makeSourceWithSecrets());
+      await manager.reload();
+
+      // fails-when: the reload builds a new registry, so the boot instance never learns
+      //   a source added while the orchestrator runs ("Unknown provider, skipping")
+      expect(registry.hasExact('github:42')).toBe(true);
+      expect(manager.getRegistry()).toBe(registry);
+      // breaks-if-wrong: bundles other components registered survive a reload
+      expect(registry.getByRoutingKey('generic:org:src')).toBe(foreign);
+
+      sources.length = 0;
+      await manager.reload();
+      expect(registry.hasExact('github:42')).toBe(false);
+      expect(registry.getByRoutingKey('generic:org:src')).toBe(foreign);
+    });
+
+    /** A started manager whose store lists no source yet but holds github:42's secrets. */
+    async function startWithEmptySources() {
+      const sourceStore = createMockSourceStore(
+        [],
+        new Map([['github:42', makeSourceWithSecrets()]]),
+      );
+      const manager = new SourceManager({ pool: mockPool as any, sourceStore, onSourcesChanged });
+      return { sourceStore, manager, registry: await manager.start() };
+    }
+
+    it('overlapping reloads apply in the order they were requested', async () => {
+      const { sourceStore, manager, registry } = await startWithEmptySources();
+
+      // The first reload reads a DB view that still has the source, and its read is slow.
+      let finishStaleRead!: (rows: Source[]) => void;
+      vi.mocked(sourceStore.listSources)
+        .mockImplementationOnce(() => new Promise((resolve) => (finishStaleRead = resolve)))
+        .mockResolvedValueOnce([]);
+
+      const stale = manager.reload();
+      const fresh = manager.reload();
+      await vi.advanceTimersByTimeAsync(0);
+      finishStaleRead([makeSource()]);
+      await Promise.all([stale, fresh]);
+
+      // fails-when: the second reload applies first and the stale one then re-registers
+      //   the source it removed
+      expect(registry.hasExact('github:42')).toBe(false);
+      expect(sourceStore.listSources).toHaveBeenCalledTimes(3);
+    });
+
+    it('a failed reload does not block the next one', async () => {
+      const { sourceStore, manager, registry } = await startWithEmptySources();
+
+      vi.mocked(sourceStore.listSources)
+        .mockRejectedValueOnce(new Error('db down'))
+        .mockResolvedValueOnce([makeSource()]);
+
+      await expect(manager.reload()).rejects.toThrow('db down');
+      // breaks-if-wrong: the queue keeps serving reloads after one fails
+      await manager.reload();
+      expect(registry.hasExact('github:42')).toBe(true);
+    });
+
+    it('a burst of reloads during a running one costs one more DB read, and the last view stays', async () => {
+      const { sourceStore, manager, registry } = await startWithEmptySources();
+
+      let finishRunningRead!: (rows: Source[]) => void;
+      vi.mocked(sourceStore.listSources)
+        .mockImplementationOnce(() => new Promise((resolve) => (finishRunningRead = resolve)))
+        .mockResolvedValueOnce([makeSource()]);
+
+      const running = manager.reload();
+      await vi.advanceTimersByTimeAsync(0);
+      const burst = [manager.reload(), manager.reload(), manager.reload(), manager.reload()];
+      finishRunningRead([]);
+      await Promise.all([running, ...burst]);
+
+      // fails-when: every queued request reads the DB again (N requests -> N reads)
+      expect(sourceStore.listSources).toHaveBeenCalledTimes(3);
+      // breaks-if-wrong: the coalesced reload still reads after the last request and applies
+      expect(registry.hasExact('github:42')).toBe(true);
+    });
+
+    it('the boot load waits for a slow DB read; a later reload is bounded', async () => {
+      const sourceStore = createMockSourceStore(
+        [],
+        new Map([['github:42', makeSourceWithSecrets()]]),
+      );
+      let finishBootRead!: (rows: Source[]) => void;
+      vi.mocked(sourceStore.listSources).mockImplementationOnce(
+        () => new Promise((resolve) => (finishBootRead = resolve)),
+      );
+      const manager = new SourceManager({
+        pool: mockPool as any,
+        sourceStore,
+        onSourcesChanged,
+        reloadTimeoutMs: 1_000,
+      });
+
+      mockInfo.mockClear();
+      const started = manager.start();
+      await vi.advanceTimersByTimeAsync(5_000);
+      // fails-when: a boot read that hangs leaves no log line
+      expect(mockInfo).toHaveBeenCalledWith('Loading sources from the database');
+      expect(mockInfo).not.toHaveBeenCalledWith('Loaded sources', expect.anything());
+      finishBootRead([makeSource()]);
+      // fails-when: a boot read slower than the reload bound fails startup
+      const registry = await started;
+      expect(registry.hasExact('github:42')).toBe(true);
+      expect(mockInfo).toHaveBeenCalledWith('Loaded sources', {
+        count: 1,
+        elapsedMs: expect.any(Number),
+      });
+      const loaded = mockInfo.mock.calls.find(([message]) => message === 'Loaded sources')!;
+      expect((loaded[1] as { elapsedMs: number }).elapsedMs).toBeGreaterThanOrEqual(5_000);
+
+      // breaks-if-wrong: a later reload keeps its bound
+      vi.mocked(sourceStore.listSources).mockImplementationOnce(() => new Promise(() => undefined));
+      const later = manager.reload();
+      const laterResult = expect(later).rejects.toThrow('Source reload timed out after 1000ms');
+      await vi.advanceTimersByTimeAsync(1_000);
+      await laterResult;
+    });
+
+    it('a DB read that never answers fails its reload and lets the next one run', async () => {
+      const sourceStore = createMockSourceStore(
+        [],
+        new Map([['github:42', makeSourceWithSecrets()]]),
+      );
+      const manager = new SourceManager({
+        pool: mockPool as any,
+        sourceStore,
+        onSourcesChanged,
+        reloadTimeoutMs: 1_000,
+      });
+      const registry = await manager.start();
+
+      let finishHungRead!: (rows: Source[]) => void;
+      vi.mocked(sourceStore.listSources)
+        .mockImplementationOnce(() => new Promise((resolve) => (finishHungRead = resolve)))
+        .mockResolvedValueOnce([makeSource()]);
+
+      const hung = manager.reload();
+      const hungResult = expect(hung).rejects.toThrow('Source reload timed out after 1000ms');
+      const next = manager.reload();
+      await vi.advanceTimersByTimeAsync(1_000);
+      // fails-when: the queue waits on the hung read forever and the next reload never runs
+      await hungResult;
+      await next;
+      expect(registry.hasExact('github:42')).toBe(true);
+
+      // A late answer from the timed-out read is discarded, not applied over the newer view.
+      finishHungRead([]);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(registry.hasExact('github:42')).toBe(true);
     });
   });
 

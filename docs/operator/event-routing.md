@@ -270,21 +270,21 @@ curl -X POST https://<orchestrator>/api/v1/admin/generic-sources \
 
 ### Configuration options
 
-| Field                  | Type     | Required | Description                                                                |
-| ---------------------- | -------- | -------- | -------------------------------------------------------------------------- |
-| `customerId`           | string   | yes      | Customer or organization identifier, up to 255 characters                  |
-| `name`                 | string   | yes      | Human-readable source name (unique per customer)                           |
-| `verificationMethod`   | enum     | no       | `hmac_sha256`, `bearer_token`, `ip_allowlist`, or `none` (default: `none`) |
-| `verificationConfig`   | object   | no       | Method-specific config (see below)                                         |
-| `eventTypeHeader`      | string   | no       | HTTP header for event type extraction (default: `X-Event-Type`)            |
-| `eventTypePath`        | string   | no       | JSONPath in payload for event type extraction                              |
-| `idempotencyKeyHeader` | string   | no       | HTTP header for idempotency key                                            |
-| `idempotencyKeyPath`   | string   | no       | JSONPath in payload for idempotency key                                    |
-| `dedupWindowSeconds`   | integer  | no       | Deduplication window in seconds                                            |
-| `maxPayloadBytes`      | integer  | no       | Maximum payload size in bytes                                              |
-| `allowedEvents`        | string[] | no       | Allowlist of accepted event types                                          |
-| `stripHeaders`         | string[] | no       | Headers to strip before passing to workflows                               |
-| `rateLimitRpm`         | integer  | no       | Rate limit: requests per minute                                            |
+| Field                  | Type     | Required | Description                                                                       |
+| ---------------------- | -------- | -------- | --------------------------------------------------------------------------------- |
+| `customerId`           | string   | yes      | Customer or organization identifier, up to 255 characters                         |
+| `name`                 | string   | yes      | Human-readable source name (unique per customer)                                  |
+| `verificationMethod`   | enum     | no       | `hmac_sha256`, `bearer_token`, `ip_allowlist`, or `none` (default: `hmac_sha256`) |
+| `verificationConfig`   | object   | no       | Method-specific config (see below)                                                |
+| `eventTypeHeader`      | string   | no       | HTTP header for event type extraction (default: `X-Event-Type`)                   |
+| `eventTypePath`        | string   | no       | JSONPath in payload for event type extraction                                     |
+| `idempotencyKeyHeader` | string   | no       | HTTP header for idempotency key                                                   |
+| `idempotencyKeyPath`   | string   | no       | JSONPath in payload for idempotency key                                           |
+| `dedupWindowSeconds`   | integer  | no       | Deduplication window in seconds                                                   |
+| `maxPayloadBytes`      | integer  | no       | Maximum payload size in bytes                                                     |
+| `allowedEvents`        | string[] | no       | Allowlist of accepted event types                                                 |
+| `stripHeaders`         | string[] | no       | Headers to strip before passing to workflows                                      |
+| `rateLimitRpm`         | integer  | no       | Rate limit: requests per minute                                                   |
 
 ### Verification methods
 
@@ -325,7 +325,7 @@ The CLI (`kici-admin source add generic` and `source update-generic`) does not e
 ```json
 {
   "verificationMethod": "ip_allowlist",
-  "verificationConfig": { "allowedIps": ["10.0.0.1", "10.0.0.2"] }
+  "verificationConfig": { "allowlist": ["10.0.0.1", "10.0.0.2"] }
 }
 ```
 

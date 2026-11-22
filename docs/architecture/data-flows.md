@@ -23,13 +23,13 @@ GitHub  -->  Platform Relay  -->  Orchestrator  -->  Agent
 2. **Platform routes the webhook** to the right orchestrator over WebSocket and forwards the body bytes verbatim. Platform never sees customer HMAC secrets — signature verification happens entirely on the orchestrator after reassembly.
 3. **Orchestrator admits the delivery**, then **verifies the signature** (HMAC-SHA256 against per-source webhook secret, with dual-secret rotation support). Admission runs first, on the routing key alone: when the ingest admission controller sheds, the orchestrator records an `event_log` breadcrumb with status `shed` and ACKs `shed_retry_later`, which the Platform answers as **429** with `Retry-After`. See [ingest admission shed](./webhooks/webhook-delivery.md#ingest-admission-shed-step-3).
 4. **Orchestrator dedup check** against dual-layer `DedupCache` (in-memory set + `dedup_cache` DB table).
-5. **Orchestrator resolves provider** by looking up the provider bundle from the `ProviderRegistry` using `getByRoutingKey()` (exact match first, falls back to provider type prefix for backward compatibility; a `generic:` key falls back only to the shared `generic:default` bundle, never to another source's). Skips processing if the provider is unknown.
-6. **Orchestrator normalizes** the webhook via the provider's `WebhookNormalizer` (extracts branch, event type, action, sender).
+5. **Orchestrator resolves provider** by looking up the provider bundle from the `ProviderRegistry` using `getByRoutingKey()` (exact match first; a key with no bundle of its own falls back only to its provider type's default bundle, such as `generic:default`, never to another source's). Skips processing if the provider is unknown.
+6. **Orchestrator normalizes** the webhook via the provider's `WebhookNormalizer` (extracts branch, event type, action, sender). For a generic delivery, the orchestrator then dispatches the matching registrations of other sources in the org. A plain generic delivery that had candidates ends there. See [cross-source delivery](./webhooks/webhook-delivery.md#cross-source-delivery).
 7. **Orchestrator extracts repo and credentials** from payload (repository identifier from `repository.full_name`, provider credentials such as GitHub installation ID).
 8. **Orchestrator handles /kici commands** in `issue_comment` events: intercepts `/kici approve` and `/kici reject` approval commands before trigger matching, delegating to `handleApprovalComment()` for security hold management.
-9. **Orchestrator resolves trust** for PR events (determines lock file source: head vs base branch).
+9. **Orchestrator resolves trust** for PR events (determines lock file source: head vs base branch). It then evaluates the org fork switch. An `ignore` verdict drops the delivery before any lock file is fetched.
 10. **Orchestrator fetches lock file** via the provider's `LockFileFetcher` (cached with LRU). For untrusted PR events, fetches both base and head lock files in parallel; for trusted PRs and pushes, fetches from head SHA.
-11. **Orchestrator detects workflow modifications** for untrusted PR events by comparing base and head lock files via `detectWorkflowModifications()`, applying security holds when non-trusted contributors modify workflow files.
+11. **Orchestrator detects workflow modifications** for untrusted PR events by comparing base and head lock files via `detectWorkflowModifications()`, and posts the neutral `KiCI: Workflow changes` check. The check is informational and feeds no dispatch decision: the run evaluates the base lock file.
 12. **Orchestrator extracts registrations** on default-branch pushes: persists registerable workflows (event, schedule, lifecycle triggers) for cluster-wide event matching.
 13. **Orchestrator notifies the event router** on default-branch pushes: after the registrations are persisted, emits a `registration.updated` event via `eventRouter.emit()` (if event routing is active). Workflow event subscriptions are the persisted registrations themselves, matched at emit time through the registration index.
 14. **Orchestrator resolves changed files** via the provider's `ChangedFilesFetcher` for path-based trigger filtering (`skipped` when no workflow uses path filters). No fetcher, a truncated list, or an API failure resolves as `unavailable`: a path filter then matches, and when the event has a git range the agent decides it from its clone in an `__init__` job.
@@ -81,7 +81,7 @@ See [Job execution lifecycle](./execution/job-execution.md) for details.
 
 1. **Acknowledge and report running** -- Send `job.ack` on accepting the dispatch (a busy or draining agent sends `job.reject` instead), then `job.status: running`
 2. **Sandbox selection** -- Determine execution mode (container, bare-metal, firecracker) from job config and environment
-3. **Sandbox setup** -- Create and start the execution environment (container: `docker create`/`start`; bare-metal: validate; firecracker: detect)
+3. **Sandbox setup** -- Create and start the execution environment (container: `docker create`/`start`; bare-metal: validate; firecracker: none, because the scaler already booted the VM)
 4. **Context emission** -- Send `job.context` to orchestrator with runtime details (Node version, OS, arch, sandbox type)
 5. **Sandbox execution** -- The sandbox child process handles the inner pipeline: `.kici/` source tarball restore, deps tarball restore, workflow loading (dynamic-import `.ts` via the shared TypeScript ESM loader hook), step extraction, rule evaluation, step execution sequentially with timeout and abort support. There is no runtime bundling step — workflow TS is transformed on import, not ahead of time.
 6. **IPC callbacks** -- Step status, log lines, event emissions, and concurrency reports flow from the sandbox to the agent via IPC, then to the orchestrator via WebSocket
@@ -159,8 +159,8 @@ Build Job Dispatch --> Build Agent (kici:role:builder + matching kici:os:/kici:a
   |                      |-- Pack .kici/node_modules (portable tar.gz)
   |                      |-- Upload source tarball to cache (source/v2/{orgId}/{sourceTarDigest}.tar.gz)
   |                      |-- Upload deps tarball to cache (deps/{plat}-{arch}/{depsHash}.tar.gz)
-  |                      |-- Upload deps companion .hash file
-  |                      |-- Report success (cache.upload.complete × 2)
+  |                      |-- Report each upload (cache.upload.complete × 2)
+  |                      |     (the orchestrator then publishes the .hash pointers)
   |                      |
   v                      v
 Build Complete <---------+
@@ -234,7 +234,7 @@ After the cache probe and before any build job, a single orchestrator checks the
 
 ### Cross-source / no-contentHash workflows
 
-- **A workflow entry without `contentHash`** skips the source cache entirely, and agents compile from source. The compiler writes a `contentHash` for every workflow, and a lock old enough to lack one (schema v1) is below the oldest supported schema version, so the orchestrator rejects it when it fetches the lock. Regenerate it with `kici compile`. The current lock file schema version is 44.
+- **A workflow entry without `contentHash`** skips the source cache entirely, and agents compile from source. The compiler writes a `contentHash` for every workflow. A lock old enough to lack one (schema v1) is below the oldest supported schema version, so the orchestrator rejects it when it fetches the lock. Regenerate it with `kici compile`. The current lock file schema version is 45.
 - **Cross-source dispatch** (a workflow registered against source A fired by a generic webhook on source B) bypasses both caches. The registration's lock file entry still carries `contentHash`, but the cross-source path always clone-and-installs — the eval temp dir doesn't ship `@kici-dev/sdk`. The execution agent still verifies `contentHash` against the cloned source for drift detection.
 - **Global-workflow dispatch** (a workflow defined in repository A with `repos:`, fired by an event from repository B) uses both caches when A's registration records a commit. The build job packs A's `.kici/` at that commit under A's `contentHash`, and the dependency cache is keyed by the `lockfileHash` and `siblingsDigest` the registration stored from A's lock file. A registration with no commit clones and installs on the agent. See [global workflows](global-workflows.md#which-repository-each-decision-uses).
 
@@ -280,8 +280,9 @@ Cache keys reflect that source tarballs and deps have different platform charact
 
 - **Source:** `source/v2/{orgId}/{sourceTarDigest}.tar.gz`, with a `source/v2/{orgId}/{contentHash}.hash` pointer — platform-agnostic, and scoped to the owning organization so two repositories with matching `.kici/` trees never share one object. Raw TypeScript source is identical regardless of CPU architecture, so one entry is shared across all platforms. `contentHash` is the per-workflow hash from the lock file (`SHA-256(COMPILE_SCHEMA_VERSION + ":" + treeDigest [+ "\0" + assetDigest])`, where `treeDigest` covers every file under `.kici/` except the paths `.kici/.kiciignore` declares, `COMPILE_SCHEMA_VERSION = 7`, and line endings are normalized to LF so the hash agrees across platforms).
 - **Deps:** `deps/{platform}-{arch}/{depsHash}.tar.gz`, with a
-  `deps/{platform}-{arch}/{lockfileHash}.hash` pointer holding that hash — the
-  tarball is addressed by its own content, so two builds sharing a lock file
+  `deps/{platform}-{arch}/{lockfileHash}.hash` pointer holding that hash
+  (`{lockfileHash}-{siblingsDigest}.hash` when the lock carries a sibling digest).
+  The tarball is addressed by its own content, so two builds sharing a lock file
   cannot leave a tarball and an integrity hash that disagree. Platform-specific. Native dependencies in `node_modules` differ across architectures, so each platform/arch combination gets its own cache entry.
 
 The orchestrator derives the target platform/arch for dep cache lookups by probing `AgentRegistry.findAvailable()` with the workflow's first job's `runsOn` labels to find a representative matching agent, then using that agent's platform and arch. Falls back to `linux/x64` if no matching agents are registered.
@@ -300,27 +301,27 @@ Agents upload artifacts directly to S3 using pre-signed PUT URLs. This eliminate
 Agent                         Orchestrator                    S3
   |                                |                           |
   |-- cache.upload.request ------->|                           |
-  |   { type: "source"|"dep",     |                           |
-  |     key: "source/..." or       |                           |
-  |          "deps/..." }          |                           |
-  |                                |-- getUploadUrl(key) ----->|
+  |   { cacheType: "source"|"deps",|                           |
+  |     platform, arch,            |                           |
+  |     sourceTarDigest|depsHash } |                           |
+  |                                |-- getUploadUrl(hash) ---->|
   |                                |   (PutObject pre-sign)    |
   |<-- cache.upload.response ------|                           |
-  |   { url: "https://s3.../..." } |                           |
+  |   { uploadUrl: "https://..." } |                           |
   |                                |                           |
   |-- HTTP PUT (artifact body) --------------------------->|
   |   (direct S3 upload)           |                           |
   |                                |                           |
   |-- cache.upload.complete ------>|                           |
-  |   { type, key, depsHash? }     |-- initMeta(key) -------->|
-  |                                |   (CopyObject to set     |
-  |                                |    TTL metadata)          |
-  |                                |-- put(hashKey) --------->|
-  |                                |   (companion .hash file   |
-  |                                |    for deps integrity)    |
+  |   { cacheType, platform, arch, |-- initMeta(key) -------->|
+  |     contentHash|lockfileHash,  |   (CopyObject to set     |
+  |     sourceTarDigest|depsHash } |    TTL metadata)          |
+  |                                |-- publishPointer() ------>|
+  |                                |   (.hash pointer to the   |
+  |                                |    uploaded tarball)      |
 ```
 
-The two-phase metadata approach (`upload via PUT` then `initMeta via CopyObject`) works around the limitation that S3 pre-signed URLs cannot include custom metadata headers. For dependency tarballs, the agent also reports the SHA-256 content hash in `cache.upload.complete`; the orchestrator stores it as a companion `.hash` file alongside the tarball. When dispatching execution jobs, the orchestrator reads this hash and includes it as `depsHash` in `job.dispatch`, enabling agent-side integrity verification on download. Source tarballs carry their own SHA-256 as `sourceTarDigest` in `job.dispatch`, verified before extraction; the workflow `contentHash` is then re-computed against the extracted source to verify it against the lock file, which covers drift end-to-end.
+The two-phase metadata approach (`upload via PUT` then `initMeta via CopyObject`) works around the limitation that S3 pre-signed URLs cannot include custom metadata headers. The agent hashes each tarball first and names that hash in `cache.upload.request` and `cache.upload.complete`. After the upload lands, the orchestrator publishes the `.hash` pointer: `{lockfileHash}.hash` names the dependency tarball and `{contentHash}.hash` names the source tarball. When it dispatches execution jobs, the orchestrator reads these pointers and includes the hashes as `depsHash` and `sourceTarDigest` in `job.dispatch`. The agent verifies each tarball against its hash on download, before extraction. It then re-computes the workflow `contentHash` against the extracted source and compares it with the lock file, which covers drift end-to-end.
 
 The orchestrator holds the build job's terminal success until the metadata copy and the pointer write for every upload it reported have finished, bounded by the org's cache upload settle timeout (default 10 seconds). The jobs that wait on the build read the cache when that success is handled, so they get the URLs of the tarballs the build just uploaded.
 
@@ -633,10 +634,10 @@ Agent                    Orchestrator             Platform              GitHub
   |   (completed/failed)     |                     |                  |
   |                          |-- execution.status ->|                  |
   |                          |   (run metadata)     |-- upsert        |
-  |                          |                      |   execution_runs |
+  |                          |                      |   run projection |
   |                          |-- job.status.forward>|                  |
   |                          |   (job metadata)     |-- upsert        |
-  |                          |                      |   execution_jobs |
+  |                          |                      |   job projection |
   |                          |-- GitHub Checks API ---------------------->|
   |                          |   (check run update)  |                  |
   |                          |                      |                  |
@@ -659,11 +660,11 @@ Dashboard                    Platform                         Orchestrator
     |                          |                              |
     |-- POST /orgs/:id/runs/  ->|                              |
     |   :runId/rerun (auth)    |-- Cooldown check             |
-    |                          |   (last_rerun_at < 5s ago?)  |
+    |                          |   (last re-run < 5s ago?)    |
     |                          |                              |
     |                          |-- run.rerun.request (WS) --->|
     |                          |   { runId, actor,            |
-    |                          |     routingKey? }            |
+    |                          |     routingKey }             |
     |                          |                              |-- Load original run from DB
     |                          |                              |-- Read webhook payload from storage
     |                          |                              |-- Re-fetch lock file at original SHA
@@ -671,7 +672,7 @@ Dashboard                    Platform                         Orchestrator
     |                          |<- run.rerun.response (WS) ---|
     |                          |   { newRunId }               |
     |<- 200 { newRunId } ------|                              |
-    |                          |-- UPDATE last_rerun_at       |
+    |                          |-- Start re-run cooldown      |
     |-- Navigate to new run    |                              |
     |                          |                              |-- Dispatch through the shared pipeline
     |                          |                              |   (detached from the request)
@@ -683,8 +684,8 @@ Dashboard                    Platform                         Orchestrator
 Key design points:
 
 - **Answered once accepted:** The orchestrator answers `run.rerun.response` once it has validated the re-run and claimed its request id, before the dispatch. A dispatch can wait minutes on a cold source or dependency cache, while the relayed request has ten seconds. A dispatch that fails after the answer fails the new run, and the run's failure reason says why. When the relay times out, the Platform answers 504 with `run_start_unconfirmed`: the run may still start, so clients point at the run list instead of offering a retry. A schedule fired by hand ("Run now") is answered the same way.
-- **Cooldown enforcement:** The Platform enforces a 5-second cooldown per original run via the `last_rerun_at` column, on the HTTP route and on the MCP `rerun_run` tool. Rapid re-run attempts receive 429 Too Many Requests. The cooldown starts when the orchestrator accepts the re-run, and also when the relay times out (504 `run_start_unconfirmed`), because the run may still start. A refusal (400 or 410) or no connected orchestrator (503) starts no cooldown. A request that rejoins a live run-start intent skips the cooldown.
-- **Retry of an unconfirmed start:** Before it relays a re-run or a "Run now", the Platform records a run-start intent (`run_start_intents`): the organization, the action and its target, the principal, and the request id. While the intent is live, a request for the same action by the same principal relays the same request id, so the orchestrator's request-id claim answers it with the run the first request started and sets `alreadyAccepted: true`. The Platform deletes the intent when an orchestrator answer comes back (a run id or a refusal). A timeout, a shutdown or a send failure keeps it. The intent expires 30 minutes after the first send and is never extended, so it ends before the orchestrator prunes its one-hour claim. The `run-start-intent-sweep` job deletes expired intents. Another principal is another intent.
+- **Cooldown enforcement:** The Platform enforces a 5-second cooldown per original run, on the HTTP route and on the MCP `rerun_run` tool. Rapid re-run attempts receive 429 Too Many Requests. The cooldown starts when the orchestrator accepts the re-run, and also when the relay times out (504 `run_start_unconfirmed`), because the run may still start. A refusal (400 or 410) or no connected orchestrator (503) starts no cooldown. A request that rejoins a live run-start intent skips the cooldown.
+- **Retry of an unconfirmed start:** Before it relays a re-run or a "Run now", the Platform records a run-start intent: the organization, the action and its target, the principal, and the request id. While the intent is live, a request for the same action by the same principal relays the same request id. The orchestrator's request-id claim then answers it with the run the first request started and sets `alreadyAccepted: true`. The Platform deletes the intent when an orchestrator answer comes back (a run id or a refusal). A timeout, a shutdown or a send failure keeps it. The intent expires 30 minutes after the first send and is never extended, so it ends before the orchestrator prunes its one-hour claim. A scheduled sweep deletes expired intents. Another principal is another intent.
 - **Payload reuse:** The orchestrator reads the original webhook payload from filesystem/object storage, and the dispatch pipeline stores it for the new run (enabling re-run of re-runs).
 - **Lock file at original SHA:** The lock file is re-fetched at the original commit SHA, ensuring the re-run uses the same workflow definition.
 - **Lineage tracking:** The new run has `parent_run_id` pointing to the immediate parent run, `original_run_id` pointing to the root ancestor run (for chain traversal), and `triggered_by` recording the user identity.
@@ -710,7 +711,7 @@ Dashboard                    Platform                         Orchestrator      
     |                          |   { cancelledJobs: N }       |                    |
     |                          |                              |<- job.status -------|
     |<- 200 { cancelledJobs } -|                              |   (cancelled)      |
-    |                          |-- UPDATE cancelled_by        |                    |
+    |                          |-- Record who cancelled       |                    |
     |                          |                              |                    |
 ```
 
@@ -760,7 +761,7 @@ GitHub         Platform                  Orchestrator              Agent
   |              |-- requestContext.run()  |                       |
   |              |   (requestId)          |                       |
   |              |                        |                       |
-  |              |-- webhook.relay (WS) ->|                       |
+  |              |-- webhook.relay.start->|                       |
   |              |   { ..., requestId }   |                       |
   |              |                        |-- requestContext.run() |
   |              |                        |   (requestId)         |
@@ -784,7 +785,7 @@ GitHub         Platform                  Orchestrator              Agent
 
 1. **Platform ingestion:** The webhook handler generates a `requestId` (UUID) and wraps the entire request in `requestContext.run()`. All log lines within this async scope automatically include `requestId`.
 
-2. **WebSocket relay:** The `requestId` is included in the `webhook.relay` message sent to the orchestrator. For cross-instance relay (via Valkey pub/sub), the `requestId` is serialized in the notification payload.
+2. **WebSocket relay:** The `requestId` is included in the `webhook.relay.start` message, the first frame of the chunked relay to the orchestrator. For cross-instance relay (via Valkey pub/sub), the `requestId` is serialized in the notification payload.
 
 3. **Orchestrator processing:** The orchestrator wraps webhook processing in `requestContext.run()` using the `requestId` from the relay message (falling back to a new UUID for backward compatibility). When a `runId` is generated for job dispatch, it is enriched into the existing context via `enrichRequestContext()`.
 

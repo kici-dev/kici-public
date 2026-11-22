@@ -153,15 +153,20 @@ describe('POST /sources/:routingKey/redeliver', () => {
     expect(redeliverDeliveries).not.toHaveBeenCalled();
   });
 
-  it('returns 404 for an unknown source', async () => {
+  it('returns a 404 that names the decoded routing key for an unknown source', async () => {
+    const getSourceWithSecrets = vi.fn().mockResolvedValue(null);
     const app = createSourceRoutes({
-      sourceStore: createMockSourceStore(),
+      sourceStore: createMockSourceStore({ getSourceWithSecrets }),
       redeliverDeliveries: stubRedeliver(),
     });
 
-    const res = await post(app, WINDOW);
+    const res = await post(app, WINDOW, encodeURIComponent('github:100%done'));
 
     expect(res.status).toBe(404);
+    // fails-when: the route looks up or reports the still-encoded key (github%3A100%25done)
+    // breaks-if-wrong: the `Source not found` prefix the kici-admin output carries must stay
+    expect(await res.json()).toEqual({ error: 'Source not found: github:100%done' });
+    expect(getSourceWithSecrets).toHaveBeenCalledWith('github:100%done');
   });
 
   it('returns 400 for a non-GitHub source', async () => {

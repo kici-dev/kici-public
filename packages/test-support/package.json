@@ -18,6 +18,10 @@
       "import": "./dist/logger-mock.js",
       "types": "./dist/logger-mock.d.ts"
     },
+    "./git-repo-snapshot": {
+      "import": "./dist/git-repo-snapshot.js",
+      "types": "./dist/git-repo-snapshot.d.ts"
+    },
     "./http": {
       "import": "./dist/http.js",
       "types": "./dist/http.d.ts"

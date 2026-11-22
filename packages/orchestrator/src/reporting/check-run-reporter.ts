@@ -18,9 +18,12 @@
  */
 
 import { createLogger, getRequestContext, toErrorMessage } from '@kici-dev/shared';
-import { Octokit } from '@octokit/rest';
-import { createAppAuth } from '@octokit/auth-app';
-import { createInstallationOctokit, type GitHubAppConfig } from '../providers/github/auth.js';
+import type { Octokit } from '@octokit/rest';
+import {
+  createAppOctokit,
+  createInstallationOctokit,
+  type GitHubAppConfig,
+} from '../providers/github/auth.js';
 import { githubCheckRunTotal } from '../metrics/prometheus.js';
 import { buildReducedPrivilegeNote } from '../security/reduced-privilege-note.js';
 import type { ProviderRegistry } from '../provider-registry.js';
@@ -1161,10 +1164,7 @@ export class CheckRunReporter {
       return;
     }
 
-    const appOctokit = new Octokit({
-      authStrategy: createAppAuth,
-      auth: { appId: githubConfig.appId, privateKey: githubConfig.privateKey },
-    });
+    const appOctokit = createAppOctokit(githubConfig);
 
     let installationId: number;
     try {

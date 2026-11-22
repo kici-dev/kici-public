@@ -5,7 +5,12 @@
  */
 
 import { statSync } from 'node:fs';
-import { type SourceProvider, SourceSubtype } from '@kici-dev/engine';
+import {
+  type RepoUrlBuilder,
+  type SourceProvider,
+  SourceSubtype,
+  repoIdentifierFromUrl,
+} from '@kici-dev/engine';
 import { LocalSourceConfigSchema } from './providers/local/local-source-config.js';
 import { safeJsonParse } from './helpers/json.js';
 
@@ -105,13 +110,18 @@ export function genericProviderTypeToSubtype(
 }
 
 /**
- * Extract repo identifier (owner/repo) from a git clone URL.
- * e.g., "https://github.com/myorg/myrepo.git" -> "myorg/myrepo"
+ * The lock-file URL a dispatched job carries: the source's raw-file URL for
+ * the repository of `repoUrl` at `sha`, on any git host, or
+ * `<repoUrl>/raw/<sha>/.kici/kici.lock.json` when the source builds no URLs.
  */
-export function extractRepoIdentifier(repoUrl: string): string {
-  // Match provider URLs: github.com/owner/repo, gitlab.com/namespace/project, etc.
-  const match = repoUrl.match(/(?:github|gitlab|bitbucket)\.\w+\/([^/]+\/[^/.]+)/);
-  return match ? match[1] : 'unknown/unknown';
+export function dispatchLockFileUrl(
+  repoUrlBuilder: RepoUrlBuilder | undefined,
+  repoUrl: string,
+  sha: string,
+): string {
+  return repoUrlBuilder
+    ? repoUrlBuilder.buildRawFileUrl(repoIdentifierFromUrl(repoUrl), sha, '.kici/kici.lock.json')
+    : `${repoUrl.replace(/\.git$/, '')}/raw/${sha}/.kici/kici.lock.json`;
 }
 
 /**

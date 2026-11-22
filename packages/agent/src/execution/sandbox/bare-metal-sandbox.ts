@@ -22,6 +22,11 @@ import type {
   JobExecutionResult,
 } from './types.js';
 import { createForkRunner, fileCloneSourceBinds, type ForkRunnerHandle } from './fork-runner.js';
+import {
+  applyTrustPathPlan,
+  planTrustPathMounts,
+  type TrustPathMount,
+} from './host-trust-paths.js';
 
 const logger = createLogger({ prefix: 'bare-metal-sandbox' });
 
@@ -40,6 +45,12 @@ interface BareMetalSandboxOptions {
   /** Pre-sanitized (system allowlist + user env). */
   env: Record<string, string>;
   /**
+   * The TLS trust settings in `env` that the agent host supplied
+   * (`hostSuppliedTrustPaths`). bwrap mounts each usable path read-only under
+   * `TRUST_MOUNT_ROOT`, since its private /etc holds only the files it binds.
+   */
+  hostTrustPaths?: Record<string, string>;
+  /**
    * When true (and bwrap is off), spawn the runner in its own process group so
    * the between-jobs phase can reap a backgrounded daemon. Default true.
    */
@@ -56,6 +67,7 @@ export class BareMetalSandbox implements ExecutionSandbox {
   private readonly useBwrap: boolean;
   private readonly sandboxNetwork: 'isolated' | 'host';
   private readonly env: Record<string, string>;
+  private readonly hostTrustPaths: Record<string, string>;
   private readonly orphanCleanup: boolean;
   private readonly runnerUser: string | undefined;
   private runner: ForkRunnerHandle | null = null;
@@ -68,6 +80,7 @@ export class BareMetalSandbox implements ExecutionSandbox {
     this.useBwrap = options.sandbox;
     this.sandboxNetwork = options.sandboxNetwork ?? 'isolated';
     this.env = options.env;
+    this.hostTrustPaths = options.hostTrustPaths ?? {};
     this.orphanCleanup = options.orphanCleanup ?? true;
     this.runnerUser = options.runnerUser;
   }
@@ -125,7 +138,7 @@ export class BareMetalSandbox implements ExecutionSandbox {
     this.runner = createForkRunner(
       {
         runnerPath: this.runnerPath,
-        env: this.env,
+        ...this.envWithTrustMounts(),
         useBwrap: this.useBwrap,
         workDir: this.workDir,
         // Opt-out via KICI_SANDBOX_NETWORK=host; 'isolated' (default) is loopback only.
@@ -140,6 +153,29 @@ export class BareMetalSandbox implements ExecutionSandbox {
     );
 
     return this.runner.result;
+  }
+
+  /**
+   * The runner env and, under bwrap, the host TLS trust mounts: each usable
+   * path mounts read-only under TRUST_MOUNT_ROOT with its setting rewritten,
+   * as in the container sandbox, and a setting with no usable host path is
+   * dropped. A host job without bwrap sees the host filesystem and keeps the
+   * plain pass-through.
+   */
+  private envWithTrustMounts(): {
+    env: Record<string, string>;
+    readOnlyMounts?: TrustPathMount[];
+    unsetEnv?: string[];
+  } {
+    if (!this.useBwrap) return { env: this.env };
+    // fails-when: a host trust path outside the default binds (e.g. /etc/pki)
+    // is not mounted, and git under bwrap fails on the missing CA bundle.
+    const plan = planTrustPathMounts(this.hostTrustPaths);
+    return {
+      env: applyTrustPathPlan(this.env, plan),
+      readOnlyMounts: plan.mounts,
+      unsetEnv: plan.unavailableKeys,
+    };
   }
 
   /** Sends the abort IPC message and SIGTERM, then SIGKILL after the grace period (30s default). */
@@ -182,7 +218,7 @@ export class BareMetalSandbox implements ExecutionSandbox {
     const handle = createForkRunner(
       {
         runnerPath: this.runnerPath,
-        env: this.env,
+        ...this.envWithTrustMounts(),
         useBwrap: this.useBwrap,
         workDir,
         networkIsolation: this.useBwrap && this.sandboxNetwork === 'isolated',

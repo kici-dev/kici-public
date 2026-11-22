@@ -12,6 +12,7 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import {
   PgSecretStore,
+  looksLikeCiphertext,
   SecretScopeExistsError,
   SecretScopeNotFoundError,
 } from './pg-secret-store.js';
@@ -791,5 +792,19 @@ describe('loadOldMasterKey', () => {
     const result = loadOldMasterKey();
     expect(result).toBeInstanceOf(Buffer);
     expect(result!.length).toBe(32);
+  });
+});
+
+describe('looksLikeCiphertext', () => {
+  it('reads the store envelope as ciphertext, and a legacy plaintext value as not', () => {
+    const key = Buffer.alloc(32, 7);
+    // fails-when: an encrypted row is read as plaintext, so a foreign key passes the check
+    for (const value of ['', 'x', 'a much longer secret value than the iv and tag']) {
+      expect(looksLikeCiphertext(encrypt(value, key, 1, 'o:s:k').data), value).toBe(true);
+    }
+    // breaks-if-wrong: the plaintext an old direct write stored never counts as another key
+    for (const value of ['hunter2', 'plain token', 'ghp_short', 'sk-live-abc', 'a'.repeat(39)]) {
+      expect(looksLikeCiphertext(value), value).toBe(false);
+    }
   });
 });

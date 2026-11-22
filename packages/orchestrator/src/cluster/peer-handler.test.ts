@@ -1704,8 +1704,8 @@ describe('PeerHandler', () => {
     };
 
     it('rejects peer with protocol version one below the floor', async () => {
-      // fails-when: MIN_PROTOCOL_VERSION drops below PROTOCOL_VERSION.
-      const { ws, authResponse } = await sendPeerAuth(PROTOCOL_VERSION - 1);
+      // fails-when: the floor drops below MIN_PROTOCOL_VERSION.
+      const { ws, authResponse } = await sendPeerAuth(MIN_PROTOCOL_VERSION - 1);
 
       expect(authResponse).not.toBeNull();
       expect(authResponse.accepted).toBe(false);

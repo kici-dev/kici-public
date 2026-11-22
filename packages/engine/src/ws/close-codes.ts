@@ -39,7 +39,7 @@ export const WS_CLOSE_CLUSTER_NAME_CONFLICT = 4011;
 /**
  * Load rebalancing across Platform instances: a newly joined instance asks
  * peers holding excess connections to shed some. Not an error — the affected
- * orchestrators reconnect immediately and redistribute evenly.
+ * orchestrators reconnect after their normal backoff delay and redistribute evenly.
  */
 export const WS_CLOSE_REBALANCE = 4030;
 

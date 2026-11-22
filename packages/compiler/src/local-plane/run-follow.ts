@@ -8,7 +8,20 @@ import {
   ExecutionRunStatus,
   sleep,
 } from '@kici-dev/engine';
+import pc from 'picocolors';
+import { logger } from '@kici-dev/core';
 import { unwrapStoredLogLine } from '../remote/output/streaming.js';
+import {
+  ReadRetryExhaustedError,
+  withReadRetry,
+  type ReadRetryOptions,
+} from '../remote/read-retry.js';
+import {
+  PLANE_READ_ERRORS,
+  describePlaneReadError,
+  withReadDeadline,
+  type PlaneReadClient,
+} from './plane-read-errors.js';
 
 /**
  * Read only by the anti-false-green guard below: a missing member lets a lagging
@@ -50,10 +63,7 @@ export function resolveAcceptanceTimeoutMs(
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_ACCEPTANCE_TIMEOUT_MS;
 }
 
-/** `AdminApiClient.get`, injectable for tests. */
-export interface RunFollowClient {
-  get<T>(path: string): Promise<T>;
-}
+export type RunFollowClient = PlaneReadClient;
 
 export interface RunOutcome {
   runId: string;
@@ -97,8 +107,17 @@ export interface FollowRunOptions {
    * the idle window. Default 2 min; `KICI_LOCAL_ACCEPTANCE_TIMEOUT_MS` overrides.
    */
   acceptanceTimeoutMs?: number;
-  /** Plane log path named in the acceptance-failure message. */
+  /** Plane log path named in the acceptance-failure and lost-contact messages. */
   hintLogPath?: string;
+  /**
+   * Retry for the run status and jobs reads: a transient failure (5xx, 429,
+   * dropped connection) is retried up to the budget, a refusal fails at once.
+   */
+  readRetry?: ReadRetryOptions;
+  /** Ctrl-C: ends a read in flight and the follow, which returns `cancelled`. */
+  signal?: AbortSignal;
+  /** Deadline of each read; defaults to `READ_REQUEST_TIMEOUT_MS`. */
+  readTimeoutMs?: number;
 }
 
 export async function followRun(
@@ -107,7 +126,24 @@ export async function followRun(
   runId: string,
   opts: FollowRunOptions = {},
 ): Promise<RunOutcome> {
-  const client: RunFollowClient = opts.client ?? new AdminApiClient(planeUrl, adminToken);
+  try {
+    return await followUntilSettled(planeUrl, adminToken, runId, opts);
+  } catch (err) {
+    if (!opts.signal?.aborted) throw err;
+    return { runId, status: ExecutionRunStatus.enum.cancelled, jobs: [] };
+  }
+}
+
+async function followUntilSettled(
+  planeUrl: string,
+  adminToken: string,
+  runId: string,
+  opts: FollowRunOptions,
+): Promise<RunOutcome> {
+  const rawClient = withReadDeadline(opts.client ?? new AdminApiClient(planeUrl, adminToken), {
+    timeoutMs: opts.readTimeoutMs,
+    signal: opts.signal,
+  });
   const pollIntervalMs = opts.pollIntervalMs ?? 750;
   const idleTimeoutMs = opts.idleTimeoutMs ?? 900_000;
   const maxTotalMs = opts.maxTotalMs ?? 7_200_000;
@@ -125,8 +161,47 @@ export async function followRun(
   let accepted = false;
   let acceptanceDeadline = startedAt + acceptanceTimeoutMs;
   let lastAcceptanceCheck = 0;
+  // Warn once per outage, not once per attempt.
+  let warnedOutage = false;
+  const retrying = withReadRetry(rawClient, {
+    ...PLANE_READ_ERRORS,
+    signal: opts.signal,
+    ...opts.readRetry,
+    onTransientFailure: (err, attempt) => {
+      opts.readRetry?.onTransientFailure?.(err, attempt);
+      if (opts.quiet || warnedOutage) return;
+      warnedOutage = true;
+      logger.warn(
+        pc.yellow(
+          `The local plane did not answer a status read for run ${runId} ` +
+            `(${describePlaneReadError(err)}); retrying.`,
+        ),
+      );
+    },
+  });
+  // The status and jobs reads. A plane that kept failing for the whole retry
+  // budget ends the follow with the run's last known status.
+  const client: RunFollowClient = {
+    get: async <T>(path: string): Promise<T> => {
+      try {
+        return await retrying.get<T>(path);
+      } catch (err) {
+        if (!(err instanceof ReadRetryExhaustedError)) throw err;
+        const seen = lastStatus
+          ? `The run was last seen as "${lastStatus}".`
+          : 'Its status was never read.';
+        throw new Error(
+          `offline run: lost contact with the local plane while following run ${runId}: ` +
+            `its admin API ${err.message}. ${seen}` +
+            (opts.hintLogPath ? ` Plane log: ${opts.hintLogPath}` : ''),
+          { cause: err },
+        );
+      }
+    },
+  };
 
   for (;;) {
+    opts.signal?.throwIfAborted();
     const now = Date.now();
     if (now - lastProgressAt > idleTimeoutMs) {
       throw new Error(
@@ -171,7 +246,7 @@ export async function followRun(
     }
     // A new log line is progress, so only true silence trips the idle window.
     if (stream) {
-      const emitted = await drainLogs(client, runId, cursors, stream);
+      const emitted = await drainLogs(rawClient, runId, cursors, stream);
       if (emitted > 0) progressed = true;
     }
     if (progressed) lastProgressAt = now;
@@ -185,11 +260,12 @@ export async function followRun(
       const allTerminal = jobs.length > 0 && jobs.every((j) => TERMINAL_JOB_STATES.has(j.status));
       const anyFailed = jobs.some((j) => FAILED_JOB_STATES.has(j.status));
       if (allTerminal && !(run.status === 'success' && anyFailed)) {
-        if (stream) await drainLogs(client, runId, cursors, stream);
+        if (stream) await drainLogs(rawClient, runId, cursors, stream);
         return { runId, status: run.status, jobs };
       }
     }
     await sleep(pollIntervalMs);
+    warnedOutage = false;
   }
 }
 
@@ -202,7 +278,10 @@ async function fetchJobs(client: RunFollowClient, runId: string): Promise<RunOut
   }));
 }
 
-/** Best-effort: a fetch error never aborts the follow; logs are not the terminal signal. */
+/**
+ * Best-effort and unretried: a failed page is refetched next tick from the same
+ * cursor; logs are not the terminal signal.
+ */
 async function drainLogs(
   client: RunFollowClient,
   runId: string,

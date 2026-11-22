@@ -192,7 +192,7 @@ volumes:
   - /var/run/docker.sock:/var/run/docker.sock
 ```
 
-Podman exposes its socket at a different path (`/run/podman/podman.sock` rootful, or `/run/user/<uid>/podman/podman.sock` rootless). Mount that path instead and point `DOCKER_HOST` at it; the agent talks to whichever socket that variable resolves to, falling back to `/var/run/docker.sock`.
+Podman exposes its socket at a different path (`/run/podman/podman.sock` rootful, or `/run/user/<uid>/podman/podman.sock` rootless). Mount that path instead. When `DOCKER_HOST` is set, the agent uses only the runtime it names. Otherwise the agent uses the first socket that exists: `/var/run/docker.sock`, then the rootful Podman socket, then the rootless Podman socket.
 
 The agent:
 

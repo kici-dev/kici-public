@@ -8,7 +8,10 @@ vi.mock('open', () => ({
 }));
 
 import { pkceFlow, deviceFlow, exchangeTokenForPat } from './oauth.js';
+import { RELEASE_VERSION_PATTERN } from '@kici-dev/engine';
+import { CLI_RELEASE_VERSION, ClientNewerThanPlatformError } from './platform-fetch.js';
 import { resetDiscoveryCache } from './oidc-discovery.js';
+import { parseScopeList } from './oidc-scopes.js';
 import open from 'open';
 
 /**
@@ -111,6 +114,29 @@ async function driveCallback(
   const redirectUri = authUrl.searchParams.get('redirect_uri')!;
   const state = authUrl.searchParams.get('state')!;
   await fetch(`${redirectUri}?code=test-code&state=${state}`);
+}
+
+/**
+ * A mock IdP on an ephemeral port. It answers discovery with `doc(issuer)` and
+ * every other request with the JSON `respond` returns for its path and form body.
+ */
+async function startMockIdp(
+  respond: (url: string | undefined, body: string) => unknown,
+  doc: (issuer: string) => string = discoveryDoc,
+): Promise<{ server: Server; issuer: string; paths: Array<string | undefined> }> {
+  const paths: Array<string | undefined> = [];
+  const server = createServer((req, res) => {
+    paths.push(req.url);
+    let body = '';
+    req.on('data', (chunk: Buffer) => (body += chunk.toString()));
+    req.on('end', () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(isDiscoveryReq(req.url) ? doc(issuer) : JSON.stringify(respond(req.url, body)));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const issuer = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  return { server, issuer, paths };
 }
 
 beforeEach(() => {
@@ -379,6 +405,40 @@ describe('pkceFlow', () => {
     expect(open).not.toHaveBeenCalled();
     const allOutput = consoleSpy.mock.calls.map((c) => c.join(' ')).join('\n');
     expect(allOutput).toContain('KICI_AUTH_URL=');
+  });
+
+  /** Run a PKCE login with `extraScopes` against a mock IdP; returns the authorize URL scope. */
+  async function authorizeScope(extraScopes?: readonly string[]): Promise<string | null> {
+    process.env.KICI_BROWSER_CMD = 'none';
+    const consoleSpy = vi.spyOn(console, 'log');
+    const idp = await startMockIdp(() => ({ access_token: 'scoped-token' }));
+    mockAuthServer = idp.server;
+
+    const flow = pkceFlow({
+      issuer: idp.issuer,
+      clientId: 'test-client-id',
+      ...(extraScopes && { extraScopes }),
+    });
+    const match = await waitForConsole(consoleSpy, /KICI_AUTH_URL=(\S+)/, {
+      flow,
+      label: 'the authorize URL',
+    });
+    await driveCallback(consoleSpy, flow, { pattern: /KICI_AUTH_URL=(\S+)/ });
+    expect(await flow).toBe('scoped-token');
+    return new URL(match[1]).searchParams.get('scope');
+  }
+
+  // fails-when: an extra scope is dropped, reordered, or a base scope is requested twice
+  it('extra scopes append in order without duplicates', async () => {
+    const scope = await authorizeScope(
+      parseScopeList('groups, audience:server:client_id:kici-platform openid'),
+    );
+    expect(scope).toBe('openid profile email groups audience:server:client_id:kici-platform');
+  });
+
+  // fails-when: offline_access is requested, or a base scope is dropped
+  it('requests the base scopes alone when no extra scope is given', async () => {
+    expect(await authorizeScope()).toBe('openid profile email');
   });
 
   it('prints the authorize URL on the default open path', async () => {
@@ -938,6 +998,50 @@ describe('deviceFlow', () => {
     );
   });
 
+  // fails-when: an IdP with no device endpoint gets a request to an undefined URL
+  it('the device flow names the missing endpoint', async () => {
+    const idp = await startMockIdp(
+      () => ({}),
+      (origin) =>
+        JSON.stringify({
+          issuer: origin,
+          authorization_endpoint: `${origin}/oauth/v2/authorize`,
+          token_endpoint: `${origin}/oauth/v2/token`,
+        }),
+    );
+    mockServer = idp.server;
+
+    const flow = deviceFlow({ issuer: idp.issuer, clientId: 'c' });
+    await expect(flow).rejects.toThrow(/device_authorization_endpoint/);
+    await expect(flow).rejects.toThrow(/--device/);
+    expect(idp.paths).toEqual(['/.well-known/openid-configuration']);
+  });
+
+  it('requests the extra scopes at the device authorization endpoint', async () => {
+    let scope: string | null = null;
+    const idp = await startMockIdp((url, body) => {
+      if (url !== '/oauth/v2/device_authorization') return { access_token: 'device-scoped-token' };
+      scope = new URLSearchParams(body).get('scope');
+      return {
+        device_code: 'd',
+        user_code: 'U-1',
+        verification_uri: 'https://example.com/device',
+        interval: 0,
+        expires_in: 300,
+      };
+    });
+    mockServer = idp.server;
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    const token = await deviceFlow({
+      issuer: idp.issuer,
+      clientId: 'c',
+      extraScopes: ['groups', 'email'],
+    });
+    expect(token).toBe('device-scoped-token');
+    expect(scope).toBe('openid profile email groups');
+  });
+
   it('throws on expired_token', async () => {
     mockServer = createServer((req, res) => {
       if (isDiscoveryReq(req.url)) {
@@ -1085,5 +1189,35 @@ describe('exchangeTokenForPat', () => {
         `Could not reach Platform at http://127\\.0\\.0\\.1:${deadPort}.*KICI_PLATFORM_URL`,
       ),
     );
+  });
+
+  it('passes a newer-client refusal through, read once, with the Platform message', async () => {
+    // fails-when: fetchOrThrow wraps the refusal in "Could not reach Platform", so the user
+    // reads a dropped connection instead of the Platform's message
+    // breaks-if-wrong: the unreachable case above still reads "Could not reach Platform"
+    let requests = 0;
+    let sentVersion: string | undefined;
+    mockServer = createServer((req, res) => {
+      requests++;
+      sentVersion = req.headers['x-kici-client-version'] as string | undefined;
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({ error: 'client_newer_than_platform', message: 'Upgrade it (test).' }),
+      );
+    });
+    await new Promise<void>((resolve) => mockServer.listen(0, '127.0.0.1', () => resolve()));
+    mockPort = (mockServer.address() as AddressInfo).port;
+
+    const err = await exchangeTokenForPat({
+      platformUrl: `http://127.0.0.1:${mockPort}`,
+      accessToken: 'oidc-token',
+      machineName: 'my-laptop',
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ClientNewerThanPlatformError);
+    expect((err as Error).message).toBe('Upgrade it (test).');
+    expect(requests).toBe(1);
+    // fails-when: the exchange sends no release header, or another value than the CLI's own
+    expect(sentVersion).toBe(CLI_RELEASE_VERSION);
+    expect(sentVersion).toMatch(RELEASE_VERSION_PATTERN);
   });
 });

@@ -29,7 +29,7 @@ The control plane authorizes every dashboard-routed write. The check runs **befo
 - **Verbs** are `none`, `read`, `read_payload` (for log payloads + webhook bodies), `write`, `admin`. Each role assignment picks one verb per resource.
 - **Built-in roles** ship with sensible defaults: `Owner` gets the highest level on every resource (`admin` everywhere except `fleet`, whose gates top out at `write`), `Member` gets `read` on most things and `none` on the privileged ones — `ci_trust`, `support`, and `fleet` (members must be explicitly granted write).
 - **Custom roles** are configured per-org in the dashboard's Settings → Roles tab. A custom role is a typed `{resource → verb}` map.
-- **Identity** is the user's OIDC `sub`, resolved from the session cookie issued at login.
+- **Identity** is the user's OIDC `sub`, resolved from the access token the dashboard sends with each request.
 
 The control plane returns a `403` with the resource and the required verb in the response body when the check fails.
 
@@ -45,11 +45,11 @@ The orchestrator authorizes every `kici-admin` bearer token. The check runs on e
 
 Three fixed roles:
 
-| Role      | Permissions                                                                                                                                                                                            | Use case                              |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------- |
-| `owner`   | Every operation, including key rotation and admin-token management                                                                                                                                     | Bootstrap token, break-glass operator |
-| `admin`   | Every operation except `token.manage` and `key.rotate`                                                                                                                                                 | Day-to-day operations, CI scripts     |
-| `auditor` | Read-only: `context.read`, `audit.read`, `run.read`, `event_log.read`, `access_log.read`, `event_dlq.read`, `scaler.read` (metadata, no payload bodies, no secret values, no VM stop or scaler reload) | Compliance review, log inspection     |
+| Role      | Permissions                                                                                                                                                                                                             | Use case                              |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| `owner`   | Every operation, including key rotation and admin-token management                                                                                                                                                      | Bootstrap token, break-glass operator |
+| `admin`   | Every operation except `token.manage` and `key.rotate`                                                                                                                                                                  | Day-to-day operations, CI scripts     |
+| `auditor` | Read-only: `context.read`, `audit.read`, `run.read`, `event_log.read`, `access_log.read`, `event_dlq.read`, `scaler.read`, `test_run.read` (metadata, no payload bodies, no secret values, no VM stop or scaler reload) | Compliance review, log inspection     |
 
 The full list of fine-grained permissions lives in the orchestrator's `secrets/rbac.ts`, and the per-role matrix is in the [`kici-admin` CLI reference](../orchestrator/kici-admin-cli.md#rbac-roles).
 
@@ -62,6 +62,8 @@ The full list of fine-grained permissions lives in the orchestrator's `secrets/r
 
 - On a route that targets a routing key (runs, sources, the event log), the token acts only on its own key. A request for a different key is refused with `403`.
 - On every route that has no per-routing-key slice — **all** secret routes, contexts, org settings, and the trust policy — a scoped token is refused with `403` outright, whatever its role.
+- On its own source, a scoped token cannot change what reaches beyond that source. It cannot move the source to another org (`source update --org`) or to another GitHub server (`source update --github-url`). Both are refused with `403`.
+- A workflow registration it writes (`workflow register-manual`) stays in its source's org: any other `--org` is refused with `403`. For a GitHub App source, the registration stores the installation the App has on the repository, read from the App's server. A different `installationId`, a repository the App is not installed on, or a lookup the server does not answer is refused with `403`.
 
 So a routing-key-scoped `admin` token cannot reach the secret store at all. Issue one whenever an operator's work is confined to a single source.
 
@@ -145,7 +147,7 @@ The asymmetry shifts from "two layers, watch the gap" to "two layers, one of the
 - **Settings → Roles** — define custom roles. Each role is a `{resource → verb}` map. Save → the role becomes selectable on the Members tab.
 - **Settings → API keys** — dashboard / programmatic API keys (used for SaaS API access, not orchestrator CLI).
 - **Settings → Orchestrator keys** — orchestrator-to-control-plane WebSocket auth tokens (used by the orchestrator process itself; not CLI bearer tokens).
-- **Settings → Security → Dashboard policy** — the read-only view of the [dashboard-write policy](./dashboard-write-policy.md).
+- **Settings → Orchestrator security** — the read-only view of the [dashboard-write policy](./dashboard-write-policy.md).
 - **Settings → Security → Orchestrator token reconciliation** — the [drift report](#reconciling-the-two-layers) between orchestrator tokens and dashboard roles. Read-only, and needs `members:admin`.
 
 Orchestrator CLI tokens are **not** managed from the dashboard. They live entirely in the orchestrator's database and are created, listed, and revoked with `kici-admin token`. The reconciliation report reads them; it never changes one.
@@ -167,7 +169,7 @@ The dashboard's **Activity** page federates both streams into one chronological 
 
 ### What if the control plane is unreachable?
 
-The orchestrator continues to function — the orchestrator's CLI is intentionally the operator's escape hatch. Dashboard users see a "control plane unreachable" banner; orchestrator CLI users see no impact.
+The orchestrator continues to function — the orchestrator's CLI is intentionally the operator's escape hatch. The dashboard reads its data through the control plane, so its pages cannot load data during the outage. Orchestrator CLI users see no impact.
 
 ### Can I scope an orchestrator token to a specific environment or scope?
 

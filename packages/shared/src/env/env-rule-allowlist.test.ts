@@ -25,8 +25,8 @@ import { IS_ALLOWED_ENV_NAME } from './allowlist.js';
 const REPO_ROOT = resolve(import.meta.dirname, '../../../../');
 
 /**
- * Mirrors the inline ESLint rule's coverage. `docs-site/`, `infra/` and
- * `tools/` are excluded: they hold legitimate non-KICI_ env reads
+ * Mirrors the inline ESLint rule's coverage: the roots below. Other trees of the
+ * repository are excluded: they hold legitimate non-KICI_ env reads
  * (Astro/Vite/etc.) scoped to their own subtrees.
  */
 const SCAN_ROOTS = ['packages', 'scripts', 'e2e'];

@@ -10,7 +10,7 @@ Test your workflows remotely against the full CI pipeline from your local machin
 KiCI gives you four ways to exercise a workflow before it runs in real CI, ordered from fastest / least faithful to slowest / most faithful:
 
 - **`kici preview <event>`** — a pure dry-run that shows _which_ workflows and jobs a trigger event would match. No steps execute. Use it to check trigger and rule logic. See [`kici preview`](./cli/authoring-and-local.md#kici-preview).
-- **Unit-test a step function** — call your step's function directly in vitest with a fabricated context from `@kici-dev/sdk/testing`. No orchestrator, no agent — just your step logic. See [Unit-testing step functions](#unit-testing-step-functions) below.
+- **Unit-test a step function** — call your step's function directly in vitest with a fabricated context from `@kici-dev/sdk/testing`. No orchestrator, no agent — only your step logic. See [Unit-testing step functions](#unit-testing-step-functions) below.
 - **`kici run <event> --local`** — executes the whole workflow on your own machine, which becomes an ephemeral agent. A faithful end-to-end run without a remote round-trip. See [Local execution as an alternative](#local-execution-as-an-alternative).
 - **`kici run remote`** — uploads your working tree and runs the full pipeline (orchestrator + agent) remotely, streaming logs back. The most faithful check.
 
@@ -38,7 +38,7 @@ See [Storage layout](../operator/orchestrator/storage-layout.md) for the full en
 
 ## Unit-testing step functions
 
-A KiCI step is just a TypeScript function that takes a context and does work — so you can test it in isolation with vitest, no orchestrator or agent required. `@kici-dev/sdk/testing` builds a real step context for you: `ctx.$` runs real shell commands, `ctx.secrets` resolves values you seed, and `ctx.emit(...)` is recorded so you can assert on it.
+A KiCI step is a TypeScript function that takes a context and does work — so you can test it in isolation with vitest, no orchestrator or agent required. `@kici-dev/sdk/testing` builds a real step context for you: `ctx.$` runs real shell commands, `ctx.secrets` resolves values you seed, and `ctx.emit(...)` is recorded so you can assert on it.
 
 Extract your step body into a named function so both your workflow and your test can call it:
 
@@ -216,7 +216,7 @@ The trigger you pass as `event` only selects the event type. Its filters are the
 The event gets its branch and commit as follows:
 
 - **Branch:** the fixture's `branch` when you set it, else the branch you have checked out. The step sees it as `refs/heads/<branch>` in the payload `ref` and as the branch name in `ctx.repo.ref`.
-- **Commit:** the fixture's `sha` when you set it, else your `HEAD` commit. The run records this commit as its SHA.
+- **Commit:** the fixture's `sha` when you set it, else the commit the remote workspace checks out. That is the synthetic commit of your uncommitted changes, or your `HEAD` on a clean working tree or with `--no-commit`. The run records this commit as its SHA. A push event's `before` is the parent of this commit.
 - **PR events:** `branch` is the base branch (default `main`), and the branch you have checked out is the head branch.
 - **Tag events:** `branch` is the tag name (default `v0.0.0`).
 - **Detached `HEAD`:** the event uses `main` (the head branch of a PR event uses `feature/test`), and `kici run remote` prints a warning. Set `branch` to choose one. (`kici run <event> --local` uses `kici-local` on a detached `HEAD`.)
@@ -286,7 +286,7 @@ Bypass trigger matching and run a specific workflow directly:
 kici run remote --workflow ci
 ```
 
-This skips the trigger evaluation step and runs all jobs in the named workflow. The run carries the branch you have checked out and your `HEAD` commit.
+This skips the trigger evaluation step and runs all jobs in the named workflow. The run carries the branch you have checked out and the commit the remote workspace checks out (see [Repo state transfer](#repo-state-transfer)).
 
 Add a fixture to send that fixture's event to the named workflow only:
 
@@ -330,31 +330,33 @@ Press Ctrl+C during a running test to send a cancel request to the orchestrator.
 
 When you run `kici run remote`, the CLI:
 
-1. Collects your working tree: every tracked file, every untracked file that `.gitignore` does not exclude, and the `.git` directory
-2. Creates a compressed tarball of those files
-3. Encrypts the tarball using X25519 ECDH key exchange
-4. Uploads the encrypted tarball to storage via a signed URL
-5. Triggers the pipeline with a reference to the upload
+1. Collects your working tree: every tracked file, and every untracked file that `.gitignore` does not exclude
+2. Builds a `.git` that matches a fresh checkout of your repository, with your uncommitted changes as a synthetic commit on top of your `HEAD`
+3. Creates a compressed tarball of those files
+4. Encrypts the tarball using X25519 ECDH key exchange
+5. Uploads the encrypted tarball to storage via a signed URL
+6. Triggers the pipeline with a reference to the upload
 
-The agent does not clone your repository. It extracts the tarball into an empty workspace, so the job runs on the files of your local working tree, uncommitted changes included. The `.git` directory ships too, so steps that run git commands see your local history and branch.
+The agent does not clone your repository. It extracts the tarball into an empty workspace, so the job runs on the files of your local working tree, uncommitted changes included. Steps that run git commands see your branch, a clean `git status`, and your changes as the last commit (`git diff HEAD~1`). By default, the history is depth 1: your `HEAD` commit, plus the synthetic commit when you have uncommitted changes. A job's [`checkout` option](sdk/core.md#checkout-depth-and-tags) or `--git-depth` ships more. Your `.git/config`, hooks, reflogs, stashes and credentials never ship. [What the remote workspace contains](cli/runs-and-approvals.md#what-the-remote-workspace-contains) describes the `.git`, the synthetic commit, the changed files the CLI sends, and the flags that change them.
 
-[`kici run <event> --local`](cli/runs-and-approvals.md#kici-run-event---local) builds its isolated checkout differently: it clones your repository at `HEAD` and copies only your changed files on top.
+[`kici run <event> --local`](cli/runs-and-approvals.md#kici-run-event---local) builds its isolated checkout differently: it clones your repository at `HEAD`, copies only your changed files on top, and commits them. The agent then clones that copy.
 
 ### What gets included
 
 - Tracked files, with your staged and unstaged changes
 - New untracked files (not in `.gitignore`)
-- The `.git` directory
-- Symbolic links. A link to a file ships with the file it points at, and the agent writes that file's content in place of the link. A link to a directory ships as a link, and the agent recreates it. A link that points outside the repository, or at a file that `.gitignore` or `.kiciignore` excludes, fails the job with an error that names the link.
+- A `.git` that matches a fresh checkout of your repository, built by the CLI. Your own `.git` directory never ships.
+- Symbolic links. A link to a file ships with the file it points at, and the agent recreates the link. When the agent cannot recreate the link safely inside the repository, it writes the file's content in its place. A link to a directory inside the repository ships as a link, and the agent recreates it.
 - Hard links. Each path ships as a separate file with its own content, also when it shares its data with other files. A `node_modules` directory that pnpm installs contains many hard links.
 
 ### What gets excluded
 
 - Files matching `.gitignore` patterns
-- Files matching `.kiciignore` patterns (additional exclusions, never applied to the `.git` directory)
+- Files matching `.kiciignore` patterns (additional exclusions, never applied to the shipped `.git`)
 - Tracked files you deleted locally
 - The files of submodules and of other nested git repositories. The CLI prints a warning that names each one.
 - Symbolic links whose target does not exist. The CLI prints a warning that names each one.
+- Links to a file or a directory outside the repository, links with an absolute target, and links to a file that `.gitignore` or `.kiciignore` excludes. The CLI prints a warning that names each one, and the run continues. A symbolic link to a `node_modules` directory outside the repository is one example. To keep it out of the upload with no warning, add `node_modules` to `.gitignore` with no trailing slash: the pattern `node_modules/` matches only a directory, not a symbolic link.
 
 ### `.kiciignore`
 
@@ -375,11 +377,11 @@ The format is the same as `.gitignore` -- one glob pattern per line, `#` for com
 
 ### Size limits
 
-| Threshold | Behavior                                                                          |
-| --------- | --------------------------------------------------------------------------------- |
-| < 50 MB   | Normal upload                                                                     |
-| 50-500 MB | Warning displayed, upload proceeds                                                |
-| > 500 MB  | Error -- reduce bundle size via `.kiciignore` or check for unintended large files |
+| Threshold | Behavior                                                                                           |
+| --------- | -------------------------------------------------------------------------------------------------- |
+| < 50 MB   | Normal upload                                                                                      |
+| 50-500 MB | Warning displayed, upload proceeds                                                                 |
+| > 500 MB  | Error -- exclude large files with `.kiciignore`, or ship less history with a smaller `--git-depth` |
 
 The CLI always shows a pre-upload summary before transferring:
 

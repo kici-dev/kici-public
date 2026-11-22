@@ -1,4 +1,4 @@
-import { execSync } from 'node:child_process';
+import { execSync, spawnSync } from 'node:child_process';
 import { createReadStream, createWriteStream } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -8,15 +8,19 @@ import { create as tarCreate, replace as tarReplace } from 'tar';
 import picomatch from 'picomatch';
 import { formatBytes, sha256, sha256File } from '@kici-dev/core';
 import { singleLinkTarCaches } from '@kici-dev/core/tar-single-link';
-import { makeTempDir } from '@kici-dev/core/tmp';
+import { KICI_TMP_PREFIX, kiciTmpBase, makeTempDir, type TempHandle } from '@kici-dev/core/tmp';
+import { gcStaleTmpDirs } from '@kici-dev/core/tmp-gc';
+import type { OverlayGitRecord } from '@kici-dev/engine';
 import { encryptTarball } from './encryption.js';
+import type { GitShipOptions, ShippedGit } from './shipped-git/git-ship-types.js';
+import { assertHasCommit, buildShippedGit } from './shipped-git/shipped-git.js';
 import {
   classifyOverlayEntries,
-  isGitDirPath,
   isReservedOverlayPath,
   OVERLAY_MANIFEST_DIR,
   overlaySkipWarnings,
   SkipContext,
+  type OverlayEntries,
 } from './overlay-links.js';
 
 interface UploadSummary {
@@ -28,7 +32,7 @@ interface UploadSummary {
   deletedFiles: number;
   /** Compressed tarball size in bytes. */
   compressedSize: number;
-  /** HEAD SHA. */
+  /** The commit the remote workspace checks out when a `.git` ships, else HEAD. */
   sha: string;
 }
 
@@ -41,11 +45,15 @@ export interface OverlayManifest {
   /** SHA-256 of each included file. */
   checksums: Record<string, string>;
   /**
-   * Symlinks whose target is a directory: repo-relative path → link text, as
-   * `readlink` returns it. The agent recreates each one. Absent when there is
-   * none, and ignored by an agent that predates it.
+   * Directory symlinks: path → `readlink` text, which the agent recreates. Absent when there is
+   * none; an agent that predates it ignores it.
    */
   symlinks?: Record<string, string>;
+  /**
+   * The shipped `.git`'s history, which the agent compares against a job's checkout options.
+   * Absent when no `.git` ships; an agent that predates it ignores it.
+   */
+  git?: OverlayGitRecord;
 }
 
 interface UploadOptions {
@@ -68,23 +76,52 @@ export interface UploadResult {
 const SIZE_WARN_THRESHOLD = 50 * 1024 * 1024;
 /** 500 MB: a hard error. */
 const SIZE_ERROR_THRESHOLD = 500 * 1024 * 1024;
+
+const OVERLAY_TMP_LABEL = 'overlay';
+const OVERLAY_TMP_DIR_PREFIX = `${KICI_TMP_PREFIX}${OVERLAY_TMP_LABEL}-`;
+const OVERLAY_TMP_DIR_PATTERN = new RegExp(`^${OVERLAY_TMP_DIR_PREFIX}[A-Za-z0-9]{6}$`);
+export const OVERLAY_TMP_GC_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
 const MAX_RETRIES = 3;
 
-/** Returns the non-empty stdout lines, or an empty array when the command fails. */
-function gitLines(cmd: string, cwd: string): string[] {
+const UNTRACKED_FILES_ARGS = ['ls-files', '--others', '--exclude-standard'];
+
+/** Large enough for `ls-files` of a big monorepo. */
+const MAX_PATHS_BUFFER = 256 * 1024 * 1024;
+
+/** Where the shipped repository stays, beside the tarball, once the tarball holds it. */
+const SHIPPED_GIT_DIRNAME = 'ship';
+
+/**
+ * The paths a git listing prints, NUL-separated so a newline or non-ASCII name arrives verbatim.
+ * A failing listing throws git's message: an empty list would ship an incomplete workspace.
+ */
+function gitPaths(args: string[], cwd: string): string[] {
+  const result = spawnSync('git', ['--no-optional-locks', ...args, '-z'], {
+    cwd,
+    encoding: 'utf-8',
+    maxBuffer: MAX_PATHS_BUFFER,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (result.error || result.status !== 0) {
+    const reason = result.error?.message ?? result.stderr.trim();
+    throw new Error(`git ${args.join(' ')} failed in ${cwd}: ${reason || `exit ${result.status}`}`);
+  }
+  return result.stdout.split('\0').filter((p) => p.length > 0);
+}
+
+/** Whether the repository has a remote; false when git cannot tell. */
+function hasGitRemote(repoRoot: string): boolean {
   try {
-    const output = execSync(cmd, { cwd, encoding: 'utf-8' }).trim();
-    if (!output) return [];
-    return output.split('\n').filter((l) => l.length > 0);
+    return (
+      execSync('git --no-optional-locks remote', { cwd: repoRoot, encoding: 'utf-8' }).trim() !== ''
+    );
   } catch {
-    return [];
+    return false;
   }
 }
 
-/**
- * The files that form the overlay over a clone at HEAD. The remote uploader and
- * the local materializer share it, so both reconstruct the same workspace.
- */
+/** The overlay over a clone at HEAD, shared by the remote uploader and the local materializer. */
 export interface OverlaySelection {
   sha: string;
   hasRemote: boolean;
@@ -92,39 +129,8 @@ export interface OverlaySelection {
   existingFiles: string[];
   /** Missing on disk, so deleted from the clone. */
   deletedFiles: string[];
-}
-
-/**
- * Lists every file under `<repoRoot>/.git`, relative to `repoRoot`, so each
- * extracts back in place. `git ls-files` never lists `.git`, and `kici run
- * remote` has no clone on the agent: shipping the whole `.git` makes the overlay
- * a real repository, so steps that run git behave as under `kici run --local`.
- */
-async function collectGitDirFiles(repoRoot: string): Promise<string[]> {
-  const gitRoot = path.join(repoRoot, '.git');
-  const out: string[] = [];
-
-  async function walk(absDir: string): Promise<void> {
-    let entries: import('node:fs').Dirent[];
-    try {
-      entries = await fs.readdir(absDir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    await Promise.all(
-      entries.map(async (entry) => {
-        const abs = path.join(absDir, entry.name);
-        if (entry.isDirectory()) {
-          await walk(abs);
-        } else if (entry.isFile() || entry.isSymbolicLink()) {
-          out.push(path.relative(repoRoot, abs));
-        }
-      }),
-    );
-  }
-
-  await walk(gitRoot);
-  return out;
+  /** Paths git reports changed against HEAD, filtered as the selection is (all of a dirty-only one). */
+  changedFiles: string[];
 }
 
 /** Returns a picomatch matcher, or null when the file is missing or has no patterns. */
@@ -146,55 +152,39 @@ async function loadKiciIgnore(kiciIgnorePath: string): Promise<((file: string) =
 }
 
 /**
- * Selects the files that form the overlay over a clone at HEAD: only dirty files
- * (staged, unstaged, untracked) for a repo with a remote, every tracked and
- * untracked file otherwise. `.kiciignore` (picomatch) filters the set. Gitignored
- * files, secrets such as `.kici/.env.local` included, never appear:
- * `--exclude-standard` drops them.
- *
- * `fullWorkingTree` (the `kici run remote` path) also adds the whole `.git`
- * directory, after `.kiciignore` filtering: working-tree ignore globs never
- * apply to git internals.
+ * The overlay over a clone at HEAD: the dirty files for a repo with a remote, else every tracked
+ * and untracked file, filtered by `.kiciignore` (picomatch). `--exclude-standard` drops
+ * gitignored files (secrets such as `.kici/.env.local`); `git ls-files` never lists `.git`.
+ * `--no-optional-locks` keeps the developer's index unrefreshed.
  */
 export async function selectOverlayFiles(
   repoRoot: string,
   options?: { kiciIgnorePath?: string; fullWorkingTree?: boolean },
 ): Promise<OverlaySelection> {
-  const sha = execSync('git rev-parse HEAD', { cwd: repoRoot, encoding: 'utf-8' }).trim();
+  const sha = execSync('git --no-optional-locks rev-parse HEAD', {
+    cwd: repoRoot,
+    encoding: 'utf-8',
+  }).trim();
 
-  const remotes = gitLines('git remote', repoRoot);
-  const hasRemote = remotes.length > 0;
+  const hasRemote = hasGitRemote(repoRoot);
 
-  let allFiles: string[];
+  // `--no-renames`: a rename lists both its paths, so the old one is deleted.
+  const unstaged = gitPaths(['diff', '--name-only', '--no-renames', 'HEAD'], repoRoot);
+  const staged = gitPaths(['diff', '--name-only', '--no-renames', '--cached', 'HEAD'], repoRoot);
+  const untracked = gitPaths(UNTRACKED_FILES_ARGS, repoRoot);
+  const changed = [...new Set([...unstaged, ...staged, ...untracked])];
 
-  // `kici run remote` runs the LOCAL working tree with no clone, so it takes the
-  // full selection even when a remote exists.
-  if (hasRemote && !options?.fullWorkingTree) {
-    const unstaged = gitLines('git diff --name-only HEAD', repoRoot);
-    const staged = gitLines('git diff --name-only --cached HEAD', repoRoot);
-    const untracked = gitLines('git ls-files --others --exclude-standard', repoRoot);
-
-    allFiles = [...new Set([...unstaged, ...staged, ...untracked])];
-  } else {
-    const tracked = gitLines('git ls-files', repoRoot);
-    const untracked = gitLines('git ls-files --others --exclude-standard', repoRoot);
-    allFiles = [...new Set([...tracked, ...untracked])];
-  }
+  // `kici run remote` runs the local working tree with no clone: always the full selection.
+  const unfiltered =
+    hasRemote && !options?.fullWorkingTree
+      ? changed
+      : [...new Set([...gitPaths(['ls-files'], repoRoot), ...untracked])];
 
   const kiciIgnorePath = options?.kiciIgnorePath ?? path.join(repoRoot, '.kiciignore');
   const kiciIgnore = await loadKiciIgnore(kiciIgnorePath);
-
-  if (kiciIgnore) {
-    allFiles = allFiles.filter((f) => !kiciIgnore(f));
-  }
-  // The manifest directory is reserved: a repository copy of it would collide
-  // with the real manifest at the same tarball path.
-  allFiles = allFiles.filter((f) => !isReservedOverlayPath(f));
-
-  if (options?.fullWorkingTree) {
-    const gitFiles = await collectGitDirFiles(repoRoot);
-    allFiles = [...new Set([...allFiles, ...gitFiles])];
-  }
+  // Reserved: a repository copy would collide with the real manifest's tarball path.
+  const selected = (f: string): boolean => !kiciIgnore?.(f) && !isReservedOverlayPath(f);
+  const allFiles = unfiltered.filter(selected);
 
   const existingFiles: string[] = [];
   const deletedFiles: string[] = [];
@@ -211,14 +201,28 @@ export async function selectOverlayFiles(
     }),
   );
 
-  return { sha, hasRemote, existingFiles, deletedFiles };
+  return { sha, hasRemote, existingFiles, deletedFiles, changedFiles: changed.filter(selected) };
 }
 
 /**
- * Writes the manifest at `.kici-overlay-tmp/manifest.json`, where the agent
- * reads it, then each repository entry. Nothing is written into the repository:
- * the manifest is packed from `workDir`, the entries appended from `repoRoot`,
- * and the archive gzipped.
+ * `buildShippedGit`'s inputs from an overlay. A dangling tracked link is absent remotely but no
+ * deletion: it stays in the shipped history, skip-worktree in the remote index.
+ */
+export function shippedGitInputs(
+  selection: OverlaySelection,
+  entries: OverlayEntries,
+): { shippedPaths: Set<string>; changedPaths: Set<string>; deletions: string[] } {
+  const dangling = new Set(entries.skipped.danglingLinks);
+  return {
+    shippedPaths: new Set([...entries.files, ...Object.keys(entries.symlinks)]),
+    changedPaths: new Set(selection.changedFiles),
+    deletions: entries.deletions.filter((p) => !dangling.has(p)),
+  };
+}
+
+/**
+ * Pack the manifest (from `workDir`, at `.kici-overlay-tmp/manifest.json`), then the repository
+ * entries, then each extra root's (the built `.git`), and gzip. Nothing is written into the repo.
  */
 async function packOverlayTarball(
   repoRoot: string,
@@ -226,6 +230,7 @@ async function packOverlayTarball(
   manifest: OverlayManifest,
   repoEntries: string[],
   tarballPath: string,
+  extraRoots: Array<{ root: string; entries: string[] }> = [],
 ): Promise<void> {
   const manifestRoot = path.join(workDir, 'manifest-root');
   const manifestRel = path.posix.join(OVERLAY_MANIFEST_DIR, 'manifest.json');
@@ -236,8 +241,7 @@ async function packOverlayTarball(
   try {
     await tarCreate({ file: rawTarPath, cwd: manifestRoot }, [manifestRel]);
     if (repoEntries.length > 0) {
-      // A symlink (file or directory) ships as a link entry: node-tar does not
-      // follow links unless asked to. git records no hard links, so each path
+      // node-tar ships a symlink as a link entry; git records no hard links, so each path
       // ships as its own content.
       await tarReplace(
         {
@@ -248,6 +252,13 @@ async function packOverlayTarball(
         repoEntries,
       );
     }
+    for (const { root, entries } of extraRoots) {
+      if (entries.length === 0) continue;
+      await tarReplace(
+        { file: rawTarPath, cwd: root, ...(await singleLinkTarCaches(root, entries)) },
+        entries,
+      );
+    }
     await pipeline(createReadStream(rawTarPath), createGzip(), createWriteStream(tarballPath));
   } finally {
     await fs.rm(rawTarPath, { force: true });
@@ -255,84 +266,158 @@ async function packOverlayTarball(
   }
 }
 
+/** SHA-256 of each `files` entry, read under `root`. */
+async function checksumFiles(
+  root: string,
+  files: string[],
+  into: Record<string, string>,
+): Promise<void> {
+  await Promise.all(
+    files.map(async (file) => {
+      into[file] = await sha256File(path.join(root, file));
+    }),
+  );
+}
+
+/** SHA-256 of each file as packed: `checkout` paths, and links to them, read the replacement. */
+async function checksumOverlayFiles(
+  repoRoot: string,
+  files: string[],
+  checkout: { root: string; paths: string[] } | undefined,
+  into: Record<string, string>,
+): Promise<void> {
+  if (!checkout) return checksumFiles(repoRoot, files, into);
+  const replaced = new Set(checkout.paths);
+  const realRoot = await fs.realpath(repoRoot);
+  await Promise.all(
+    files.map(async (file) => {
+      const target = path.relative(realRoot, await fs.realpath(path.join(repoRoot, file)));
+      const rel = target.split(path.sep).join('/');
+      into[file] = replaced.has(rel)
+        ? await sha256File(path.join(checkout.root, rel))
+        : await sha256File(path.join(repoRoot, file));
+    }),
+  );
+}
+
 /**
- * Creates an overlay tarball from the selection `selectOverlayFiles` makes. It
- * carries a `manifest.json` with the HEAD SHA, the deletions and SHA-256
- * checksums for integrity verification.
+ * The overlay tarball of `selectOverlayFiles`'s selection, with a `manifest.json` of the HEAD
+ * SHA, deletions and SHA-256 checksums. With `git`, it also ships a fresh-clone `.git`
+ * (`buildShippedGit`), never the developer's, recorded under the manifest's `git` key; a file
+ * whose default-config checkout differs ships as that checkout writes it.
  *
- * @returns also a warning per kind of selected path the overlay leaves out
- *   (submodules, dangling symlinks)
+ * @returns also a warning per kind of path left out, and one when no `.git` can ship
  */
 export async function createOverlayTarball(
   repoRoot: string,
-  options?: { kiciIgnorePath?: string; fullWorkingTree?: boolean },
+  options?: { kiciIgnorePath?: string; fullWorkingTree?: boolean; git?: GitShipOptions },
 ): Promise<{
   tarballPath: string;
   summary: UploadSummary;
   manifest: OverlayManifest;
   hasRemote: boolean;
   warnings: string[];
+  git?: ShippedGit;
+  /** Holds the tarball and the shipped repository; the caller removes it once the upload is done. */
+  tempDir: TempHandle;
 }> {
+  // Before any read of HEAD: a repository with no commit gets the actionable error.
+  assertHasCommit(repoRoot);
   const selection = await selectOverlayFiles(repoRoot, options);
   const { sha, hasRemote } = selection;
   const kiciIgnore = await loadKiciIgnore(
     options?.kiciIgnorePath ?? path.join(repoRoot, '.kiciignore'),
   );
-  // Directory symlinks ship as link text, file symlinks bring the in-repo
-  // targets the agent dereferences them to, and paths beneath a symlink are
-  // deletions (git tracks nothing there).
+  // Directory links ship as text, file links bring their in-repo targets, and paths beneath a
+  // link are deletions (git tracks nothing there).
   const entries = await classifyOverlayEntries(repoRoot, selection, kiciIgnore ?? (() => false));
   const linkPaths = Object.keys(entries.symlinks);
   const shipped = new Set([...entries.files, ...linkPaths]);
 
-  // `.git/**` and a link target shipped beside a changed link are not the
-  // developer's changes: both stay out of the new/modified breakdown but count
-  // toward `fileCount`.
-  const untrackedSet = new Set(gitLines('git ls-files --others --exclude-standard', repoRoot));
-  const workingTreeFiles = selection.existingFiles.filter(
-    (f) => shipped.has(f) && !isGitDirPath(f),
-  );
+  // A shipped link target is no change: out of the new/modified breakdown, in `fileCount`.
+  const untrackedSet = new Set(gitPaths(UNTRACKED_FILES_ARGS, repoRoot));
+  const workingTreeFiles = selection.existingFiles.filter((f) => shipped.has(f));
   const newFiles = workingTreeFiles.filter((f) => untrackedSet.has(f));
   const modifiedFiles = workingTreeFiles.filter((f) => !untrackedSet.has(f));
 
-  // A file symlink's checksum covers its target, which the agent reads through it.
-  const checksums: Record<string, string> = {};
-  await Promise.all(
-    entries.files.map(async (file) => {
-      const fullPath = path.join(repoRoot, file);
-      checksums[file] = await sha256File(fullPath);
-    }),
-  );
+  // The returned tarball outlives this function: the caller removes the dir.
+  const overlayDir = await makeTempDir(OVERLAY_TMP_LABEL);
+  const tmpDir = overlayDir.path;
+  const warnings = overlaySkipWarnings(entries.skipped, SkipContext.RemoteRun);
+  // The built `.git` (a full history copy at depth 0) gets its own temp dir, removed once
+  // packed; only the shipped repository stays, beside the tarball, for the caller.
+  let gitWork: TempHandle | undefined;
+  let git: ShippedGit | undefined;
+  let tarballPath: string;
+  let manifest: OverlayManifest;
+  let compressedSize: number;
+  try {
+    if (options?.git) {
+      gitWork = await makeTempDir('shipped-git', { base: tmpDir });
+      const result = await buildShippedGit({
+        repoRoot,
+        workDir: gitWork.path,
+        options: options.git,
+        ...shippedGitInputs(selection, entries),
+      });
+      if ('skipped' in result) warnings.push(result.skipped);
+      else {
+        git = result.git;
+        warnings.push(...git.warnings);
+      }
+    }
 
-  const manifest: OverlayManifest = {
-    sha,
-    deletions: entries.deletions,
-    checksums,
-    ...(linkPaths.length > 0 ? { symlinks: entries.symlinks } : {}),
-  };
+    // A file symlink's checksum covers its target, which the agent reads through it.
+    const replaced = new Set(git?.checkout?.paths ?? []);
+    const checksums: Record<string, string> = {};
+    await checksumOverlayFiles(repoRoot, entries.files, git?.checkout, checksums);
+    if (git) await checksumFiles(git.root, git.files, checksums);
 
-  // Persisted: the returned tarball outlives this function, so the caller cleans up.
-  const { path: tmpDir } = await makeTempDir('overlay', { persist: true });
-  const tarballPath = path.join(tmpDir, 'overlay.tar.gz');
-  await packOverlayTarball(repoRoot, tmpDir, manifest, [...shipped], tarballPath);
+    manifest = {
+      sha,
+      deletions: entries.deletions,
+      checksums,
+      ...(linkPaths.length > 0 ? { symlinks: entries.symlinks } : {}),
+      ...(git ? { git: git.record } : {}),
+    };
 
-  const stat = await fs.stat(tarballPath);
-  const compressedSize = stat.size;
-
-  if (compressedSize > SIZE_ERROR_THRESHOLD) {
-    throw new Error(
-      `Tarball size ${formatBytes(compressedSize)} exceeds 500MB limit. ` +
-        'Use --dangerously-allow-large-upload to override.',
+    tarballPath = path.join(tmpDir, 'overlay.tar.gz');
+    await packOverlayTarball(
+      repoRoot,
+      tmpDir,
+      manifest,
+      [...shipped].filter((p) => !replaced.has(p)),
+      tarballPath,
+      [
+        ...(git ? [{ root: git.root, entries: git.files }] : []),
+        ...(git?.checkout ? [{ root: git.checkout.root, entries: git.checkout.paths }] : []),
+      ],
     );
+
+    compressedSize = (await fs.stat(tarballPath)).size;
+    assertOverlayWithinLimit(compressedSize);
+    if (git) {
+      // The caller reads the shipped objects (the synthetic commit's diff): move them out.
+      const shipRoot = path.join(tmpDir, SHIPPED_GIT_DIRNAME);
+      await fs.rename(git.root, shipRoot);
+      git = { ...git, root: shipRoot };
+    }
+  } catch (err) {
+    // No tarball is returned, so nothing in the overlay dir outlives the failure.
+    // A cleanup failure must not replace the error that says why packing failed.
+    await overlayDir.cleanup().catch(() => undefined);
+    throw err;
+  } finally {
+    await gitWork?.cleanup();
   }
 
   const summary: UploadSummary = {
-    fileCount: shipped.size,
+    fileCount: shipped.size + (git?.files.length ?? 0),
     newFiles: newFiles.length,
     modifiedFiles: modifiedFiles.length,
     deletedFiles: entries.deletions.length,
     compressedSize,
-    sha,
+    sha: git?.workspaceSha ?? sha,
   };
 
   return {
@@ -340,8 +425,28 @@ export async function createOverlayTarball(
     summary,
     manifest,
     hasRemote,
-    warnings: overlaySkipWarnings(entries.skipped, SkipContext.RemoteRun),
+    warnings,
+    ...(git ? { git } : {}),
+    tempDir: overlayDir,
   };
+}
+
+/** Throws when the compressed overlay is above the 500 MB upload limit. */
+export function assertOverlayWithinLimit(compressedSize: number): void {
+  if (compressedSize > SIZE_ERROR_THRESHOLD) {
+    throw new Error(
+      `Overlay is ${formatBytes(compressedSize)}, above the 500MB limit. ` +
+        'Exclude large files with .kiciignore, or ship less history with a smaller --git-depth.',
+    );
+  }
+}
+
+export async function gcStaleOverlayDirs(base: string = kiciTmpBase()): Promise<string[]> {
+  return gcStaleTmpDirs({
+    base,
+    pattern: OVERLAY_TMP_DIR_PATTERN,
+    maxAgeMs: OVERLAY_TMP_GC_MAX_AGE_MS,
+  });
 }
 
 /** Returns a warning between the warn and error thresholds, or null. */
@@ -352,16 +457,11 @@ export function getSizeWarning(compressedSize: number): string | null {
   return null;
 }
 
-/**
- * Encrypts the tarball with X25519 ECDH and PUTs it to a pre-signed URL, with up
- * to 3 attempts in total; a 4xx is never retried.
- */
+/** Encrypt with X25519 ECDH and PUT to a pre-signed URL: up to 3 attempts, never retrying a 4xx. */
 export async function uploadTarball(opts: UploadOptions): Promise<UploadResult> {
   const { tarballPath, signedUrl, orchestratorPublicKey, onProgress } = opts;
 
-  // An empty URL means the orchestrator has no object storage (or upload init
-  // failed). Fail fast: fetch('') throws an opaque "Failed to parse URL from "
-  // only after every retry.
+  // Empty: no object storage, or upload init failed. fetch('') would fail opaquely after retries.
   if (!signedUrl) {
     throw new Error(
       'The orchestrator did not return an upload URL, so the overlay cannot be ' +

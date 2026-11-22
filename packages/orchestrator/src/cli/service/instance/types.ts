@@ -38,6 +38,11 @@ export interface InstanceManifest {
    * refuses.
    */
   migrationHeads?: Record<string, string>;
+  /**
+   * Compose only: the registry prefix `install --image-registry` named, so a command that
+   * renders the compose file again pulls from the same registry. Absent: `quay.io/kici-dev`.
+   */
+  imageRegistry?: string;
 }
 
 /** A row in `<kiciRoot>/instances.json`. */

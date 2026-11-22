@@ -11,9 +11,11 @@
 
 import type { Kysely } from 'kysely';
 import type { TrustTier } from '@kici-dev/engine';
-import { TrustTierSchema, repoIdentifierFromUrl } from '@kici-dev/engine';
+import { SourceProvider, TrustTierSchema, repoIdentifierFromUrl } from '@kici-dev/engine';
+import { toErrorMessage } from '@kici-dev/shared';
 import type { Database } from '../db/types.js';
 import type { JobCredentialContext } from '../ws/git-credential-relay.js';
+import { githubUrlOfSource } from '../sources/github-source-config.js';
 
 /** The `gitCredentials` map shape shared by the lock, the wire and both rows. */
 type DeclaredCredentials = Record<string, Record<string, string>>;
@@ -65,6 +67,8 @@ interface DispatchRecordFacts {
   declared: DeclaredCredentials | undefined;
   /** `owner/repo` of the clone URL the orchestrator chose for this job's checkout. */
   checkoutRepo: string | undefined;
+  /** The routing key of the source whose bundle dispatched (and cloned) the job. */
+  routingKey: string | undefined;
 }
 
 /**
@@ -92,16 +96,24 @@ async function readDispatchRecord(
   db: Kysely<Database>,
   jobId: string,
 ): Promise<DispatchRecordFacts> {
-  const none: DispatchRecordFacts = { declared: undefined, checkoutRepo: undefined };
+  const none: DispatchRecordFacts = {
+    declared: undefined,
+    checkoutRepo: undefined,
+    routingKey: undefined,
+  };
   if (!UUID.test(jobId)) return none;
   const row = await db
     .selectFrom('dispatch_queue')
-    .select(['job_config', 'repo_url'])
+    .select(['job_config', 'repo_url', 'routing_key'])
     .where('id', '=', jobId)
     .executeTakeFirst();
   if (!row) return none;
   const checkoutRepo = row.repo_url ? repoIdentifierFromUrl(row.repo_url) : undefined;
-  return { declared: declaredFromJobConfig(row.job_config), checkoutRepo };
+  return {
+    declared: declaredFromJobConfig(row.job_config),
+    checkoutRepo,
+    routingKey: row.routing_key,
+  };
 }
 
 function declaredFromJobConfig(
@@ -150,6 +162,51 @@ function resolveCredentialPolicy(run: PolicyRunFacts): {
   return { policyRepo: run.repo_identifier, policyBranch: run.ref };
 }
 
+/**
+ * Where a workflow-supplied GitHub App credential of a job from the source at
+ * `routingKey` mints: the server that source stores (`github_url`), read live.
+ *
+ * Never the run's `provider_context`: for a cron, manual, internal-event or
+ * cross-source run that column is a registration's free-form context, which a
+ * routing-key-scoped admin token can write, and the mint sends the App's JWT
+ * to the server it names. A GitHub source that is gone refuses the mint rather
+ * than sending the JWT to github.com. A source of another provider has no
+ * server: such a job's App credential mints at github.com.
+ */
+async function readGithubMintServer(
+  db: Kysely<Database>,
+  routingKey: string,
+): Promise<Pick<JobCredentialContext, 'githubUrl' | 'githubAppMintRefusal'>> {
+  const source = await db
+    .selectFrom('sources')
+    .select(['github_url'])
+    .where('routing_key', '=', routingKey)
+    .where('provider', '=', SourceProvider.enum.github)
+    .executeTakeFirst();
+  if (source) {
+    let githubUrl: string | undefined;
+    try {
+      githubUrl = githubUrlOfSource(source);
+    } catch (err) {
+      return {
+        githubAppMintRefusal:
+          `The GitHub source ${routingKey} that ran this job is refused, so a GitHub App ` +
+          `credential cannot be minted for it: ${toErrorMessage(err)}.`,
+      };
+    }
+    return githubUrl ? { githubUrl } : {};
+  }
+  // fails-when: a job of a removed GitHub source mints at github.com instead of being refused
+  if (routingKey.startsWith(`${SourceProvider.enum.github}:`)) {
+    return {
+      githubAppMintRefusal:
+        `The GitHub source ${routingKey} that ran this job is no longer configured, so ` +
+        `a GitHub App credential cannot be minted for it.`,
+    };
+  }
+  return {};
+}
+
 /** Build the `jobContext` lookup the git credential handler takes. */
 export function createJobCredentialContextReader(db: Kysely<Database>) {
   return async (runId: string, jobId: string): Promise<JobCredentialContext | null> => {
@@ -163,6 +220,8 @@ export function createJobCredentialContextReader(db: Kysely<Database>) {
         'trust_tier',
         'workflow_repo_identifier',
         'workflow_branch',
+        'routing_key',
+        'dispatch_routing_key',
       ])
       .where('run_id', '=', runId)
       .executeTakeFirst();
@@ -199,6 +258,12 @@ export function createJobCredentialContextReader(db: Kysely<Database>) {
       ...resolveCredentialPolicy(run),
       triggerType: run.trigger_event ?? '',
       ...(dispatch.checkoutRepo ? { checkoutRepo: dispatch.checkoutRepo } : {}),
+      // The job's own source first: the bundle that dispatched it, then the
+      // source the run's credentials belong to.
+      ...(await readGithubMintServer(
+        db,
+        dispatch.routingKey ?? run.dispatch_routing_key ?? run.routing_key ?? '',
+      )),
     };
   };
 }

@@ -59,12 +59,13 @@ const DECLARATION = /\.d\.ts(\.map)?$/;
 
 /**
  * Whether a package-relative source path (any separator) is test-only: a
- * `*.test.ts`, a `*.test-helpers.ts`, or a file under `__test-helpers__`.
+ * `*.test.ts`, a `*.test-d.ts` / `*.test-d.tsx` type test (it imports vitest), a
+ * `*.test-helpers.ts`, or a file under `__test-helpers__`.
  * Builds emit none of them (`build-ts.mjs`, each `tsconfig.build.json`), so a
  * published package imports no private test-support package.
  */
 export function isTestOnlySource(rel) {
-  if (rel.endsWith('.test.ts') || rel.endsWith('.test-helpers.ts')) return true;
+  if (/\.(test|test-d|test-helpers)\.ts$|\.test-d\.tsx$/.test(rel)) return true;
   return rel.split(/[\\/]/).includes('__test-helpers__');
 }
 

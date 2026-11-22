@@ -139,6 +139,12 @@ describe('assertLockFileSchemaCompatible (compatibility window)', () => {
     expect(() => assertLockFileSchemaCompatible(lock, REPO, REF, 42)).not.toThrow();
   });
 
+  it('a schema-44 orchestrator accepts a v45 lock (additive bump)', () => {
+    const lock = baseLock({ schemaVersion: 45 as never, minReaderVersion: 42 });
+    // fails-when: a reader refuses a lock whose schemaVersion is above its own
+    expect(() => assertLockFileSchemaCompatible(lock, REPO, REF, 44)).not.toThrow();
+  });
+
   it('refuses a lock with no minReaderVersion', () => {
     // fails-when: the reader falls back to schemaVersion when minReaderVersion is absent.
     const lock = baseLock();

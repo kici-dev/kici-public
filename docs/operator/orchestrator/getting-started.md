@@ -367,7 +367,7 @@ services:
 
 If the orchestrator fails to start with `nftables operation denied -- missing NET_ADMIN capability`, add `--cap-add=NET_ADMIN` to your container run command or `cap_add: [NET_ADMIN]` in your Compose file.
 
-If the error is `nftables binary not found`, you may be running a custom image that was not built from the official Dockerfile. Ensure the image includes `nftables` (`apk add --no-cache nftables` for Alpine-based images).
+If the error is `nftables binary not found`, the orchestrator found no `nft` on its `PATH` or in `/usr/local/sbin`, `/usr/sbin` or `/sbin`. You may be running a custom image that was not built from the official Dockerfile. Install the `nftables` package in the image or on the host (`apt-get install nftables` on Debian-based systems).
 
 ## Reverse proxy setup
 

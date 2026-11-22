@@ -18,7 +18,7 @@ import {
   type TestTriggerInput,
 } from './test-pipeline.js';
 import type { ProcessingDeps } from './processor.js';
-import type { ActorPrincipal } from '@kici-dev/engine';
+import { changedFilesStatusSchema, type ActorPrincipal } from '@kici-dev/engine';
 import { lockFileFixture, staticJob } from '../__test-helpers__/lock-fixtures.js';
 
 describe('repoIdentityFromInlineInput', () => {
@@ -1940,5 +1940,40 @@ describe('processTestTrigger records the commit the run acted on', () => {
     // missing SHA must still resolve to a cloneable ref
     const args = await runWith({});
     expect(args[SHA_ARG]).toBe('main');
+  });
+});
+
+describe('processTestTrigger carries a CLI-sent changed-files list', () => {
+  /** The event of the job dispatched for `event`. */
+  async function dispatchedEvent(event: TestTriggerInput['event']) {
+    const deps = createMockDeps();
+    (deps.lockFileCache.get as any).mockResolvedValue(
+      createMockLockFile([createMockWorkflow('ci')]),
+    );
+    const result = await processTestTrigger(createMockInput({ event }), deps);
+    expect(result.status).toBe('accepted');
+    const dispatch = deps.dispatcher.dispatch as ReturnType<typeof vi.fn>;
+    return dispatch.mock.calls[0]?.[0]?.jobConfig?.event;
+  }
+
+  const push = { type: 'push', targetBranch: 'main', payload: { ref: 'refs/heads/main' } };
+
+  it('stamps a CLI-sent changed-files list as fetched', async () => {
+    const event = await dispatchedEvent({ ...push, changedFiles: ['a'] });
+    expect(event.changedFiles).toEqual(['a']);
+    // fails-when: the list arrives unstamped, so the agent recomputes it against the git host
+    expect(event.changedFilesStatus).toBe(changedFilesStatusSchema.enum.fetched);
+  });
+
+  it('stamps an empty CLI-sent list as fetched', async () => {
+    // A commit that changes nothing is a real, empty diff.
+    const event = await dispatchedEvent({ ...push, changedFiles: [] });
+    expect(event.changedFilesStatus).toBe(changedFilesStatusSchema.enum.fetched);
+  });
+
+  it('leaves the status unset without a list', async () => {
+    const event = await dispatchedEvent(push);
+    // breaks-if-wrong: a fixture with no list keeps today's agent-computed path
+    expect(event.changedFilesStatus).toBeUndefined();
   });
 });

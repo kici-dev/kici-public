@@ -67,8 +67,15 @@ vi.mock('../../service/index.js', async () => {
   };
 });
 
+// The real env-file writer, wrapped so a test can prove it never ran.
+vi.mock('./install-env.js', async () => {
+  const actual = await vi.importActual<typeof import('./install-env.js')>('./install-env.js');
+  return { ...actual, writeInstallEnvFile: vi.fn(actual.writeInstallEnvFile) };
+});
+
 // Import after mocks so the action picks up the mocked module.
 import { registerOrchestratorInstall } from './install.js';
+import { writeInstallEnvFile } from './install-env.js';
 import { readIndex, manifestPath, readKiciVersion } from '../../service/index.js';
 
 describe('orchestrator install — folder-anchored', () => {
@@ -232,6 +239,62 @@ describe('orchestrator install — folder-anchored', () => {
     exitSpy.mockRestore();
   });
 
+  it('registers --platform-url <url>', () => {
+    const install = program.commands.find((c) => c.name() === 'install');
+    const option = install?.options.find((o) => o.long === '--platform-url');
+    expect(option?.flags).toBe('--platform-url <url>');
+    expect(option?.description).toContain('KICI_PLATFORM_URL');
+  });
+
+  it('writes the URL named by --platform-url into the stub', async () => {
+    await runInstall(['--no-wizard', '--platform-url', 'wss://kici.corp.example/ws']);
+
+    const content = fs.readFileSync(path.join(tmpServiceConfigDir, 'kici-test.env'), 'utf-8');
+    expect(content).toContain('\nKICI_PLATFORM_URL=wss://kici.corp.example/ws\n');
+    expect(content).not.toContain('api.kici.dev');
+  });
+
+  it('an --env-file install overwrites the copied KICI_PLATFORM_URL with --platform-url', async () => {
+    const source = path.join(tmpInstanceDir, 'copied.env');
+    fs.writeFileSync(
+      source,
+      'KICI_MODE=platform\nKICI_PLATFORM_URL=wss://api.kici.dev/ws\nKICI_DATABASE_URL=postgres://x\n',
+      'utf-8',
+    );
+
+    await runInstall(['--env-file', source, '--platform-url', 'wss://kici.corp.example/ws']);
+
+    const content = fs.readFileSync(path.join(tmpServiceConfigDir, 'kici-test.env'), 'utf-8');
+    expect(content.match(/^KICI_PLATFORM_URL=.*$/gm)).toEqual([
+      'KICI_PLATFORM_URL=wss://kici.corp.example/ws',
+    ]);
+  });
+
+  // fails-when: the URL is checked after (or never before) the env file is written
+  it.each([
+    ['https://kici.corp.example'],
+    ['kici.corp.example'],
+    ['wss://user:secret@kici.corp.example/ws'],
+  ])('refuses --platform-url %s before the env file is written', async (value) => {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('process.exit called');
+    }) as never);
+    vi.mocked(writeInstallEnvFile).mockClear();
+
+    await expect(runInstall(['--no-wizard', '--platform-url', value])).rejects.toThrow(
+      'process.exit called',
+    );
+
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    const errArgs = consoleErrorSpy.mock.calls.map((c: unknown[]) => c.join(' ')).join('\n');
+    expect(errArgs).toContain('--platform-url');
+    expect(vi.mocked(writeInstallEnvFile)).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(tmpServiceConfigDir, 'kici-test.env'))).toBe(false);
+    expect(mockInstall).not.toHaveBeenCalled();
+
+    exitSpy.mockRestore();
+  });
+
   it('writes the manifest into --instance-dir', async () => {
     await runInstall();
 
@@ -318,6 +381,50 @@ describe('orchestrator install — folder-anchored', () => {
     }
     expect(mockInstall).toHaveBeenCalledTimes(1);
     expect(mockRestrict).not.toHaveBeenCalled();
+  });
+
+  it('a compose install with --image-registry renders and records the registry', async () => {
+    // fails-when: the flag parses but never reaches the compose renderer or the manifest
+    const { detectPlatform } = await import('../../service/index.js');
+    vi.mocked(detectPlatform).mockReturnValueOnce('compose');
+    await runInstall([
+      '--platform',
+      'compose',
+      '--image-registry',
+      'registry.internal.example/kici-dev/',
+    ]);
+
+    const cfg = mockInstall.mock.calls[0]![0] as ServiceConfig;
+    expect(cfg.imageRegistry).toBe('registry.internal.example/kici-dev');
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(tmpInstanceDir, '.kici-orchestrator.json'), 'utf-8'),
+    );
+    expect(manifest.imageRegistry).toBe('registry.internal.example/kici-dev');
+  });
+
+  it('an install without --image-registry records no registry', async () => {
+    // breaks-if-wrong: an install with no registry keeps quay.io/kici-dev
+    await runInstall();
+    const cfg = mockInstall.mock.calls[0]![0] as ServiceConfig;
+    expect(cfg.imageRegistry).toBeUndefined();
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(tmpInstanceDir, '.kici-orchestrator.json'), 'utf-8'),
+    );
+    expect(manifest).not.toHaveProperty('imageRegistry');
+  });
+
+  it('refuses --image-registry for a non-compose install before anything is written', async () => {
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('process.exit called');
+    }) as never);
+    await expect(
+      runInstall(['--image-registry', 'registry.internal.example/kici-dev']),
+    ).rejects.toThrow('process.exit called');
+    const errArgs = consoleErrorSpy.mock.calls.map((c: unknown[]) => c.join(' ')).join('\n');
+    expect(errArgs).toContain('--image-registry applies only to --platform compose');
+    expect(mockInstall).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(tmpServiceConfigDir, 'kici-test.env'))).toBe(false);
+    exitSpy.mockRestore();
   });
 
   it('passes component: orchestrator to manager.install()', async () => {

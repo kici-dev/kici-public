@@ -113,3 +113,72 @@ describe('buildExecutionStatusFrame free text', () => {
     expect(executionStatusSchema.parse(built)).toEqual(built);
   });
 });
+
+describe('buildExecutionStatusFrame for a GitHub Enterprise Server run', () => {
+  it('sends repoWebUrl and a namespaced actor provider for a GHES run', () => {
+    const built = frame(
+      context({
+        githubUrl: 'https://ghe.corp.example',
+        triggerActorUsername: 'octocat',
+        triggerActorUserId: '5',
+      }),
+    );
+    // fails-when: a GHES run's frame names no server, so the dashboard links it to github.com
+    expect(built.repoWebUrl).toBe('https://ghe.corp.example');
+    // fails-when: a GHES actor is attributed in the github.com identity namespace
+    expect(built.triggerActorProvider).toBe('github:ghe.corp.example');
+    expect(built.triggerActorUserId).toBe('5');
+    expect(executionStatusSchema.parse(built)).toEqual(built);
+  });
+
+  it("a github.com run's frame is unchanged", () => {
+    const built = frame(context({ triggerActorUsername: 'octocat', triggerActorUserId: '5' }));
+    // breaks-if-wrong: hosted frames stay byte-for-byte
+    expect(JSON.stringify(built)).toBe(
+      JSON.stringify({
+        type: 'execution.status',
+        messageId: 'msg-1',
+        runId: 'run-1',
+        workflowName: 'ci',
+        status: 'running',
+        routingKey: 'github:1',
+        repoIdentifier: SOURCE_REPO,
+        repoProvider: 'github',
+        sha: 'abc123',
+        triggerActorProvider: 'github',
+        triggerActorUsername: 'octocat',
+        triggerActorUserId: '5',
+        jobCount: 2,
+        startedAt: 1_700_000_000_000,
+        timestamp: 1_700_000_060_000,
+        statusEpoch: 0,
+      }),
+    );
+  });
+
+  it('a run whose GitHub source is gone names neither its server nor its actor namespace', () => {
+    const built = frame(
+      context({
+        githubSourceMissing: true,
+        triggerActorUsername: 'octocat',
+        triggerActorUserId: '5',
+      }),
+    );
+    // fails-when: the frame sends 'github' for a GHES actor, so the Platform overwrites
+    //   the stored namespace and the actor resolves as a github.com user with the same id
+    expect('triggerActorProvider' in built).toBe(false);
+    expect('repoWebUrl' in built).toBe(false);
+    expect(built.triggerActorUserId).toBe('5');
+    expect('githubSourceMissing' in built).toBe(false);
+    expect(executionStatusSchema.parse(built)).toEqual(built);
+  });
+
+  it('keeps a non-GitHub provider as the actor provider', () => {
+    const built = frame(
+      context({ provider: 'gitlab', triggerActorUsername: 'dev', triggerActorUserId: '9' }),
+    );
+    // breaks-if-wrong: only the GitHub provider is namespaced by server
+    expect(built.triggerActorProvider).toBe('gitlab');
+    expect('repoWebUrl' in built).toBe(false);
+  });
+});

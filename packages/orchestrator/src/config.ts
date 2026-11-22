@@ -792,12 +792,14 @@ const baseSchema = z.object({
 });
 
 /**
- * Validation scope for orchestrator config: a running orchestrator (`runtime`)
- * vs a build-artifact (agent packaging) operation (`packaging`). Packaging only
- * needs the object-storage config, so it skips the runtime coordinator/platform
+ * Validation scope for orchestrator config: a running orchestrator (`runtime`),
+ * a `kici-admin` command that loads the orchestrator's config in its own process
+ * (`admin`: the runtime checks, plus the kici-admin settings of that shell), or a
+ * build-artifact (agent packaging) operation (`packaging`). Packaging only needs
+ * the object-storage config, so it skips the runtime coordinator/platform
  * cross-field requirements.
  */
-export const ConfigScope = z.enum(['runtime', 'packaging']);
+export const ConfigScope = z.enum(['runtime', 'packaging', 'admin']);
 export type ConfigScope = z.infer<typeof ConfigScope>;
 
 type ConfigData = z.infer<typeof baseSchema>;
@@ -1237,6 +1239,7 @@ const TEST_ONLY_ENV_VARS = [
   'KICI_TEST_ADMIN_DATABASE_URL', // admin DB URL that gates real-Postgres repo tests (vitest harness)
   'KICI_SKIP_S3_SENTINEL_VALIDATION', // split-brain sentinel fault-injection (test double only)
   'KICI_SKIP_DB_TESTS', // opt-out that stops the vitest harness starting a throwaway Postgres
+  'KICI_SKIP_VISUAL_SNAPSHOTS', // the dashboard CT pixel-comparison opt-out the mirror CI sets
 ];
 
 /**
@@ -1286,11 +1289,36 @@ const REMOVED_ENV_VAR_ADVICE: Record<string, string> = {
  * the shared DB config store on top at runtime. `kici-admin orchestrator
  * upgrade` passes the variables of the instance env file instead.
  */
+/**
+ * The `KICI_*` settings of the kici-admin CLI, which no orchestrator config field reads: the
+ * admin API (`KICI_ADMIN_URL`, `KICI_ADMIN_TOKEN`), the lazy-dependency mirror
+ * (`KICI_LAZY_DEPS_MIRROR`) and the compose image registry prefix (`KICI_IMAGE_REGISTRY`).
+ * Only the `admin` scope accepts them. An orchestrator refuses to boot on one, with a line
+ * that names what it is, so `KICI_ADMIN_TOKEN` written for `KICI_BOOTSTRAP_ADMIN_TOKEN` is
+ * caught instead of booting with no admin token.
+ */
+export const KICI_ADMIN_ENV_VARS: readonly string[] = [
+  'KICI_ADMIN_URL',
+  'KICI_ADMIN_TOKEN',
+  'KICI_LAZY_DEPS_MIRROR',
+  'KICI_IMAGE_REGISTRY',
+];
+
+/** Why an orchestrator refuses each kici-admin setting at boot. */
+const ADMIN_ONLY_ENV_VAR_ADVICE: Record<string, string> = {
+  KICI_ADMIN_TOKEN:
+    'a kici-admin setting the orchestrator does not read; its own admin token is KICI_BOOTSTRAP_ADMIN_TOKEN',
+  KICI_ADMIN_URL: 'a kici-admin setting the orchestrator does not read',
+  KICI_LAZY_DEPS_MIRROR: 'a kici-admin setting the orchestrator does not read',
+  KICI_IMAGE_REGISTRY: 'a kici-admin setting the orchestrator does not read',
+};
+
 export function loadConfig(
   scope: ConfigScope = ConfigScope.enum.runtime,
   env: NodeJS.ProcessEnv = process.env,
 ): AppConfig {
   const packaging = scope === ConfigScope.enum.packaging;
+  const admin = scope === ConfigScope.enum.admin;
   const data = packaging ? envDef.parse(env, packagingConfigSchema) : envDef.parse(env);
 
   // Reject typo'd KICI_* env vars at boot. Adds the logger's vars
@@ -1320,8 +1348,18 @@ export function loadConfig(
         // service consumes it, so it is allowlisted here rather than
         // workspace-wide, leaving the agent's and Platform's catchers as strict
         // as they were.
-        extraKnown: ['KICI_CONFIG'],
-        notStartupVars: { ...OVERLAY_ONLY_ENV_VAR_ADVICE, ...REMOVED_ENV_VAR_ADVICE },
+        //
+        // The kici-admin settings (its admin API target and token, and the two
+        // install-local sources of an air-gapped host) are known only to a
+        // kici-admin command, which reads them in the process that loads this
+        // config. An orchestrator refuses them: none is an orchestrator setting.
+        // fails-when: a mistyped KICI_ADMIN_TOKEN boots an orchestrator silently
+        extraKnown: ['KICI_CONFIG', ...(admin ? KICI_ADMIN_ENV_VARS : [])],
+        notStartupVars: {
+          ...OVERLAY_ONLY_ENV_VAR_ADVICE,
+          ...REMOVED_ENV_VAR_ADVICE,
+          ...(admin ? {} : ADMIN_ONLY_ENV_VAR_ADVICE),
+        },
       },
       env,
     );

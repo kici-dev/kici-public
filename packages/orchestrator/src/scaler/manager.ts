@@ -496,6 +496,14 @@ interface SpawningEntry {
    */
   spawnStartedAt?: number;
   /**
+   * The manager's provision-failure round when `spawnStartedAt` was set. A
+   * failure of this spawn escalates the scaler's backoff only when no other
+   * failure has escalated it since this spawn started
+   * ({@link ProvisionAttempt}). Undefined on an entry restored from the store,
+   * which falls back to `spawnStartedAt`.
+   */
+  provisionRound?: number;
+  /**
    * The backend type that spawned this agent, recorded at spawn time and
    * rehydrated from the durable row on recovery.
    *
@@ -620,14 +628,75 @@ enum ProvisionFailureKind {
   External = 'external',
   /** A local backend's host refused to start the agent process. */
   Launch = 'launch',
+  /**
+   * A local backend's `spawn()` rejected for any other reason: a missing image,
+   * a runtime socket error, a spawn timeout. The first one is retried at once,
+   * since a single blip should not cost a job the base delay; each further
+   * consecutive one defers like a refused launch.
+   */
+  Transient = 'transient',
+}
+
+/**
+ * The deferral one more consecutive failure earns: `base * 2^(n-1)` for a
+ * refused launch or a dead external provision, one step later for a transient
+ * spawn failure (none after the first), always capped at `maxMs`.
+ */
+function provisionBackoffDelayMs(
+  consecutive: number,
+  transient: boolean,
+  settings: Pick<ProvisionBackoffSettings, 'baseMs' | 'maxMs'>,
+): number {
+  const exponent = transient ? consecutive - 2 : consecutive - 1;
+  if (exponent < 0) return 0;
+  // `2 ** exponent` may be Infinity for a long outage; Math.min still yields the cap.
+  return Math.min(settings.baseMs * 2 ** exponent, settings.maxMs);
+}
+
+/** One scaler's live backoff state, for `kici-admin diagnose`. */
+export interface ProvisionBackoffStatus {
+  consecutiveFailures: number;
+  /** Epoch ms before which a spawn request for this scaler is deferred; 0 when none is armed. */
+  deferUntilMs: number;
+}
+
+/**
+ * When the provision that failed was started, so its failure can be placed
+ * before or after the last escalation of its scaler's backoff.
+ *
+ * Exponential backoff counts attempt rounds, not attempts: eight spawns in
+ * flight when the runtime blips are one round, and counting each would defer
+ * the scaler for the full ceiling after a two-second outage. A failure
+ * escalates only when its provision started after the scaler's last
+ * escalation; an earlier one was already in flight in that round.
+ */
+interface ProvisionAttempt {
+  /**
+   * The manager's round counter when this coordinator started the spawn. Exact,
+   * so preferred: two spawns started in the same millisecond still order
+   * correctly against an escalation.
+   */
+  round?: number;
+  /**
+   * Epoch ms the provision started, for one this process did not start (a
+   * peer's provision the reaper condemns, or a spawn restored from the store).
+   */
+  startedAtMs?: number;
 }
 
 /** Per-scaler consecutive-failure state driving the backoff. */
 interface ProvisionFailureState {
-  /** Consecutive provisioning failures with no successful registration between. */
+  /**
+   * Consecutive failed provision rounds with no successful registration
+   * between. Provisions that fail together count once ({@link ProvisionAttempt}).
+   */
   consecutive: number;
   /** Epoch ms before which a further spawn request for this scaler is deferred. */
   deferUntilMs: number;
+  /** The manager round the last escalation opened; unset before the first. */
+  escalatedRound?: number;
+  /** Epoch ms of the last escalation; unset before the first. */
+  escalatedAtMs?: number;
   /**
    * Agent ids already counted, so two observers of the SAME dead provision count
    * it once: the local stale-spawn prune (every coordinator, over its own spawns)
@@ -644,6 +713,29 @@ interface ProvisionFailureState {
  * long outage would otherwise add one id per attempt for as long as it lasts.
  */
 const MAX_COUNTED_FAILED_AGENTS = 64;
+
+/**
+ * Whether one more failure moves a scaler's backoff a step, or belongs to the
+ * round the last escalation already counted ({@link ProvisionAttempt}). A
+ * failure with no known start counts, as every failure did before rounds.
+ */
+/** The start of the provision a spawning entry tracks, for {@link failureEscalates}. */
+function provisionAttemptOf(entry: SpawningEntry): ProvisionAttempt {
+  return {
+    ...(entry.provisionRound !== undefined && { round: entry.provisionRound }),
+    startedAtMs: entry.spawnStartedAt ?? entry.spawnedAt,
+  };
+}
+
+function failureEscalates(
+  prior: ProvisionFailureState | undefined,
+  attempt: ProvisionAttempt | undefined,
+): boolean {
+  if (prior?.escalatedRound === undefined || prior.escalatedAtMs === undefined) return true;
+  if (attempt?.round !== undefined) return attempt.round >= prior.escalatedRound;
+  if (attempt?.startedAtMs !== undefined) return attempt.startedAtMs >= prior.escalatedAtMs;
+  return true;
+}
 
 /** A job a pending provision was requested for. */
 export interface BoundJobRef {
@@ -733,6 +825,13 @@ export interface ScalerManagerDeps {
    */
   resolveProvisionBackoff?: () => Promise<ProvisionBackoffSettings>;
   /**
+   * Revoke every live ephemeral agent token minted for one agent id; resolves
+   * to the count revoked. Called for a local spawn that produced no agent, so
+   * a failing launch cannot leave one usable token per attempt. Both hosts
+   * wire their token store; unit tests that omit it revoke nothing.
+   */
+  revokeAgentTokens?: (agentId: string) => Promise<number>;
+  /**
    * Current `execution_jobs.status` of the jobs bound to pending event
    * provisions, keyed by job id. A job with no row is absent from the map.
    * Each job comes with its run so the read stays on the `(run_id, job_id)`
@@ -784,7 +883,14 @@ export class ScalerManager {
    * rather than inheriting a deferral it never observed).
    */
   private readonly provisionFailures = new Map<string, ProvisionFailureState>();
+  /**
+   * Provision-failure round counter, shared by every scaler: each backoff
+   * escalation opens a new round, and each spawn records the round it started
+   * in ({@link ProvisionAttempt}). Only its order matters, never its value.
+   */
+  private provisionRound = 0;
   private readonly resolveProvisionBackoff: () => Promise<ProvisionBackoffSettings>;
+  private readonly revokeAgentTokens?: ScalerManagerDeps['revokeAgentTokens'];
   private readonly readJobStatuses?: ScalerManagerDeps['readJobStatuses'];
   private globalMaxAgents: number;
   /**
@@ -978,6 +1084,7 @@ export class ScalerManager {
     this.onScalerEvent = deps.onScalerEvent;
     this.resolveProvisionBackoff =
       deps.resolveProvisionBackoff ?? (async () => DEFAULT_PROVISION_BACKOFF);
+    this.revokeAgentTokens = deps.revokeAgentTokens;
     this.readJobStatuses = deps.readJobStatuses;
     this.isDraining = deps.isDraining ?? (() => false);
     this.globalResourceCap = deps.config.globalResourceCap;
@@ -1140,6 +1247,13 @@ export class ScalerManager {
     const backend = this.backends.get(backendName);
     if (!backend) return;
 
+    // A scaler deferred after failed launches is deferred for its pool too, or
+    // the fill re-spawns into the same failure every tick.
+    if (this.provisionDeferred(backendName)) {
+      this.warmPool.onWarmSpawnFailed(labelSet);
+      return;
+    }
+
     const agentId = this.generateAgentId(backend.type);
     const normalized = normalizeLabelSet(labelSet);
     const labelSetResources = backend.labelSets.find(
@@ -1186,11 +1300,11 @@ export class ScalerManager {
       // not storm the backend socket either.
       await this.spawnSemaphoreFor(backendName).run(async () => {
         const entry = this.spawningAgents.get(agentId);
-        if (entry) entry.spawnStartedAt = Date.now();
+        if (entry) this.markSpawnStarted(entry);
         const fingerprinting = this.captureSpawnSourceFingerprint(agentId, backend, labelSet);
         if (fingerprinting) await fingerprinting;
         // No bound job/org, so the cluster default spawn deadline applies.
-        return this.runSpawnWithTimeout(undefined, (signal) =>
+        return this.runSpawnWithTimeout(undefined, agentId, (signal) =>
           backend.spawn(
             labelSet,
             agentId,
@@ -1220,10 +1334,7 @@ export class ScalerManager {
       // never shows up.
       if (this.onSpawnSettled(agentId, backend)) this.startLogForwarding(backend, agentId);
     } catch (err) {
-      this.spawningAgents.delete(agentId);
-      this.deleteSpawningAgentFromStore(agentId);
-      if (isDeterministicSpawnError(err)) this.deferRefusedLaunch(backendName, agentId);
-      else this.releaseAll(agentId);
+      this.unwindRejectedSpawn(agentId, backendName, err);
       this.warmPool.onWarmSpawnFailed(labelSet);
       logger.error(
         `Warm pool spawn failed for backend ${backendName}: ${err}`,
@@ -1723,9 +1834,14 @@ export class ScalerManager {
    * its own catch cleans up) AND rejects, so the caller's semaphore `run()`
    * releases the slot even if the backend's unwind stalls somewhere
    * non-abortable.
+   *
+   * A backend that outlives the deadline may still mint the agent's token after
+   * the caller's failure branch revoked what existed, so the token is revoked
+   * again once the abandoned spawn settles.
    */
   private async runSpawnWithTimeout(
     orgId: string | undefined,
+    agentId: string,
     spawn: (signal: AbortSignal) => Promise<ManagedAgent>,
   ): Promise<ManagedAgent> {
     const timeoutMs = this.resolveSpawnTimeoutMs
@@ -1734,8 +1850,10 @@ export class ScalerManager {
 
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
     const deadline = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
+        timedOut = true;
         const err = new Error(`scaler spawn timed out after ${timeoutMs}ms`);
         controller.abort(err);
         reject(err);
@@ -1745,7 +1863,10 @@ export class ScalerManager {
     const spawnPromise = spawn(controller.signal);
     // The deadline may win the race; a later abort-rejection must not surface
     // as an unhandled rejection.
-    spawnPromise.catch(() => {});
+    const afterDeadline = (): void => {
+      if (timedOut) this.revokeUnregisteredAgentToken(agentId);
+    };
+    spawnPromise.then(afterDeadline, afterDeadline);
 
     try {
       return await Promise.race([spawnPromise, deadline]);
@@ -1922,14 +2043,14 @@ export class ScalerManager {
           // Admitted past the throttle: start the "never registered" staleness
           // clock now, not at enqueue time.
           const entry = this.spawningAgents.get(agentId);
-          if (entry) entry.spawnStartedAt = Date.now();
+          if (entry) this.markSpawnStarted(entry);
           const fingerprinting = this.captureSpawnSourceFingerprint(
             agentId,
             backend,
             spawnLabelSet,
           );
           if (fingerprinting) await fingerprinting;
-          return this.runSpawnWithTimeout(orgId, (signal) =>
+          return this.runSpawnWithTimeout(orgId, agentId, (signal) =>
             backend.spawn(
               spawnLabelSet,
               agentId,
@@ -1947,10 +2068,7 @@ export class ScalerManager {
             if (this.onSpawnSettled(agentId, backend)) this.startLogForwarding(backend, agentId);
           },
           (err) => {
-            this.spawningAgents.delete(agentId);
-            this.deleteSpawningAgentFromStore(agentId);
-            if (isDeterministicSpawnError(err)) this.deferRefusedLaunch(backendName, agentId);
-            else this.releaseAll(agentId);
+            this.unwindRejectedSpawn(agentId, backendName, err);
             logger.error(`Failed to spawn agent ${agentId} via ${backendName}: ${err}`, {
               ...ids,
               ...spawnFailureFields(err),
@@ -2825,9 +2943,13 @@ export class ScalerManager {
       incScalerExternalProvisionTimeout(candidate.scalerName);
       // Identity from the candidate, not the in-memory maps: the leader-gated
       // reaper often never spawned this agent, which never registered anywhere.
+      // This coordinator's own spawn carries its exact round; a peer's provision
+      // has only the durable spawn time to place it against an escalation.
+      const local = this.spawningAgents.get(candidate.agentId);
       this.reportProvisionFailure({
         scalerName: candidate.scalerName,
         agentId: candidate.agentId,
+        attempt: local ? provisionAttemptOf(local) : { startedAtMs: candidate.spawnedAt.getTime() },
         ...(candidate.runId !== undefined && { runId: candidate.runId }),
         ...(candidate.boundJobId !== undefined && { jobId: candidate.boundJobId }),
       });
@@ -2893,25 +3015,42 @@ export class ScalerManager {
   }
 
   /**
-   * Record a consecutive provisioning failure and arm the next deferral. The
-   * delay doubles per failure up to the cap, so an outage settles into a steady
-   * retry cadence. `2 ** (n - 1)` is capped before use, so it cannot overflow.
+   * Record a provisioning failure and arm the next deferral. The delay doubles
+   * per failed round up to the cap, so an outage settles into a steady retry
+   * cadence ({@link provisionBackoffDelayMs}).
+   *
+   * A failure whose provision started before the scaler's last escalation is
+   * part of that round ({@link ProvisionAttempt}): it re-arms the window at the
+   * current step, so a refused launch is still deferred, but adds no step.
    */
   private async recordProvisionFailure(
     backendName: string,
     kind: ProvisionFailureKind,
+    attempt: ProvisionAttempt | undefined,
   ): Promise<void> {
     // Await first, so the get/set below is one uninterrupted microtask; two
     // concurrent reports would otherwise read one value and lose an increment.
     const settings = await this.resolveProvisionBackoff();
     const prior = this.provisionFailures.get(backendName);
+    const now = Date.now();
+    const transient = kind === ProvisionFailureKind.Transient;
+    // fails-when: each in-flight failure escalates — 8 spawns rejected by one runtime blip
+    // defer the scaler by the ceiling instead of the first step
+    // breaks-if-wrong: a retry started after the last escalation must still escalate, or an
+    // outage would never back off past the first step
+    if (prior && prior.consecutive > 0 && !failureEscalates(prior, attempt)) {
+      const rearmUntil = now + provisionBackoffDelayMs(prior.consecutive, transient, settings);
+      prior.deferUntilMs = Math.max(prior.deferUntilMs, rearmUntil);
+      return;
+    }
     const consecutive = (prior?.consecutive ?? 0) + 1;
-    const uncapped = settings.baseMs * 2 ** (consecutive - 1);
-    // `uncapped` may be Infinity; Math.min still yields the finite cap.
-    const delayMs = Math.min(uncapped, settings.maxMs);
+    const delayMs = provisionBackoffDelayMs(consecutive, transient, settings);
+    this.provisionRound += 1;
     this.provisionFailures.set(backendName, {
       consecutive,
-      deferUntilMs: Date.now() + delayMs,
+      deferUntilMs: now + delayMs,
+      escalatedRound: this.provisionRound,
+      escalatedAtMs: now,
       countedAgents: prior?.countedAgents ?? new Set<string>(),
     });
     if (consecutive >= settings.maxConsecutiveFailures) {
@@ -2976,6 +3115,7 @@ export class ScalerManager {
   private reportProvisionFailure(opts: {
     scalerName: string;
     agentId: string;
+    attempt: ProvisionAttempt | undefined;
     runId?: string;
     jobId?: string;
   }): void {
@@ -2999,42 +3139,133 @@ export class ScalerManager {
         backendType: ScalerBackendType.enum.event,
       },
     );
-    void this.recordProvisionFailure(opts.scalerName, ProvisionFailureKind.External).catch(
-      (err) => {
-        logger.warn('scaler: failed to arm the provision backoff', {
-          scaler: opts.scalerName,
-          error: toErrorMessage(err),
-        });
-      },
-    );
+    void this.recordProvisionFailure(
+      opts.scalerName,
+      ProvisionFailureKind.External,
+      opts.attempt,
+    ).catch((err) => {
+      logger.warn('scaler: failed to arm the provision backoff', {
+        scaler: opts.scalerName,
+        error: toErrorMessage(err),
+      });
+    });
   }
 
   /**
-   * Defer a scaler whose host refused to start an agent, then free the spawn's
-   * reservation.
+   * Defer a scaler whose local launch produced no agent, revoke the agent token
+   * the launch minted, then free the spawn's reservation.
    *
    * Arm first: the release notifies freed capacity, and the re-drive 250 ms
    * later must meet the deferral rather than spawn into the same refusal. The
    * release still notifies, since it legitimately unblocks a job waiting on
-   * another scaler or the global cap. Callers: a `spawn()` rejected with a
-   * `DeterministicSpawnError`, and a settled spawn whose compute stopped before
-   * its agent registered (`dropFailedSettledSpawn`). Any other rejection is
-   * released at once and retried.
+   * another scaler or the global cap. Callers: a `spawn()` that rejected while
+   * its spawning entry was still live (a `DeterministicSpawnError` is a
+   * {@link ProvisionFailureKind.Launch}, anything else
+   * {@link ProvisionFailureKind.Transient}), and a settled spawn whose compute
+   * stopped before its agent registered (`dropFailedSettledSpawn`).
    */
-  private deferRefusedLaunch(backendName: string, agentId: string): void {
+  private deferFailedLaunch(
+    backendName: string,
+    agentId: string,
+    attempt: ProvisionAttempt | undefined,
+    kind: ProvisionFailureKind = ProvisionFailureKind.Launch,
+  ): void {
     const claimed = this.claimFailedProvision(backendName, agentId);
+    this.revokeUnregisteredAgentToken(agentId);
     runDetached(
       logger,
-      'Arm the launch-refusal backoff',
+      'Arm the launch-failure backoff',
       async () => {
         try {
-          if (claimed) await this.recordProvisionFailure(backendName, ProvisionFailureKind.Launch);
+          if (claimed) await this.recordProvisionFailure(backendName, kind, attempt);
         } finally {
           this.releaseAll(agentId);
         }
       },
       { scaler: backendName, agentId },
     );
+  }
+
+  /**
+   * Unwind a `spawn()` that rejected, on the job-bound and the warm path alike.
+   *
+   * With its spawning entry still live, the launch produced no agent: the
+   * scaler is deferred and the token the launch minted is revoked, so a scaler
+   * whose image is missing settles into the backoff instead of re-spawning (and
+   * minting) at the re-drive cadence. With the entry gone, the agent already
+   * registered, ran and left while `spawn()` still awaited the runtime, or the
+   * stale prune took it and did its own cleanup; neither says the scaler is
+   * failing, so the reservation is only released.
+   */
+  private unwindRejectedSpawn(agentId: string, backendName: string, err: unknown): void {
+    const entry = this.spawningAgents.get(agentId);
+    this.spawningAgents.delete(agentId);
+    this.deleteSpawningAgentFromStore(agentId);
+    const attempt = entry && provisionAttemptOf(entry);
+    if (isDeterministicSpawnError(err)) {
+      this.deferFailedLaunch(backendName, agentId, attempt, ProvisionFailureKind.Launch);
+    } else if (entry) {
+      this.deferFailedLaunch(backendName, agentId, attempt, ProvisionFailureKind.Transient);
+    } else {
+      this.releaseAll(agentId);
+    }
+  }
+
+  /** Start a spawning entry's "never registered" clock and record its failure round. */
+  private markSpawnStarted(entry: SpawningEntry): void {
+    entry.spawnStartedAt = Date.now();
+    entry.provisionRound = this.provisionRound;
+  }
+
+  /**
+   * Revoke the ephemeral agent token a local spawn minted for an agent that
+   * never registered, so a failed launch leaves no live credential behind.
+   *
+   * A registered agent is skipped: its token is what keeps its connection, and
+   * only a registered agent is in `managedAgentIndex`. Fire-and-forget, like
+   * the other store writes here; a failed revoke still expires at its TTL.
+   */
+  private revokeUnregisteredAgentToken(agentId: string): void {
+    const revoke = this.revokeAgentTokens;
+    if (!revoke || this.managedAgentIndex.has(agentId)) return;
+    runDetached(
+      logger,
+      'Revoke a failed spawn’s agent token',
+      async () => {
+        const revoked = await revoke(agentId);
+        if (revoked > 0) {
+          logger.info('scaler: revoked the agent token of a spawn that produced no agent', {
+            agentId,
+            revoked,
+          });
+        }
+      },
+      { agentId },
+    );
+  }
+
+  /**
+   * Each scaler's consecutive-failure backoff, for `kici-admin diagnose`. A
+   * scaler stays listed until an agent registers, also once its deferral has
+   * run out; the diagnose row marks only a deferral still running.
+   */
+  provisionBackoffStatus(): Map<string, ProvisionBackoffStatus> {
+    const out = new Map<string, ProvisionBackoffStatus>();
+    for (const [name, state] of this.provisionFailures) {
+      if (state.consecutive === 0) continue;
+      out.set(name, { consecutiveFailures: state.consecutive, deferUntilMs: state.deferUntilMs });
+    }
+    return out;
+  }
+
+  /**
+   * Whether a spawn request for `backendName` would be deferred now. The
+   * synchronous half of {@link provisionBackoffRefusal}, for the warm fill,
+   * which needs no wording.
+   */
+  private provisionDeferred(backendName: string): boolean {
+    const state = this.provisionFailures.get(backendName);
+    return state !== undefined && state.consecutive > 0 && Date.now() < state.deferUntilMs;
   }
 
   /**
@@ -3227,6 +3458,7 @@ export class ScalerManager {
       this.reportProvisionFailure({
         scalerName: entry.backendName,
         agentId,
+        attempt: provisionAttemptOf(entry),
         ...(entry.runId !== undefined && { runId: entry.runId }),
         ...(entry.boundJobId !== undefined && { jobId: entry.boundJobId }),
       });
@@ -4109,6 +4341,9 @@ export class ScalerManager {
         } else {
           // `adopted_by IS NULL` is belt-and-braces: a local row is never adoptable.
           this.deleteUnadoptedSpawningAgentFromStore(id);
+          // The agent never registered here, and a local agent registers nowhere
+          // else, so its token authorizes nothing anyone is waiting for.
+          this.revokeUnregisteredAgentToken(id);
           // The compute may still exist (a VM whose guest stopped after
           // `spawn()` resolved, a process that never connected); without a
           // teardown it counts against `maxAgents` and holds host resources.
@@ -4309,6 +4544,7 @@ export class ScalerManager {
     if (this.managedAgentIndex.has(agentId)) return true;
     if (backend.type !== ScalerBackendType.enum.event) {
       logger.warn(`Spawn of agent ${agentId} finished after it was pruned; destroying it`);
+      this.revokeUnregisteredAgentToken(agentId);
       runDetached(
         logger,
         'Late spawn teardown',
@@ -4337,7 +4573,7 @@ export class ScalerManager {
     this.spawningAgents.delete(agentId);
     this.deleteUnadoptedSpawningAgentFromStore(agentId);
     if (!spawning.boundJobId) this.warmPool.onWarmSpawnFailed(spawning.labelSet);
-    this.deferRefusedLaunch(spawning.backendName, agentId);
+    this.deferFailedLaunch(spawning.backendName, agentId, provisionAttemptOf(spawning));
     this.eventBuffer.delete(agentId);
   }
 
@@ -4525,6 +4761,9 @@ export class ScalerManager {
       });
     }
 
+    // Without this the usage gauges stay absent until the first reservation, and
+    // rehydrated reservations stay invisible until then too.
+    this.publishUsageMetrics();
     return recovery;
   }
 

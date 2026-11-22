@@ -21,7 +21,8 @@
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createLogger, toErrorMessage } from '@kici-dev/core';
-import { toCommandError } from '../command-error.js';
+import { CommandError, toCommandError } from '../command-error.js';
+import { resolveSystemBinary, SYSTEM_BINARY_DIRS } from './system-binary.js';
 
 /**
  * Network policy controlling RFC1918 and internet access for the agents or job
@@ -237,7 +238,12 @@ function tableOf(opts: NftOptions): string {
  * nft's stderr tail
  */
 async function nft(opts: NftOptions, ...args: string[]): Promise<string> {
-  const [file, argv] = opts.requireSudo === true ? ['sudo', ['-n', 'nft', ...args]] : ['nft', args];
+  // Through sudo the bare name is kept: sudo searches its own secure_path,
+  // which reaches /usr/sbin, and a sudoers rule names that path.
+  const [file, argv] =
+    opts.requireSudo === true
+      ? ['sudo', ['-n', 'nft', ...args]]
+      : [resolveSystemBinary('nft'), args];
   const startedAt = Date.now();
   try {
     const { stdout } = await execFile(file, argv, { timeout: NFT_TIMEOUT_MS });
@@ -279,8 +285,8 @@ export async function validateNftablesAvailability(opts: NftOptions = {}): Promi
   if (message !== null) {
     if (message.includes('ENOENT') || message.includes('not found')) {
       throw new Error(
-        'nftables binary not found at /usr/sbin/nft. ' +
-          'The orchestrator container image must include nftables (apk add nftables). ' +
+        `nftables binary not found: no nft on PATH or in ${SYSTEM_BINARY_DIRS.join(', ')}. ` +
+          'Install the nftables package on this host or in this image. ' +
           'Network isolation for agents cannot be established without nftables.',
       );
     }
@@ -646,6 +652,19 @@ export async function removeIsolationRules(
 /** Re-exported for the Firecracker and container backends, which pass `requireSudo` through. */
 export type { NftOptions };
 
+/**
+ * True when nft ran and reported that the table or chain does not exist (exit
+ * 1, "No such file or directory" on stderr). A missing nft binary is a spawn
+ * `ENOENT` with no exit code, and stays a failure.
+ */
+function isMissingChainError(err: unknown): boolean {
+  return (
+    err instanceof CommandError &&
+    err.exitCode === 1 &&
+    err.stderrTail.includes('No such file or directory')
+  );
+}
+
 /** One rule in the forward chain, as reported by `nft -j -a list chain`. */
 export interface NftForwardRule {
   /** nft rule handle, for `nft delete rule … handle N`. */
@@ -682,7 +701,12 @@ export async function listForwardRules(opts: NftOptions = {}): Promise<NftForwar
     const output = await nft(opts, '-j', '-a', 'list', 'chain', 'ip', table, 'forward');
     parsed = JSON.parse(output);
   } catch (err) {
-    logger.warn(`Failed to list forward rules in ip ${table}: ${toErrorMessage(err)}`);
+    if (isMissingChainError(err)) {
+      // A fresh host has no table yet: there are no rules to list.
+      logger.debug(`No forward chain in ip ${table} yet`);
+    } else {
+      logger.warn(`Failed to list forward rules in ip ${table}: ${toErrorMessage(err)}`);
+    }
     return [];
   }
   const entries = (parsed as { nftables?: unknown[] })?.nftables;

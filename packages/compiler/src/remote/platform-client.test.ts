@@ -10,6 +10,8 @@ import {
   ConnectionError,
   nextLogPosition,
 } from './platform-client.js';
+import { ClientNewerThanPlatformError } from './platform-fetch.js';
+import { readWithRetry } from './read-retry.js';
 
 describe('PlatformRunClient', () => {
   const fetchMock = vi.fn();
@@ -209,5 +211,35 @@ describe('PlatformRunClient', () => {
     fetchMock.mockRejectedValue(new Error('ECONNREFUSED'));
 
     await expect(client.runStatus('org_a', 'r')).rejects.toBeInstanceOf(ConnectionError);
+  });
+
+  describe('a Platform that refuses a CLI newer than itself', () => {
+    const REFUSAL = 'Upgrade the Platform first (from the test Platform).';
+    const refusal = () =>
+      jsonResponse({ error: 'client_newer_than_platform', message: REFUSAL }, 409);
+    const fastRetry = { budgetMs: 5_000, baseDelayMs: 1, maxDelayMs: 1 };
+
+    it('reaches the caller as the refusal, read once, not retried as a dropped connection', async () => {
+      // fails-when: transportFailure wraps the refusal in ConnectionError, so readWithRetry
+      // retries it for the whole budget and the Platform's message is lost
+      fetchMock.mockImplementation(async () => refusal());
+      const err = await readWithRetry(() => client.runStatus('org_a', 'r'), fastRetry).catch(
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(ClientNewerThanPlatformError);
+      expect(err).not.toBeInstanceOf(ConnectionError);
+      expect((err as Error).message).toBe(REFUSAL);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('a dropped connection on the same read is retried', async () => {
+      // breaks-if-wrong: the positive control: the read above would be retried if it were a
+      // ConnectionError, so one call there proves the refusal is not one
+      fetchMock
+        .mockRejectedValueOnce(new Error('ECONNRESET'))
+        .mockResolvedValueOnce(jsonResponse({ status: 'success' }));
+      await readWithRetry(() => client.runStatus('org_a', 'r'), fastRetry);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
   });
 });

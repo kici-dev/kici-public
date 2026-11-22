@@ -115,6 +115,22 @@ export class StaticAgentTokenStore {
     return true;
   }
 
+  /** Revoke every live ephemeral token bound to one agent id; returns how many. */
+  async revokeEphemeralForAgent(agentId: string): Promise<number> {
+    let count = 0;
+    for (const record of this.tokens.values()) {
+      if (
+        record.agent_type === 'ephemeral' &&
+        record.createdBy === agentId &&
+        record.revokedAt === null
+      ) {
+        record.revokedAt = Date.now();
+        count++;
+      }
+    }
+    return count;
+  }
+
   /** Remove expired ephemeral tokens; returns how many were removed. */
   async cleanupExpired(): Promise<number> {
     const now = Date.now();

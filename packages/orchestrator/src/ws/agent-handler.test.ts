@@ -35,6 +35,7 @@ import {
   ArtifactCompleteAckOutcome,
   ORCH_AGENT_CAPABILITIES,
   PROTOCOL_VERSION,
+  MIN_PROTOCOL_VERSION,
   WS_CLOSE_PROTOCOL_ERROR,
   WS_CLOSE_INTERNAL_ERROR,
 } from '@kici-dev/engine';
@@ -661,7 +662,7 @@ describe('createAgentWsHandler', () => {
       // The version check runs before the token store, so a valid token does
       // not rescue an old agent.
       //
-      // fails-when: MIN_PROTOCOL_VERSION drops below PROTOCOL_VERSION, or the
+      // fails-when: the floor drops below MIN_PROTOCOL_VERSION, or the
       // check moves behind token validation.
       // breaks-if-wrong: `authRequestMsg()` at PROTOCOL_VERSION still registers
       // in the 'token mode' positive cases beside this one.
@@ -671,7 +672,7 @@ describe('createAgentWsHandler', () => {
 
       handler.onOpen!(new Event('open'), ws as any);
       await handler.onMessage!(
-        makeMessageEvent({ ...authRequestMsg(), protocolVersion: PROTOCOL_VERSION - 1 }),
+        makeMessageEvent({ ...authRequestMsg(), protocolVersion: MIN_PROTOCOL_VERSION - 1 }),
         ws as any,
       );
 
@@ -692,7 +693,7 @@ describe('createAgentWsHandler', () => {
       // A pre-R1 agent let through the handshake omits fields R1's schemas
       // require and has those frames refused instead of being told at connect.
       //
-      // fails-when: the floor stays at 3 — `PROTOCOL_VERSION - 1` above would
+      // fails-when: the floor stays at 3 — `MIN_PROTOCOL_VERSION - 1` above would
       // then drive 2 and still pass while a real pre-R1 agent connects.
       const ts = mockTokenStore();
       const handler = createHandler({ agentAuthMode: 'token', tokenStore: ts });

@@ -1,4 +1,7 @@
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import { stubGithubFetch, TEST_APP_PRIVATE_KEY } from '../__test-helpers__/github-fetch.js';
+import { buildGitCredentialHandler } from '../ws/git-credential-relay.js';
+import { createJobCredentialContextReader } from './job-context.js';
 import {
   GitCredentialBroker,
   GitCredentialRefusedError,
@@ -181,6 +184,164 @@ describe('GitCredentialBroker', () => {
       permissions: { contents: 'write', workflows: 'write' },
     });
     expect(result.expiresAt).toBe('2026-08-22T05:51:29Z');
+  });
+
+  describe("an app ref mints at its job's GitHub server", () => {
+    const APP_REF = {
+      kind: 'app',
+      appIdSecret: 'ci:APP_ID',
+      installationIdSecret: 'ci:INSTALL_ID',
+      privateKeySecret: 'ci:APP_KEY',
+    } as const;
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    function brokerWith(
+      mint?: ConstructorParameters<typeof GitCredentialBroker>[0]['mint'],
+      privateKey = 'pem',
+    ) {
+      return new GitCredentialBroker({
+        secretResolver: secretResolver({ APP_ID: '11', INSTALL_ID: '22', APP_KEY: privateKey }),
+        contextStore: permissiveContexts(),
+        sourceAuth: noSource,
+        ...(mint ? { mint } : {}),
+      });
+    }
+
+    const resolveArgs = (githubUrl?: string) => ({
+      orgId: 'org-1',
+      gate,
+      repositories: ['acme/app'],
+      ref: { ...APP_REF },
+      permissions: { contents: 'read' },
+      ...(githubUrl ? { githubUrl } : {}),
+    });
+
+    const minted = {
+      token: 'ghs_x',
+      expiresAt: null,
+      grantedPermissions: { contents: 'read' },
+      repositorySelection: 'selected',
+    };
+
+    it("an app ref mints at the job's GitHub server", async () => {
+      const mint = vi.fn().mockResolvedValue(minted);
+      await brokerWith(mint).resolve(resolveArgs('https://ghe.corp.example'));
+      // fails-when: the broker drops the job's server, so the mint targets api.github.com
+      expect(mint.mock.calls[0]![0]).toMatchObject({ githubUrl: 'https://ghe.corp.example' });
+    });
+
+    it('an app ref of a github.com job mints with no server', async () => {
+      const mint = vi.fn().mockResolvedValue(minted);
+      await brokerWith(mint).resolve(resolveArgs());
+      // breaks-if-wrong: a github.com or non-GitHub job keeps minting at github.com
+      expect(mint.mock.calls[0]![0]).not.toHaveProperty('githubUrl');
+    });
+
+    it('the default mint posts the token request to that server', async () => {
+      const requests = stubGithubFetch();
+      await brokerWith(undefined, TEST_APP_PRIVATE_KEY).resolve(
+        resolveArgs('https://ghe.corp.example'),
+      );
+      // fails-when: the production mint path ignores the job's server
+      expect(requests.map((r) => `${r.method} ${r.url}`)).toEqual([
+        'POST https://ghe.corp.example/api/v3/app/installations/22/access_tokens',
+      ]);
+
+      const dotcom = stubGithubFetch();
+      await brokerWith(undefined, TEST_APP_PRIVATE_KEY).resolve(resolveArgs());
+      // breaks-if-wrong: a job with no server still mints at api.github.com
+      expect(dotcom.map((r) => `${r.method} ${r.url}`)).toEqual([
+        'POST https://api.github.com/app/installations/22/access_tokens',
+      ]);
+    });
+
+    describe('through the relay, from the rows the orchestrator wrote', () => {
+      const JOB_ID = '3f9b6c02-3a1f-4c19-9a2f-6b0d1e7c4a55';
+      /** The provider context a routing-key-scoped token set on a manual registration. */
+      const INJECTED = { installationId: 22, githubUrl: 'https://evil.example' };
+
+      /** A db holding a cron run of `routingKey`'s source and the `sources` rows given. */
+      function runDb(routingKey: string, sources: Record<string, { github_url: string | null }>) {
+        const answer = (table: string, where: Record<string, unknown>) => {
+          if (table === 'execution_runs') {
+            return {
+              customer_id: 'org-1',
+              repo_identifier: 'acme/app',
+              ref: 'main',
+              trigger_event: 'schedule',
+              trust_tier: null,
+              workflow_repo_identifier: null,
+              workflow_branch: null,
+              routing_key: routingKey,
+              dispatch_routing_key: null,
+              provider_context: INJECTED,
+            };
+          }
+          if (table === 'execution_jobs') return { git_credentials: { ghes: { ...APP_REF } } };
+          if (table === 'dispatch_queue') {
+            return {
+              job_config: '{}',
+              repo_url: 'https://h/acme/app.git',
+              routing_key: routingKey,
+            };
+          }
+          return sources[where.routing_key as string];
+        };
+        return {
+          selectFrom: (table: string) => {
+            const where: Record<string, unknown> = {};
+            const chain = {
+              select: () => chain,
+              where: (column: string, _op: string, value: unknown) => {
+                where[column] = value;
+                return chain;
+              },
+              executeTakeFirst: async () => answer(table, where),
+            };
+            return chain;
+          },
+        } as never;
+      }
+
+      const mintThroughRelay = (db: never) =>
+        buildGitCredentialHandler({
+          broker: brokerWith(undefined, TEST_APP_PRIVATE_KEY),
+          dispatcher: { resolveOwnedJob: () => ({ runId: 'run-1' }) },
+          jobContext: createJobCredentialContextReader(db),
+        })('agent-1', { jobId: JOB_ID, repositories: ['acme/app'], ref: { ...APP_REF } });
+
+      it("an injected server never receives the App's JWT: the source's own server does", async () => {
+        const ghes = stubGithubFetch();
+        await mintThroughRelay(
+          runDb('github:7', {
+            'github:7': { github_url: 'https://ghe.corp.example' },
+          }),
+        );
+        // fails-when: the injected host wins and the JWT goes to https://evil.example
+        expect(ghes.map((r) => `${r.method} ${r.url}`)).toEqual([
+          'POST https://ghe.corp.example/api/v3/app/installations/22/access_tokens',
+        ]);
+
+        const dotcom = stubGithubFetch();
+        await mintThroughRelay(runDb('github:1', { 'github:1': { github_url: null } }));
+        // fails-when: a github.com source's job is redirected by its provider context
+        expect(dotcom.map((r) => `${r.method} ${r.url}`)).toEqual([
+          'POST https://api.github.com/app/installations/22/access_tokens',
+        ]);
+      });
+
+      it('a job of a removed GitHub source is refused and sends nothing', async () => {
+        const requests = stubGithubFetch();
+        await expect(mintThroughRelay(runDb('github:7', {}))).rejects.toThrow(
+          /github:7 that ran this job is no longer configured/,
+        );
+        // fails-when: the mint falls back to the stamp or to api.github.com
+        expect(requests).toEqual([]);
+      });
+    });
   });
 
   it('reports a narrower grant rather than the request', async () => {

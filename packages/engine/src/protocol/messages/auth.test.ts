@@ -35,6 +35,44 @@ describe('authRequestSchema', () => {
     const roundTripped = JSON.parse(JSON.stringify(validRequest));
     expect(authRequestSchema.parse(roundTripped)).toEqual(validRequest);
   });
+
+  // fails-when: the schema strips componentVersion, so the Platform never sees the release
+  it('carries componentVersion, a release version with an optional prerelease suffix', () => {
+    for (const componentVersion of ['0.30.0', '0.30.0-4512']) {
+      expect(authRequestSchema.parse({ ...validRequest, componentVersion })).toEqual({
+        ...validRequest,
+        componentVersion,
+      });
+    }
+  });
+
+  // breaks-if-wrong: every release before the field sends none, and must still parse
+  it('accepts an auth request without componentVersion', () => {
+    expect(authRequestSchema.parse(validRequest)).not.toHaveProperty('componentVersion');
+  });
+
+  // breaks-if-wrong: a later release that widens the form (build metadata, another scheme) must
+  // still parse on every Platform at this release, hosted included; only the self-managed
+  // refusal reads the form, and it treats a value in another form as absent
+  it('accepts a componentVersion that is not a release version', () => {
+    for (const componentVersion of ['unknown', '1.2', 'v1.2.3', '0.31.0+abc', '']) {
+      expect(authRequestSchema.parse({ ...validRequest, componentVersion })).toEqual({
+        ...validRequest,
+        componentVersion,
+      });
+    }
+  });
+
+  // breaks-if-wrong: before the field existed, the non-strict object stripped any value, so every
+  // Platform accepted it; no value of componentVersion may now refuse the handshake
+  it('parses a componentVersion of any length or type', () => {
+    for (const componentVersion of ['9'.repeat(65), null, 30, {}, ['0.30.0'], true]) {
+      expect(
+        authRequestSchema.safeParse({ ...validRequest, componentVersion }).success,
+        JSON.stringify(componentVersion),
+      ).toBe(true);
+    }
+  });
 });
 
 describe('authSuccessSchema', () => {
@@ -90,6 +128,25 @@ describe('authSuccessSchema', () => {
       authSuccessSchema.safeParse({ ...validSuccess, dashboardUrl: 'not a url' }).success,
     ).toBe(true);
     expect(authSuccessSchema.safeParse({ ...validSuccess, dashboardUrl: '' }).success).toBe(true);
+  });
+
+  // fails-when: the schema does not declare githubManifestCallbackUrl, so z.object strips
+  //   it and kici-admin never learns the Platform's own manifest page.
+  it('carries githubManifestCallbackUrl when the Platform sends it', () => {
+    const parsed = authSuccessSchema.parse({
+      ...validSuccess,
+      githubManifestCallbackUrl: 'https://kici.corp.example/github/manifest-callback',
+    });
+    expect(parsed.githubManifestCallbackUrl).toBe(
+      'https://kici.corp.example/github/manifest-callback',
+    );
+  });
+
+  // breaks-if-wrong: a required field makes every orchestrator refuse the handshake of
+  //   a Platform that serves no manifest page.
+  it('accepts an auth.success without githubManifestCallbackUrl', () => {
+    const parsed = authSuccessSchema.parse(validSuccess);
+    expect(parsed).not.toHaveProperty('githubManifestCallbackUrl');
   });
 
   // The Platform omits the key when it has no base; a null is not a valid value.

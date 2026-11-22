@@ -116,7 +116,8 @@ Hooks execute inside-out, like stack unwinding.
 ### On success
 
 ```
-1. Step-level hooks:
+1. Step-level hooks (around each step):
+   - beforeStep (runs before each step starts)
    - afterStep (runs after each step, before next step starts)
 
 2. Job-level hooks:
@@ -127,7 +128,11 @@ Hooks execute inside-out, like stack unwinding.
 ### On failure
 
 ```
-1. Job-level hooks:
+1. Step-level hooks (around each step that runs, the failed step included):
+   - beforeStep
+   - afterStep
+
+2. Job-level hooks:
    - onFailure
    - cleanup (always runs)
 ```
@@ -138,7 +143,7 @@ Hooks execute inside-out, like stack unwinding.
 - **Hooks run sequentially** after the step exits, not in parallel with the step.
 - **cleanup always runs** regardless of outcome (success, failure, or graceful cancel), but is skipped on force cancel.
 - **afterStep** runs immediately after its step, before the next step starts (not deferred).
-- **Hook failure** changes job status to `failed` with a compound reason (e.g., "cancelled (onCancel hook failed: timeout)").
+- **Hook failure** of a cancel or completion hook changes job status to `failed` with a compound reason (e.g., "cancelled (onCancel hook failed: timeout)"). A `beforeStep` or `afterStep` failure is logged and leaves the job status unchanged.
 
 ## Hook step protocol
 

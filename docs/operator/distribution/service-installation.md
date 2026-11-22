@@ -60,7 +60,7 @@ Every lifecycle command — `uninstall`, `upgrade`, `start`, `stop`, `restart`, 
 2. `--name <name>` flag (matches against the reconciled instance list for the current privilege scope).
 3. A manifest in the current working directory (`./.kici-orchestrator.json` or `./.kici-agent.json`).
 
-If none of those resolve, the command exits non-zero with a candidate list of installed instances on the host. `--name` no longer has a default — a bare `kici-admin orchestrator uninstall` outside any deploy folder will refuse and list the candidates.
+If none of those resolve, the command exits non-zero with a candidate list of installed instances on the host. `--name` has no default: a bare `kici-admin orchestrator uninstall` outside any deploy folder refuses and lists the candidates.
 
 Once the target resolves, the command reads the service platform from that install's manifest. A Compose install is managed with Compose even on a systemd host, and a systemd install is managed with systemd even where a container runtime is present. `--platform <type>` overrides the manifest and forces one driver. Only `install` detects the platform from the host, because it is the command that writes the manifest.
 
@@ -79,7 +79,7 @@ You need one of:
 
 A `kici-admin` from a standalone package carries no orchestrator or agent server. With it, pass `install --binary` with the path of the launcher in the orchestrator or agent package, such as `<package dir>/kici-orchestrator-standalone`. Without `--binary`, `install` stops and asks for it.
 
-For Windows, [shawl](https://github.com/mtkennerly/shawl) is downloaded automatically on first install (cached for future use).
+For Windows, [shawl](https://github.com/mtkennerly/shawl) is downloaded automatically on first install (cached for future use). The download is checked against the SHA-256 the release records. On a host with no internet access, set `KICI_LAZY_DEPS_MIRROR` to an `http://`, `https://` or `file://` base that holds each archive at `<base>/<name>/<version>/<platform>-<arch>/<file name>`, for example `<base>/shawl/1.9.0/win32-x64/shawl-v1.9.0-win64.zip`. The SHA-256 check still applies to a file from the mirror. Windows extracts the archive with `Expand-Archive`; other hosts extract it in-process and need no `unzip`.
 
 ## Quick start
 
@@ -175,6 +175,16 @@ from the version you want) — that writes a new compose file with the new relea
 digest. Pulling a different image without regenerating is a deliberate manual edit
 of the pin.
 
+#### Pulling from your own registry
+
+To pull from a registry mirror instead of `quay.io/kici-dev`, pass `--image-registry <prefix>` (or set `KICI_IMAGE_REGISTRY`). The image line then names your prefix and keeps the same digest, so the mirror cannot substitute the content:
+
+```yaml
+image: registry.internal.example/kici-dev/kici-orchestrator:0.1.15@sha256:<index-digest>
+```
+
+Copy each image into your registry under the same repository name and digest. `agent install --platform compose` takes the same flag. The install records the prefix in its instance manifest, so a command that writes the compose file again keeps it. The flag applies only to `--platform compose`: on another platform, the flag is refused, and `KICI_IMAGE_REGISTRY` is ignored.
+
 If you generate the compose file from a development build that never ran a release,
 the installer falls back to the `:latest` tag (with a warning) since no recorded
 digest ships with that build.
@@ -244,18 +254,20 @@ kici-admin orchestrator install \
 
 Available flags:
 
-| Flag                    | Description                                                                             | Default                   |
-| ----------------------- | --------------------------------------------------------------------------------------- | ------------------------- |
-| `--platform <type>`     | Force platform: `systemd`, `launchd`, `windows`, `compose`                              | Detected from the host    |
-| `--mode <mode>`         | Operating mode written to the env file: `hybrid`, `platform`, `observed`, `independent` | `hybrid`                  |
-| `--env-file <path>`     | Path to existing env/config file                                                        | Creates new in config dir |
-| `--binary <path>`       | Path to orchestrator binary                                                             | Current executable        |
-| `--name <name>`         | Service name (also the per-instance directory segment under config/log/install roots)   | `kici-orchestrator`       |
-| `--instance-dir <path>` | Deploy folder where the instance manifest is written and resolved from                  | Current working directory |
-| `--force`               | Overwrite a same-named instance already installed at a different `--instance-dir`       | Off                       |
-| `--dev`                 | Dev mode with local PostgreSQL                                                          | Off                       |
-| `--wizard`              | Run the interactive setup wizard                                                        | On (interactive terminal) |
-| `--no-wizard`           | Skip the wizard and write a stub env file to edit by hand                               | Off                       |
+| Flag                        | Description                                                                                                                                                                                                    | Default                                       |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `--platform <type>`         | Force platform: `systemd`, `launchd`, `windows`, `compose`                                                                                                                                                     | Detected from the host                        |
+| `--mode <mode>`             | Operating mode written to the env file: `hybrid`, `platform`, `observed`, `independent`                                                                                                                        | `hybrid`                                      |
+| `--platform-url <url>`      | Platform WebSocket URL the install writes to the env file as `KICI_PLATFORM_URL` and offers as the wizard's default. It also replaces the value in an existing env file and in a file copied with `--env-file` | The hosted Platform (`wss://api.kici.dev/ws`) |
+| `--env-file <path>`         | Path to existing env/config file                                                                                                                                                                               | Creates new in config dir                     |
+| `--binary <path>`           | Path to orchestrator binary                                                                                                                                                                                    | Current executable                            |
+| `--name <name>`             | Service name (also the per-instance directory segment under config/log/install roots)                                                                                                                          | `kici-orchestrator`                           |
+| `--instance-dir <path>`     | Deploy folder where the instance manifest is written and resolved from                                                                                                                                         | Current working directory                     |
+| `--force`                   | Overwrite a same-named instance already installed at a different `--instance-dir`                                                                                                                              | Off                                           |
+| `--image-registry <prefix>` | Compose only: pull the image from this registry prefix instead of `quay.io/kici-dev`, pinned to the same digest. Env: `KICI_IMAGE_REGISTRY`                                                                    | `quay.io/kici-dev`                            |
+| `--dev`                     | Dev mode with local PostgreSQL                                                                                                                                                                                 | Off                                           |
+| `--wizard`                  | Run the interactive setup wizard                                                                                                                                                                               | On (interactive terminal)                     |
+| `--no-wizard`               | Skip the wizard and write a stub env file to edit by hand                                                                                                                                                      | Off                                           |
 
 ### Dev mode (`--dev`)
 

@@ -338,8 +338,8 @@ export type Trigger = TriggerConfig;
  *
  * **Guidance:** derive job names and structure from `ctx.event` / `ctx.needs`
  * data whenever possible. If you use `kici.infrastructure.list()` or shell
- * commands to determine job names, be aware that changes between eval and re-eval
- * will cause a non-determinism warning (or failure if a job disappears).
+ * commands to determine job names, a change between eval and re-eval causes a
+ * non-determinism warning (or failure if a job disappears).
  */
 export interface DynamicJobContext {
   /** zx shell executor for running commands */
@@ -753,6 +753,23 @@ export type RunsOnPick = 'deterministic' | 'any';
 export type RunsOn = string | RegExp | (string | RegExp)[] | RunsOnSelector;
 
 /**
+ * Clone depth and tag policy for a job's checkout (`checkout: { … }`).
+ *
+ * @example
+ * job({ checkout: { fetchDepth: 0 }, … })
+ * job({ checkout: { fetchDepth: 20, fetchTags: true }, … })
+ */
+export interface CheckoutOptions {
+  /** Commits of history to fetch. 1 (default) = shallow; 0 = full history + all branches and tags. */
+  readonly fetchDepth?: number;
+  /**
+   * Unset: git's default (tags pointing at fetched commits). true: all tags.
+   * false: no tags. fetchDepth: 0 fetches all tags unless this is false.
+   */
+  readonly fetchTags?: boolean;
+}
+
+/**
  * Job definition returned by job() factory.
  *
  * `TOutputs` is the job's inferred output shape, threaded onto `result` so
@@ -817,8 +834,11 @@ export interface Job<TOutputs = Record<string, unknown>, TName extends string = 
   readonly include?: MatrixInclude[];
   /** Exclude combinations */
   readonly exclude?: MatrixExclude[];
-  /** When false, agent skips git clone (default: true). Useful for deploy/notify jobs. */
-  readonly checkout?: boolean;
+  /**
+   * The job's git checkout. `true` or omitted = depth 1 with git's default tags;
+   * `false` = no clone (useful for deploy/notify jobs); the object sets depth and tags.
+   */
+  readonly checkout?: boolean | CheckoutOptions;
   /**
    * Named git credentials available to every step in this job.
    *
@@ -993,8 +1013,11 @@ export interface JobOptions {
    * Applied before include, removes matching combinations.
    */
   exclude?: MatrixExclude[];
-  /** When false, agent skips git clone (default: true). Useful for deploy/notify jobs. */
-  checkout?: boolean;
+  /**
+   * The job's git checkout. `true` or omitted = depth 1 with git's default tags;
+   * `false` = no clone (useful for deploy/notify jobs); the object sets depth and tags.
+   */
+  checkout?: boolean | CheckoutOptions;
   /**
    * Named git credentials available to every step in this job.
    *

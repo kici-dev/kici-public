@@ -190,8 +190,11 @@ export const ALLOWED_SYSTEM_VARS = [
   'APPDATA',
   'PROCESSOR_ARCHITECTURE',
   'NUMBER_OF_PROCESSORS',
+  ...TLS_TRUST_PATH_VARS, // GIT_SSL_CAINFO, GIT_SSL_CAPATH, SSL_CERT_FILE, SSL_CERT_DIR, NODE_EXTRA_CA_CERTS
 ] as const;
 ```
+
+The TLS trust variables (`TLS_TRUST_PATH_VARS`) name paths on the agent host. A sandbox with its own filesystem mounts each path read-only under `/run/kici/trust/<n>/<name>` and rewrites the variable to that mount: the container sandbox as a bind mount, bubblewrap as `--ro-bind <source> <target>` (`host-trust-paths.ts`). `<name>` is the resolved path's last component, or a fixed name when that is empty, `.` or `..`. The mount never covers the image's own trust store. The source is the host path with symbolic links resolved, and it must be a regular file (a directory other than `/` for `SSL_CERT_DIR` and `GIT_SSL_CAPATH`). Both sandboxes drop a variable with no usable path, so the image's own trust store stays in use. A value the job, source or org env sets is the job's own path and is passed unchanged, with no mount.
 
 ### Trusted-env profile
 

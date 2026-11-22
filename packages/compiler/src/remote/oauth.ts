@@ -6,6 +6,8 @@ import open from 'open';
 import pc from 'picocolors';
 import { toErrorMessage } from '@kici-dev/core';
 import { discoverOidcEndpoints } from './oidc-discovery.js';
+import { oidcScopeString } from './oidc-scopes.js';
+import { ClientNewerThanPlatformError, platformFetch } from './platform-fetch.js';
 import { sleep } from '@kici-dev/engine';
 
 /**
@@ -18,8 +20,9 @@ async function fetchOrThrow(
   kind: 'Platform' | 'IdP',
 ): Promise<Response> {
   try {
-    return await fetch(url, init);
+    return await (kind === 'Platform' ? platformFetch : fetch)(url, init);
   } catch (err) {
+    if (err instanceof ClientNewerThanPlatformError) throw err;
     const envHint = kind === 'Platform' ? 'KICI_PLATFORM_URL' : 'KICI_OIDC_ISSUER';
     throw new Error(
       `Could not reach ${kind} at ${url} (${toErrorMessage(err)}). Check ${envHint}.`,
@@ -30,6 +33,8 @@ async function fetchOrThrow(
 interface PkceFlowOptions {
   issuer: string;
   clientId: string;
+  /** Scopes requested after the base scopes, such as an API-audience scope the IdP needs. */
+  extraScopes?: readonly string[];
   /** Delay before the "still waiting" nudge. A testing seam: no flag or env var sets it. */
   nudgeAfterMs?: number;
   /**
@@ -45,6 +50,8 @@ interface PkceFlowOptions {
 interface DeviceFlowOptions {
   issuer: string;
   clientId: string;
+  /** Scopes requested after the base scopes, as for the PKCE flow. */
+  extraScopes?: readonly string[];
 }
 
 interface ExchangeTokenOptions {
@@ -272,8 +279,7 @@ export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
       authUrl.searchParams.set('client_id', clientId);
       authUrl.searchParams.set('redirect_uri', redirectUri);
       authUrl.searchParams.set('response_type', 'code');
-      const scopes = ['openid', 'profile', 'email', 'offline_access'];
-      authUrl.searchParams.set('scope', scopes.join(' '));
+      authUrl.searchParams.set('scope', oidcScopeString(opts.extraScopes));
       authUrl.searchParams.set('code_challenge', challenge);
       authUrl.searchParams.set('code_challenge_method', 'S256');
       authUrl.searchParams.set('state', state);
@@ -344,8 +350,16 @@ export async function pkceFlow(opts: PkceFlowOptions): Promise<string> {
 export async function deviceFlow(opts: DeviceFlowOptions): Promise<string> {
   const { issuer, clientId } = opts;
   const endpoints = await discoverOidcEndpoints(issuer);
-
-  const scopes = ['openid', 'profile', 'email', 'offline_access'];
+  const deviceEndpoint = endpoints.device_authorization_endpoint;
+  // fails-when: an IdP with no device flow gets a request to an undefined URL
+  if (!deviceEndpoint) {
+    throw new Error(
+      `The identity provider at ${issuer} advertises no device_authorization_endpoint, so ` +
+        'the device flow (--device, or the default on a headless machine) cannot run. Sign in ' +
+        'with the browser flow instead: run kici login without --device, and set ' +
+        'KICI_BROWSER_CMD=none on a headless machine to print the sign-in URL.',
+    );
+  }
 
   // Keycloak enforces PKCE on device flow when the client sets
   // `pkce.code.challenge.method` (KiCI's public clients require S256). RFC 8628
@@ -354,13 +368,13 @@ export async function deviceFlow(opts: DeviceFlowOptions): Promise<string> {
   const { verifier, challenge } = generatePkceChallenge();
 
   const deviceAuthRes = await fetchOrThrow(
-    endpoints.device_authorization_endpoint,
+    deviceEndpoint,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({
         client_id: clientId,
-        scope: scopes.join(' '),
+        scope: oidcScopeString(opts.extraScopes),
         code_challenge: challenge,
         code_challenge_method: 'S256',
       }),

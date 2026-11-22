@@ -9,6 +9,7 @@
  */
 
 import { toErrorMessage } from '@kici-dev/core';
+import { ClientNewerThanPlatformError, platformFetch } from './platform-fetch.js';
 import {
   TEST_RUN_LOG_CURSOR_START,
   type CheckMode,
@@ -30,7 +31,11 @@ export class AccessDeniedError extends Error {
 }
 
 export class NotFoundError extends Error {
-  constructor(message = 'Resource not found') {
+  constructor(
+    message = 'Resource not found',
+    /** The body's machine-readable `code`, when the server sent one. */
+    readonly code?: string,
+  ) {
     super(message);
     this.name = 'NotFoundError';
   }
@@ -43,6 +48,87 @@ export class ConnectionError extends Error {
   ) {
     super(message);
     this.name = 'ConnectionError';
+  }
+}
+
+/** Any other non-OK answer; `status` lets a caller tell a server failure from a refusal. */
+export class HttpStatusError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = 'HttpStatusError';
+  }
+}
+
+/**
+ * Deadline of a status or log read, body included: past the Platform's 10 s relay deadline and
+ * the orchestrator's 30 s default statement timeout; several still fit the 2-minute retry budget.
+ */
+export const READ_REQUEST_TIMEOUT_MS = 30_000;
+
+/** Per-call options of a status or log read. */
+export interface ReadRequestOptions {
+  /** Aborts the read at once (Ctrl-C); the abort error is rethrown as it is. */
+  signal?: AbortSignal;
+}
+
+/** The read deadline, ended early by the caller's `signal`. */
+export function readRequestSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
+  const deadline = AbortSignal.timeout(timeoutMs);
+  return signal ? AbortSignal.any([deadline, signal]) : deadline;
+}
+
+export interface RemoteServer {
+  label: string;
+  endpoint: string;
+}
+
+const errorName = (err: unknown): unknown => (err as { name?: unknown } | null)?.name;
+
+/** A failed connection, passed read deadline or cut-off body; a caller abort is kept as is. */
+function transportFailure(err: unknown, server: RemoteServer, phase: 'connect' | 'body'): Error {
+  if (errorName(err) === 'AbortError') return err as Error;
+  // fails-when: the refusal is retried as a dropped connection, and its message is lost
+  if (err instanceof ClientNewerThanPlatformError) return err;
+  const message =
+    errorName(err) === 'TimeoutError'
+      ? `No answer from ${server.label} before the read deadline`
+      : phase === 'connect'
+        ? `Failed to connect to ${server.label}: ${toErrorMessage(err)}`
+        : `The response from ${server.label} was cut off: ${toErrorMessage(err)}`;
+  return new ConnectionError(message, server.endpoint);
+}
+
+/** Send a bearer-authenticated JSON request; no answer is a `ConnectionError`. */
+export async function sendAuthenticated(
+  url: string,
+  init: RequestInit,
+  token: string,
+  server: RemoteServer,
+): Promise<Response> {
+  try {
+    return await platformFetch(url, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+        ...(init.headers as Record<string, string>),
+      },
+    });
+  } catch (err) {
+    throw transportFailure(err, server, 'connect');
+  }
+}
+
+/** Parse a JSON body; a body cut off mid-read is retried like a dropped connection. */
+export async function readJsonBody<T>(response: Response, server: RemoteServer): Promise<T> {
+  try {
+    return (await response.json()) as T;
+  } catch (err) {
+    if (err instanceof SyntaxError) throw err;
+    throw transportFailure(err, server, 'body');
   }
 }
 
@@ -202,6 +288,8 @@ interface PlatformRunClientConfig {
   platformEndpoint: string;
   /** PAT, sent as the bearer credential. */
   token: string;
+  /** Deadline of a status or log read; defaults to {@link READ_REQUEST_TIMEOUT_MS}. */
+  readTimeoutMs?: number;
 }
 
 /**
@@ -228,10 +316,16 @@ export interface ClusterTarget {
 export class PlatformRunClient {
   private readonly baseUrl: string;
   private readonly token: string;
+  private readonly readTimeoutMs: number;
 
   constructor(config: PlatformRunClientConfig) {
     this.baseUrl = config.platformEndpoint.replace(/\/+$/, '');
     this.token = config.token;
+    this.readTimeoutMs = config.readTimeoutMs ?? READ_REQUEST_TIMEOUT_MS;
+  }
+
+  private get server(): RemoteServer {
+    return { label: `the Platform at ${this.baseUrl}`, endpoint: this.baseUrl };
   }
 
   /** POST /test/uploads/init — mint an external presigned upload URL. */
@@ -241,8 +335,7 @@ export class PlatformRunClient {
     body: PlatformUploadInitInput,
   ): Promise<PlatformUploadInitResponse> {
     const path = `/api/v1/orgs/${orgId}/test/uploads/init${clusterQuery(target.orchestrator, target.defaultCluster)}`;
-    const response = await this.request(path, { method: 'POST', body: JSON.stringify(body) });
-    return (await response.json()) as PlatformUploadInitResponse;
+    return this.requestJson(path, { method: 'POST', body: JSON.stringify(body) });
   }
 
   /** POST /test/trigger */
@@ -252,12 +345,11 @@ export class PlatformRunClient {
     body: PlatformTriggerInput,
   ): Promise<PlatformTriggerResponse> {
     const path = `/api/v1/orgs/${orgId}/test/trigger${clusterQuery(target.orchestrator, target.defaultCluster)}`;
-    const response = await this.request(
+    return this.requestJson(
       path,
       { method: 'POST', body: JSON.stringify(body) },
       { mintsRun: true },
     );
-    return (await response.json()) as PlatformTriggerResponse;
   }
 
   /** GET /test/runs/:runId — run-status snapshot. */
@@ -265,10 +357,10 @@ export class PlatformRunClient {
     orgId: string,
     runId: string,
     target: ClusterTarget = {},
+    opts: ReadRequestOptions = {},
   ): Promise<PlatformRunStatusResponse> {
     const path = `/api/v1/orgs/${orgId}/test/runs/${runId}${clusterQuery(target.orchestrator, target.defaultCluster)}`;
-    const response = await this.request(path, { method: 'GET' });
-    return (await response.json()) as PlatformRunStatusResponse;
+    return this.requestJson(path, { method: 'GET', signal: this.readSignal(opts) });
   }
 
   /** GET /test/runs/:runId/logs — next log chunk from a position. */
@@ -277,6 +369,7 @@ export class PlatformRunClient {
     runId: string,
     position: RunLogPosition,
     target: ClusterTarget = {},
+    opts: ReadRequestOptions = {},
   ): Promise<PlatformRunLogsResponse> {
     const params = new URLSearchParams();
     params.set('cursor', String(position.cursor));
@@ -284,8 +377,7 @@ export class PlatformRunClient {
     if (target.orchestrator) params.set('orchestrator', target.orchestrator);
     if (target.defaultCluster) params.set('defaultCluster', target.defaultCluster);
     const path = `/api/v1/orgs/${orgId}/test/runs/${runId}/logs?${params.toString()}`;
-    const response = await this.request(path, { method: 'GET' });
-    return (await response.json()) as PlatformRunLogsResponse;
+    return this.requestJson(path, { method: 'GET', signal: this.readSignal(opts) });
   }
 
   /** POST /test/runs/:runId/cancel */
@@ -295,14 +387,25 @@ export class PlatformRunClient {
     target: ClusterTarget = {},
   ): Promise<PlatformCancelResponse> {
     const path = `/api/v1/orgs/${orgId}/test/runs/${runId}/cancel${clusterQuery(target.orchestrator, target.defaultCluster)}`;
-    const response = await this.request(path, { method: 'POST', body: JSON.stringify({}) });
-    return (await response.json()) as PlatformCancelResponse;
+    return this.requestJson(path, { method: 'POST', body: JSON.stringify({}) });
+  }
+
+  private readSignal(opts: ReadRequestOptions): AbortSignal {
+    return readRequestSignal(this.readTimeoutMs, opts.signal);
+  }
+
+  private async requestJson<T>(
+    path: string,
+    init: RequestInit,
+    opts: { mintsRun?: boolean } = {},
+  ): Promise<T> {
+    return readJsonBody<T>(await this.request(path, init, opts), this.server);
   }
 
   /**
    * Classifies errors: 401 → AuthenticationError, 403 → AccessDeniedError,
    * 404 → NotFoundError, 422 ambiguous_cluster → AmbiguousClusterError,
-   * 422 no_cluster → NoClusterError, network failure → ConnectionError.
+   * 422 no_cluster → NoClusterError, network failure or deadline → ConnectionError.
    * `mintsRun` marks a request that starts a run: a timeout there does not
    * mean the run did not start.
    */
@@ -314,23 +417,7 @@ export class PlatformRunClient {
     const url = `${this.baseUrl}${path}`;
     const startedAt = new Date();
 
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        ...init,
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.token}`,
-          ...(init.headers as Record<string, string>),
-        },
-      });
-    } catch (err) {
-      throw new ConnectionError(
-        `Failed to connect to the Platform at ${this.baseUrl}: ${toErrorMessage(err)}`,
-        this.baseUrl,
-      );
-    }
-
+    const response = await sendAuthenticated(url, init, this.token, this.server);
     if (response.ok) {
       return response;
     }
@@ -367,8 +454,9 @@ export class PlatformRunClient {
       throw new Error(body.reason ?? body.message ?? body.error ?? 'Request rejected (422)');
     }
 
-    throw new Error(
+    throw new HttpStatusError(
       `Request failed with status ${response.status}: ${await readError(response, '')}`,
+      response.status,
     );
   }
 }
@@ -386,7 +474,11 @@ export async function throwForAccessStatus(
     throw new AccessDeniedError(await readError(response, 'Access denied'));
   }
   if (response.status === 404) {
-    throw new NotFoundError(await readError(response, 'Resource not found'));
+    const { code } = await readJson(response.clone());
+    throw new NotFoundError(
+      await readError(response, 'Resource not found'),
+      typeof code === 'string' ? code : undefined,
+    );
   }
 }
 

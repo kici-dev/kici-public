@@ -28,6 +28,7 @@ import {
   type ConfigPaths,
   ORCH_CAPABILITIES,
   PROTOCOL_VERSION,
+  RELEASE_VERSION_PATTERN,
   WS_MAX_PAYLOAD_BYTES,
   DASHBOARD_REQUEST_TYPE_SET,
   DashboardResponseErrorCode,
@@ -57,6 +58,11 @@ export interface InboundVerifyOutcome {
 }
 
 const logger = createLogger({ prefix: 'platform-client' });
+
+declare const KICI_PKG_VERSION: string;
+/** The release this orchestrator was built from; undefined in an unbundled run. */
+const BUILD_RELEASE_VERSION =
+  typeof KICI_PKG_VERSION !== 'undefined' ? KICI_PKG_VERSION : undefined;
 
 /**
  * Every inbound Platform frame `type` this orchestrator recognizes: the mainline
@@ -271,6 +277,11 @@ export interface PlatformClientOptions {
   /** Merged with ORCH_CAPABILITIES in auth.request. */
   orchCapabilities?: Partial<OrchCapabilities>;
   /**
+   * The release version `auth.request` sends as `componentVersion`. Defaults to the build's
+   * `KICI_PKG_VERSION`; a value that is not a release version is not sent.
+   */
+  componentVersion?: string;
+  /**
    * Verify a reassembled chunked-relay webhook. Without it every chunked relay
    * is ACKed `rejected_misconfigured`, since the trust check cannot run.
    */
@@ -397,6 +408,8 @@ export class PlatformClient {
   private readonly onStaleCheckrunCleanup?: PlatformClientOptions['onStaleCheckrunCleanup'];
   private readonly onJoinRequest?: PlatformClientOptions['onJoinRequest'];
   private orchCapabilities: OrchCapabilities;
+  /** Sent in `auth.request`; undefined when the build has no release version. */
+  private readonly componentVersion: string | undefined;
   private readonly onVerifyInbound?: PlatformClientOptions['onVerifyInbound'];
   private readonly onAdmit?: PlatformClientOptions['onAdmit'];
   private readonly onShedCapture?: PlatformClientOptions['onShedCapture'];
@@ -412,6 +425,8 @@ export class PlatformClient {
   private _githubWebhookUrl?: string | null;
 
   private _dashboardUrl?: string;
+
+  private _githubManifestCallbackUrl?: string;
 
   getOrgPublicAlias(): string | undefined {
     return this._orgPublicAlias;
@@ -444,6 +459,15 @@ export class PlatformClient {
    */
   getDashboardUrl(): string | undefined {
     return this._dashboardUrl;
+  }
+
+  /**
+   * The headless GitHub App manifest page the Platform serves, from the last
+   * `auth.success`. `undefined` before the first successful auth, or when the
+   * Platform serves no such page (or sends an empty URL).
+   */
+  getGithubManifestCallbackUrl(): string | undefined {
+    return this._githubManifestCallbackUrl;
   }
 
   constructor(options: PlatformClientOptions) {
@@ -487,6 +511,12 @@ export class PlatformClient {
     this.onStaleCheckrunCleanup = options.onStaleCheckrunCleanup;
     this.onJoinRequest = options.onJoinRequest;
     this.orchCapabilities = { ...ORCH_CAPABILITIES, ...options.orchCapabilities };
+    const componentVersion = options.componentVersion ?? BUILD_RELEASE_VERSION;
+    // breaks-if-wrong: a version the Platform's schema refuses would refuse every connection
+    this.componentVersion =
+      componentVersion !== undefined && RELEASE_VERSION_PATTERN.test(componentVersion)
+        ? componentVersion
+        : undefined;
     this.onVerifyInbound = options.onVerifyInbound;
     this.onAdmit = options.onAdmit;
     this.onShedCapture = options.onShedCapture;
@@ -978,6 +1008,7 @@ export class PlatformClient {
           token: this.token,
           protocolVersion: PROTOCOL_VERSION,
           capabilities: this.orchCapabilities,
+          ...(this.componentVersion !== undefined && { componentVersion: this.componentVersion }),
         }),
       );
     });
@@ -1384,6 +1415,8 @@ export class PlatformClient {
     this._githubWebhookUrl = msg.githubWebhookUrl;
     // Assigned on every auth, so a reconnect to a Platform that sends no base clears it.
     this._dashboardUrl = msg.dashboardUrl || undefined;
+    // Same rule: a reconnect to a Platform that serves no page clears it.
+    this._githubManifestCallbackUrl = msg.githubManifestCallbackUrl || undefined;
     this.startHeartbeat();
     this.startClusterMembership();
 

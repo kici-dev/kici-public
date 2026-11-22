@@ -65,13 +65,15 @@ vi.mock('@kici-dev/shared', () => {
 // The @kici-dev/core/tmp allocator imports the *named* mkdtemp/rm/writeFile
 // while job-runner uses the default import, so named and default exports share
 // the same vi.fn instances (assertions read the default export).
-const { mkdtempFn, rmFn, accessFn, writeFileFn, mkdirFn } = vi.hoisted(() => ({
+const { mkdtempFn, rmFn, accessFn, writeFileFn, mkdirFn, cpFn } = vi.hoisted(() => ({
   mkdtempFn: vi.fn().mockResolvedValue('/tmp/kici-test123'),
   rmFn: vi.fn().mockResolvedValue(undefined),
   accessFn: vi.fn().mockResolvedValue(undefined),
   writeFileFn: vi.fn().mockResolvedValue(undefined),
   // The host checkout of a global workflow creates its workflow/source dirs.
   mkdirFn: vi.fn().mockResolvedValue(undefined),
+  // The host's `.kici/`-only fetch for a checkout: false container job.
+  cpFn: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock('node:fs/promises', () => ({
   default: {
@@ -80,12 +82,14 @@ vi.mock('node:fs/promises', () => ({
     access: accessFn,
     writeFile: writeFileFn,
     mkdir: mkdirFn,
+    cp: cpFn,
   },
   mkdtemp: mkdtempFn,
   rm: rmFn,
   access: accessFn,
   writeFile: writeFileFn,
   mkdir: mkdirFn,
+  cp: cpFn,
 }));
 
 vi.mock('dockerode', () => ({
@@ -262,7 +266,8 @@ vi.mock('./download.js', () => ({
   uploadToPresignedUrl: vi.fn().mockResolvedValue(undefined),
 }));
 
-const { BareMetalSandbox, ContainerSandbox } = await import('./sandbox/index.js');
+const { BareMetalSandbox, ContainerSandbox, buildSanitizedEnv } =
+  await import('./sandbox/index.js');
 const { gitClone } = await import('../checkout/git-clone.js');
 const { checkHostInstallEligibility, HostInstallRefusal } =
   await import('./host-install-eligibility.js');
@@ -811,6 +816,129 @@ describe('JobRunner', () => {
       ]);
     });
 
+    describe('the history-gap warning', () => {
+      const GAP =
+        '[kici] This job asks for more history than this run shipped ' +
+        '(fetchDepth 0 requested, depth 1 shipped). Re-run kici run remote with --git-depth 0.';
+      const fullRepoJob = (extra: Record<string, unknown> = {}) =>
+        makeDispatch({
+          jobConfig: {
+            name: 'test-job',
+            workflowName: 'test-workflow',
+            runsOn: 'linux',
+            source: { file: '.kici/workflows/ci.ts' },
+            container: 'python:3.12-slim',
+            fullRepo: true,
+            ...overlayFields,
+            ...extra,
+          },
+        });
+      const stepMinusOneLines = (): string[] =>
+        logStreamerInstances
+          .filter((s) => s.stepIndex === -1)
+          .flatMap((s) => s.addLine.mock.calls.map(([line]) => line as string));
+
+      beforeEach(async () => {
+        const { applyOverlay } = await import('./overlay-applier.js');
+        vi.mocked(applyOverlay).mockResolvedValueOnce({
+          filesApplied: 1,
+          filesDeleted: 0,
+          symlinksApplied: 0,
+          verified: true,
+          git: { fetchDepth: 1, allTags: false },
+        });
+      });
+
+      it('warns on step -1 when the job asks for more history than the overlay shipped', async () => {
+        await new JobRunner(makeDeps()).execute(
+          fullRepoJob({ checkoutOptions: { fetchDepth: 0 } }),
+        );
+        // fails-when: the host checkout never compares the job's options with the shipped record
+        expect(stepMinusOneLines()).toContain(GAP);
+      });
+
+      it('stays silent when the shipped history covers the job', async () => {
+        await new JobRunner(makeDeps()).execute(fullRepoJob());
+        // breaks-if-wrong: a job with the default checkout must not get the warning
+        expect(stepMinusOneLines().some((line) => line.startsWith('[kici] This job asks'))).toBe(
+          false,
+        );
+      });
+    });
+
+    describe('checkout: false', () => {
+      const noCheckoutJob = (extra: Record<string, unknown> = {}, dispatchExtra = {}) =>
+        makeDispatch({
+          ...dispatchExtra,
+          jobConfig: {
+            name: 'test-job',
+            workflowName: 'test-workflow',
+            runsOn: 'linux',
+            source: { file: '.kici/workflows/ci.ts' },
+            checkout: false,
+            ...extra,
+          },
+        });
+
+      beforeEach(async () => {
+        const { gitClone } = await import('../checkout/git-clone.js');
+        vi.mocked(gitClone).mockClear();
+        cpFn.mockClear();
+        mockSandboxInstance.setup.mockClear();
+      });
+
+      it('a container job with no source cache fetches .kici/ on the host, never in the sandbox', async () => {
+        const { gitClone } = await import('../checkout/git-clone.js');
+        const dispatch = noCheckoutJob({ container: 'python:3.12-slim' });
+
+        await new JobRunner(makeDeps()).execute(dispatch);
+
+        // fails-when: the in-sandbox path runs: no host fetch, and the empty work dir
+        // leaves the runner to clone .kici/ inside the customer's image
+        expect(gitClone).toHaveBeenCalledTimes(1);
+        expect(vi.mocked(gitClone).mock.calls[0][0]).toMatchObject({
+          repoUrl: 'https://github.com/org/repo.git',
+          workDir: '/tmp/kici-test123/repo',
+          depth: 1,
+        });
+        expect(cpFn).toHaveBeenCalledWith(
+          '/tmp/kici-test123/repo/.kici',
+          '/tmp/kici-test123/.kici',
+          {
+            recursive: true,
+          },
+        );
+        expect(mockSandboxInstance.setup).toHaveBeenCalledWith(
+          expect.objectContaining({ workspaceFromHost: true }),
+        );
+        // checkout stays false, so the runner finds .kici/ and fetches nothing.
+        expect((dispatch.jobConfig as Record<string, unknown>).checkout).toBe(false);
+      });
+
+      it('a container job with a source cache fetches nothing on the host', async () => {
+        const { gitClone } = await import('../checkout/git-clone.js');
+        await new JobRunner(makeDeps()).execute(
+          noCheckoutJob(
+            { container: 'python:3.12-slim' },
+            { sourceTarUrl: 'https://orch.example.com/source.tgz' },
+          ),
+        );
+        // breaks-if-wrong: the cached source still restores inside the container
+        expect(gitClone).not.toHaveBeenCalled();
+        expect(mockSandboxInstance.setup).not.toHaveBeenCalledWith(
+          expect.objectContaining({ workspaceFromHost: true }),
+        );
+      });
+
+      it('a bare-metal job leaves the .kici/ fetch to its runner', async () => {
+        const { gitClone } = await import('../checkout/git-clone.js');
+        await new JobRunner(makeDeps()).execute(noCheckoutJob());
+        // breaks-if-wrong: a bare-metal / fork job keeps its in-runner .kici/ path
+        expect(gitClone).not.toHaveBeenCalled();
+        expect(cpFn).not.toHaveBeenCalled();
+      });
+    });
+
     it('a container job with no overlay applies none', async () => {
       const { applyOverlay } = await import('./overlay-applier.js');
       vi.mocked(applyOverlay).mockClear();
@@ -1281,6 +1409,40 @@ describe('JobRunner', () => {
     expect(ContainerSandbox).toHaveBeenCalledWith(
       expect.objectContaining({
         image: 'node:20-alpine',
+      }),
+    );
+  });
+
+  // fails-when: a trust setting the job sets for its own image counts as a host
+  // path, and the sandbox drops or binds over it.
+  it('container mode: hands the sandbox only the trust settings the host supplied', async () => {
+    vi.stubEnv('GIT_SSL_CAINFO', '/etc/kici/ca-bundle.pem');
+    vi.stubEnv('SSL_CERT_FILE', '/etc/kici/ca-bundle.pem');
+    vi.mocked(buildSanitizedEnv).mockReturnValueOnce({
+      PATH: '/usr/bin',
+      GIT_SSL_CAINFO: '/etc/kici/ca-bundle.pem',
+      SSL_CERT_FILE: '/etc/kici/ca-bundle.pem',
+    });
+    const dispatch = makeDispatch({
+      jobConfig: {
+        name: 'test-job',
+        workflowName: 'test-workflow',
+        runsOn: 'linux',
+        source: { file: '.kici/workflows/ci.ts' },
+        container: 'node:22',
+        jobEnv: { SSL_CERT_FILE: '/etc/kici/ca-bundle.pem' },
+      },
+    });
+
+    try {
+      await new JobRunner(makeDeps()).execute(dispatch);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+
+    expect(ContainerSandbox).toHaveBeenCalledWith(
+      expect.objectContaining({
+        hostTrustPaths: { GIT_SSL_CAINFO: '/etc/kici/ca-bundle.pem' },
       }),
     );
   });
@@ -1915,17 +2077,53 @@ describe('JobRunner', () => {
     expect(states[states.length - 1]).toBe('success');
   });
 
-  it('dynamic eval job: passes contentHash and resolvedHashFiles to loadWorkflowSource', async () => {
+  /** Run one dynamic-eval dispatch: the clone and overlay mocks, and the job's last state. */
+  async function runEval(dispatch: JobDispatch) {
+    const { gitClone } = await import('../checkout/git-clone.js');
+    const { applyOverlay } = await import('./overlay-applier.js');
+    vi.mocked(gitClone).mockClear();
+    vi.mocked(applyOverlay).mockClear();
     const deps = makeDeps();
-    const runner = new JobRunner(deps);
+    await new JobRunner(deps).execute(dispatch);
+    const states = deps.messages
+      .filter((m) => m.type === 'job.status')
+      .map((m) => (m as { state: string }).state);
+    return { gitClone, applyOverlay, lastState: states.at(-1) };
+  }
 
-    await runner.execute(makeDynamicDispatch());
+  it('dynamic eval job: passes contentHash and resolvedHashFiles to loadWorkflowSource', async () => {
+    const { lastState } = await runEval(makeDynamicDispatch());
 
     await expectSourceLoaded(expect.any(String), 'org/repo');
+    expect(lastState).toBe('success');
+  });
 
-    const jobStatuses = deps.messages.filter((m) => m.type === 'job.status');
-    const states = jobStatuses.map((m) => (m as { state: string }).state);
-    expect(states[states.length - 1]).toBe('success');
+  it('dynamic eval job: a fullRepo test run evaluates the overlay, with no clone', async () => {
+    const { gitClone, applyOverlay, lastState } = await runEval({
+      ...makeDynamicDispatch({
+        fullRepo: true,
+        tarballUrl: 'https://s3.example/overlay.tar.gz',
+        cliPublicKey: 'cli-pub',
+        orchestratorPrivateKey: 'orch-priv',
+      }),
+      repoUrl: '',
+    });
+
+    // fails-when: the evaluation clones the empty repoUrl of a kici run remote run
+    expect(gitClone).not.toHaveBeenCalled();
+    expect(applyOverlay).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(applyOverlay).mock.calls[0]![0]).toMatchObject({
+      tarballUrl: 'https://s3.example/overlay.tar.gz',
+    });
+    expect(lastState).toBe('success');
+  });
+
+  it('dynamic eval job: a webhook run still clones its repository and applies no overlay', async () => {
+    const { gitClone, applyOverlay } = await runEval(makeDynamicDispatch());
+
+    // breaks-if-wrong: the fullRepo branch swallows an ordinary evaluation's clone
+    expect(gitClone).toHaveBeenCalledTimes(1);
+    expect(applyOverlay).not.toHaveBeenCalled();
   });
 
   it('dynamic eval job: a false filter verdict generates no jobs and never runs the generator', async () => {

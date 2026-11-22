@@ -19,7 +19,8 @@ const mockReadFileSync = vi.fn(() => '');
 // the on-disk installer-image-digests.json (node:fs is mocked).
 const DIGEST = 'a'.repeat(64);
 vi.mock('./image-digests.js', () => ({
-  resolveImageRef: (name: string) => `quay.io/kici-dev/${name}:0.1.15@sha256:${DIGEST}`,
+  resolveImageRef: (name: string, opts: { registry?: string } = {}) =>
+    `${opts.registry ?? 'quay.io/kici-dev'}/${name}:0.1.15@sha256:${DIGEST}`,
   installerImageName: (component: string) => `kici-${component}`,
 }));
 vi.mock('node:fs', async () => {
@@ -133,6 +134,19 @@ describe('ComposeServiceManager', () => {
       );
       expect(content).not.toContain('ghcr.io');
       expect(content).not.toContain('docker.io/kici-dev');
+    });
+
+    it('pulls from the configured image registry, keeping the digest', async () => {
+      // fails-when: --image-registry is accepted but the compose file still names quay.io
+      const { ComposeServiceManager } = await import('./compose.js');
+      const mgr = new ComposeServiceManager();
+      await mgr.install({ ...testConfig, imageRegistry: 'registry.internal.example/kici-dev' });
+
+      const [, content] = mockWriteFileSync.mock.calls[0];
+      expect(content).toContain(
+        `image: registry.internal.example/kici-dev/kici-orchestrator:0.1.15@sha256:${DIGEST}`,
+      );
+      expect(content).not.toContain('quay.io');
     });
 
     it('derives the image name from the component (an agent runs kici-agent)', async () => {

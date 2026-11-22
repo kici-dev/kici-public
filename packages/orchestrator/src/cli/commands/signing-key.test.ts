@@ -1,6 +1,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { Command } from 'commander';
-import { registerSigningKeyCommands } from './signing-key.js';
+import { ConfigScope, loadConfig } from '../../config.js';
+import { registerSigningKeyCommands, signingKeySettings } from './signing-key.js';
 
 /**
  * The `kici-admin signing-key` command tree wiring: list / generate / rotate /
@@ -83,5 +84,33 @@ describe('kici-admin signing-key list with no data source', () => {
     expect(errors.join('\n')).toMatch(/--database-url/);
     expect(errors.join('\n')).toMatch(/--token/);
     expect(errors.join('\n')).toMatch(/KICI_ADMIN_TOKEN/);
+  });
+});
+
+describe('signingKeySettings', () => {
+  // A shell with only the signing-key settings: no KICI_DATABASE_URL, and the default
+  // platform mode with no Platform URL or token.
+  const shell = {
+    KICI_ORCHESTRATOR_PROVENANCE_ISSUER: 'https://orch.example.test',
+    KICI_SECRET_KEY: '0'.repeat(64),
+  };
+
+  it('reads the issuer and the secret key without the runtime checks', () => {
+    // fails-when: the settings load the full orchestrator config, which refuses this shell
+    // for the missing coordinator database and Platform credentials.
+    expect(signingKeySettings(shell)).toEqual({
+      issuer: 'https://orch.example.test',
+      secretKey: '0'.repeat(64),
+    });
+  });
+
+  it('is a shell the full orchestrator config refuses', () => {
+    // The control: the shell above really lacks what a running orchestrator needs.
+    expect(() => loadConfig(ConfigScope.enum.admin, shell)).toThrow(/KICI_DATABASE_URL/);
+  });
+
+  it('leaves an unset issuer unset', () => {
+    // breaks-if-wrong: export must still refuse a shell with no issuer.
+    expect(signingKeySettings({}).issuer).toBeUndefined();
   });
 });

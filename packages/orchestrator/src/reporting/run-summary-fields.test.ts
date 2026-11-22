@@ -9,6 +9,7 @@ const run: RunSummarySource & { localWorkingTree?: boolean } = {
   workflowRepoIdentifier: 'acme/workflows',
   sha: 'abc123',
   installationId: 42,
+  githubUrl: 'https://ghe.corp.example',
   requestId: 'req-1',
   routingKey: 'rk-1',
   ref: 'main',
@@ -36,10 +37,16 @@ describe('runSummaryFields', () => {
     expect(runSummaryFields(run)).not.toHaveProperty('localWorkingTree');
   });
 
-  // fails-when: an unset workflowRepoIdentifier or a zero statusEpoch is emitted as a key
-  it('omits an unset workflowRepoIdentifier and a zero statusEpoch', () => {
-    const s = runSummaryFields({ ...run, workflowRepoIdentifier: undefined, statusEpoch: 0 });
+  // fails-when: an unset workflowRepoIdentifier, githubUrl or a zero statusEpoch is emitted as a key
+  it('omits an unset workflowRepoIdentifier, an unset githubUrl and a zero statusEpoch', () => {
+    const s = runSummaryFields({
+      ...run,
+      workflowRepoIdentifier: undefined,
+      githubUrl: undefined,
+      statusEpoch: 0,
+    });
     expect(s).not.toHaveProperty('workflowRepoIdentifier');
+    expect(s).not.toHaveProperty('githubUrl');
     expect(s).not.toHaveProperty('statusEpoch');
     expect(s).toMatchObject({ workflowName: 'ci', sha: 'abc123', triggerActorUserId: '1001' });
   });

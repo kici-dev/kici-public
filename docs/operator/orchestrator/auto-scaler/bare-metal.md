@@ -111,6 +111,7 @@ Each agent runs as a host process. On Linux and macOS it is detached and leads i
 - `KICI_RUNTIME_IMAGE` -- (set only when the label set declares an `image`) Where the agent materializes the KiCI runtime from when it nests a job container. A label set with `binaryPath` alone leaves it unset, which is why a `container` job on such a pool runs on the image's own `node`
 - `KICI_AGENT_TOKEN` -- (optional) Ephemeral auth token when auth is configured
 - `KICI_BACKPRESSURE_MODE` -- (optional) Log backpressure mode from label set config
+- The host system variables on a fixed allowlist, such as `PATH`, `HOME` and `TMPDIR`. The agent does not get the rest of the orchestrator's environment. With `KICI_TRUSTED_ENV=true`, the agent gets the host environment without the `KICI_*` variables. See the [trusted fleet-agent profile](../../security/agent-security.md#trusted-fleet-agent-profile-kici_trusted_env)
 - Host variables forwarded through the [`KICI_AGENT_ENV_` prefix](./common-config.md#environment-variable-forwarding)
 - Any additional `env` entries from the label set config, which win on a conflict
 
@@ -136,8 +137,10 @@ The scaler spawns an agent process for a job. When the job ends, the agent waits
 Sometimes an agent never starts. Either the host refuses to start the agent process, or the process stops before it connects to the orchestrator. For example, a label-set `env` value can be longer than the operating system accepts (`E2BIG` on Linux), or the agent can stop at startup because a tool it needs is missing. In both cases the scaler does three things:
 
 - **Reports it.** `kici-admin diagnose` shows the cause on the `scaler:<name>` row, and the waiting job's error names it. For an agent that stopped, the cause includes the last lines the agent wrote.
-- **Defers the scaler.** The next spawn for that scaler waits `scaler-provision-backoff-base-ms`. Each further consecutive failure doubles the wait, up to `scaler-provision-backoff-max-ms`. An agent that registers clears it. These are the cluster settings described in [Retry backoff](../event-scaler.md#retry-backoff).
+- **Defers the scaler.** The next spawn for that scaler waits `scaler-provision-backoff-base-ms`. Each further consecutive failure doubles the wait, up to `scaler-provision-backoff-max-ms`. Launches that fail together count as one failure. An agent that registers clears it. These are the cluster settings described in [Retry backoff](../event-scaler.md#retry-backoff).
 - **Frees the capacity.** Other scalers and other jobs are not held back.
+
+The scaler also revokes the agent token it minted for the agent. Any other spawn failure follows [Spawn failures](./common-config.md#spawn-failures).
 
 An agent that connected and stops later is not a launch failure. A missing binary is caught earlier: the orchestrator checks that `binaryPath` is an executable file and not a version-manager shim when it starts.
 
@@ -169,7 +172,7 @@ Container mode always applies its nftables rules. There is no `networkIsolation`
 
   Replace `kici` with the user the orchestrator runs as. Use the path that `sudo sh -c 'command -v nft'` prints if `nft` is not in `/usr/sbin`. `sudo -n` fails at once instead of asking for a password, so set `requireSudo` only where `sudo` is installed and the rule exists. An orchestrator that holds `CAP_NET_ADMIN` needs neither.
 
-  A user service often has no `/usr/sbin` on its `PATH`, so a plain `nft` is not found. Through `sudo`, the command is found on the sudo `secure_path`.
+  A user service often has no `/usr/sbin` on its `PATH`. Without `sudo`, the orchestrator looks for `nft` on its `PATH` and then in `/usr/local/sbin`, `/usr/sbin` and `/sbin`. Through `sudo`, the command is found on the sudo `secure_path`.
 
 The orchestrator checks this when it loads the scaler. It runs `nft list tables` the way the scaler asks, and creates the `kici` nftables table. If that fails, a scaler with an `image`-only label set stops the orchestrator from starting, and a reload that adds such a label set fails. The message names the label sets and both fixes. A scaler with no `image`-only label set is never refused. `requireSudo` cannot change on a reload while a label set runs job images: restart the orchestrator to apply it.
 

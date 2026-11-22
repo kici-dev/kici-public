@@ -129,6 +129,22 @@ describe('runOrchestratorWizard — mode prompt', () => {
     expect(defaultValue).toBe('hybrid');
   });
 
+  it('offers the hosted relay URL as the Platform prompt default', async () => {
+    vi.mocked(promptSelect).mockResolvedValue('platform');
+    await runOrchestratorWizard();
+    const call = vi.mocked(promptUrl).mock.calls.find((c) => c[0] === 'Platform relay URL:');
+    // breaks-if-wrong: an install without --platform-url keeps the hosted default
+    expect(call?.[1]).toBe(DEFAULT_PLATFORM_RELAY_URL);
+  });
+
+  it('offers the Platform URL the install command passed through as the prompt default', async () => {
+    vi.mocked(promptSelect).mockResolvedValue('platform');
+    await runOrchestratorWizard({ defaultPlatformUrl: 'wss://kici.corp.example/ws' });
+    const call = vi.mocked(promptUrl).mock.calls.find((c) => c[0] === 'Platform relay URL:');
+    // fails-when: the wizard ignores --platform-url and offers the hosted URL
+    expect(call?.[1]).toBe('wss://kici.corp.example/ws');
+  });
+
   it('preselects the mode the install command passed through', async () => {
     await runOrchestratorWizard({ defaultMode: 'independent' });
     expect(vi.mocked(promptSelect).mock.calls[0][2]).toBe('independent');

@@ -50,6 +50,7 @@ import {
   ensureKiciTable,
   probeNftables,
   removeIsolationRules,
+  SYSTEM_BINARY_DIRS,
 } from '@kici-dev/shared/net';
 import type { NetworkPolicy, NftOptions } from '@kici-dev/shared/net';
 import type { ResolvedContainerSpawn } from './types.js';
@@ -116,14 +117,14 @@ function nftUnusableMessage(
   failure: string,
 ): string {
   const sets = indexes.map((i) => `labelSets[${i}]`).join(', ');
-  // A non-root service often has no /usr/sbin on its PATH, which reads as a
-  // missing binary rather than a missing privilege. Through sudo, the binary
-  // that could not start may be sudo itself.
+  // A direct nft spawn searches PATH and then the system sbin directories, so
+  // ENOENT there means nft is not installed. Through sudo, the binary that
+  // could not start may be sudo itself.
   const notFound = !/ENOENT/.test(failure)
     ? ''
     : requireSudo
       ? `sudo or nft is not installed, or sudo is not on the orchestrator's PATH. `
-      : `nft is not installed, or not on the orchestrator's PATH. `;
+      : `nft is not installed: it is neither on the orchestrator's PATH nor in ${SYSTEM_BINARY_DIRS.join(', ')}. `;
   const head =
     `Bare-metal scaler "${name}" runs agents in job images (${sets}: an image and no ` +
     `binaryPath). Each such agent container is isolated with nftables rules, and this ` +

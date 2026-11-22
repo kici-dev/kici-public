@@ -1638,6 +1638,12 @@ export interface SourcesTable {
    * GitHub is the source of truth for `name` and `slug` on GitHub-App sources.
    */
   slug: string | null;
+  /**
+   * Web URL of the GitHub Enterprise Server a GitHub App source talks to; NULL
+   * for github.com. Written only by the unscoped admin paths; any
+   * `config.githubUrl` is ignored.
+   */
+  github_url: string | null;
   /** Customer/org identifier for secret and context scoping */
   customer_id: Generated<string>;
   created_at: Generated<Date>;

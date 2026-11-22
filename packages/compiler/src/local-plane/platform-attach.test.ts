@@ -5,6 +5,7 @@ import {
   revokeOrchestratorKey,
   probePlatformReachable,
 } from './platform-attach.js';
+import { ClientNewerThanPlatformError } from '../remote/platform-fetch.js';
 
 describe('derivePlatformWsUrl', () => {
   it('derives wss + /ws from an https prod base', () => {
@@ -68,6 +69,32 @@ describe('mintOrchestratorKey', () => {
     await expect(
       mintOrchestratorKey({ apiBase: 'https://x', pat: 'p', orgId: 'o' }),
     ).rejects.toThrow(/kici login/);
+  });
+
+  it('passes a newer-client refusal through, read once, with the Platform message', async () => {
+    // fails-when: the catch wraps the refusal in "Could not reach the Platform", so the user
+    // reads a dropped connection instead of the Platform's message
+    fetchMock.mockImplementation(
+      async () =>
+        new Response(
+          JSON.stringify({ error: 'client_newer_than_platform', message: 'Upgrade it (test).' }),
+          { status: 409 },
+        ),
+    );
+    const err = await mintOrchestratorKey({ apiBase: 'https://x', pat: 'p', orgId: 'o' }).catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ClientNewerThanPlatformError);
+    expect((err as Error).message).toBe('Upgrade it (test).');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('a dropped connection is still "Could not reach the Platform"', async () => {
+    // breaks-if-wrong: the rethrow is for the refusal only
+    fetchMock.mockRejectedValue(new Error('ECONNREFUSED'));
+    await expect(
+      mintOrchestratorKey({ apiBase: 'https://x', pat: 'p', orgId: 'o' }),
+    ).rejects.toThrow(/Could not reach the Platform/);
   });
 });
 

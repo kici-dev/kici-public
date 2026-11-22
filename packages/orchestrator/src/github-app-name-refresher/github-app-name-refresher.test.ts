@@ -151,6 +151,32 @@ describe('refreshGithubSourceIdentity', () => {
     expect(store.updateSource).toHaveBeenCalledWith('github:1', { name: 'New', slug: 'new' });
   });
 
+  it('reads a GitHub Enterprise Server App from its server', async () => {
+    const store: RefreshableSourceStore = {
+      listSources: vi
+        .fn()
+        .mockResolvedValue([
+          { routing_key: 'github:1', provider: 'github', name: 'Same', slug: 'same' },
+        ]),
+      getSourceWithSecrets: vi.fn().mockResolvedValue({
+        provider: 'github',
+        config: { appId: '1' },
+        github_url: 'https://ghe.corp.example',
+        privateKey: 'pem',
+      }),
+      updateSource: vi.fn().mockResolvedValue(undefined),
+    };
+    const fetchIdentity = vi.fn().mockResolvedValue({ name: 'Same', slug: 'same', ...COMPLETE });
+    const fetchInstallations = vi.fn().mockResolvedValue([]);
+
+    await refreshGithubSourceIdentity(store, 'github:1', fetchIdentity, fetchInstallations);
+
+    const creds = { appId: '1', privateKey: 'pem', githubUrl: 'https://ghe.corp.example' };
+    // fails-when: the refresh sends the App's JWT to github.com for a GHES source
+    expect(fetchIdentity).toHaveBeenCalledWith(creds);
+    expect(fetchInstallations).toHaveBeenCalledWith(creds);
+  });
+
   it('does not write when name + slug are unchanged', async () => {
     const store = makeStore(
       [{ routing_key: 'github:1', provider: 'github', name: 'Same', slug: 'same' }],

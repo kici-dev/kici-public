@@ -23,6 +23,7 @@ import {
   deleteForwardRules,
   parseRuleHandles,
   readForwardChain,
+  resolveSystemBinary,
 } from '@kici-dev/shared/net';
 import { FIRECRACKER_NET_INTERFACES } from './net-interfaces.js';
 
@@ -279,9 +280,11 @@ const defaultFileWriter: FileWriter = (path, content) => writeFile(path, content
 function defaultRunner(requireSudo: boolean): CommandRunner {
   return async ({ bin, args, stdin }) => {
     const useSudo = requireSudo && PRIVILEGED_BINS.has(bin);
+    // Without sudo, `nft`, `sysctl` and `iptables` live in /usr/sbin, which a
+    // non-root PATH often leaves out; sudo searches its own secure_path.
     const child = useSudo
       ? execFileP('sudo', ['-n', bin, ...args], { timeout: COMMAND_TIMEOUT_MS })
-      : execFileP(bin, args, { timeout: COMMAND_TIMEOUT_MS });
+      : execFileP(resolveSystemBinary(bin), args, { timeout: COMMAND_TIMEOUT_MS });
     if (stdin && child.child.stdin) {
       child.child.stdin.end(stdin);
     }

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { InfraAlertSeverity, InfraAlertType } from '../../diagnostics/infra-alert.js';
 import {
   registrationItemSchema,
+  runListItemSchema,
   DASHBOARD_REQUEST_TYPES,
   DASHBOARD_REQUEST_TYPE_SET,
   DashboardResponseErrorCode,
@@ -1900,7 +1901,7 @@ describe('dashboardRunDetailApiResponseSchema step classification', () => {
   });
 });
 
-describe('registrationItemSchema compile schema fields', () => {
+describe('registrationItemSchema optional fields', () => {
   const item = {
     id: 'r',
     repoIdentifier: 'acme/app',
@@ -1913,6 +1914,17 @@ describe('registrationItemSchema compile schema fields', () => {
     createdAt: '2026-01-01T00:00:00Z',
     updatedAt: '2026-01-01T00:00:00Z',
   };
+  const source = { routingKey: 'github:7', name: 'ghe', subtype: 'github_app', provider: 'github' };
+
+  it("keeps a source's webUrl, and parses a source without it", () => {
+    const withServer = { ...item, source: { ...source, webUrl: 'https://ghe.corp.example' } };
+    // fails-when: the schema strips webUrl, so a GHES registration links to github.com
+    expect(registrationItemSchema.parse(withServer).source?.webUrl).toBe(
+      'https://ghe.corp.example',
+    );
+    // breaks-if-wrong: an older orchestrator's source (no webUrl key) still validates
+    expect(registrationItemSchema.parse({ ...item, source }).source).toEqual(source);
+  });
 
   it('parses an item without the fields (an older orchestrator)', () => {
     expect(registrationItemSchema.parse(item)).toEqual(item);
@@ -1929,6 +1941,18 @@ describe('registrationItemSchema compile schema fields', () => {
     expect(
       registrationItemSchema.parse({ ...item, compileSchemaVersion: null }).compileSchemaVersion,
     ).toBeNull();
+  });
+});
+
+describe('runListItemSchema repoWebUrl', () => {
+  const field = runListItemSchema.shape.repoWebUrl;
+
+  it('is an optional, nullable string', () => {
+    // fails-when: the run list item has no repoWebUrl, so a GHES run links to github.com
+    expect(field.parse('https://ghe.corp.example')).toBe('https://ghe.corp.example');
+    expect(field.parse(null)).toBeNull();
+    // breaks-if-wrong: a response from an older Platform (no key) still validates
+    expect(field.parse(undefined)).toBeUndefined();
   });
 });
 

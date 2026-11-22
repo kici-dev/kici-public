@@ -1,11 +1,18 @@
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import {
   buildGithubAppManifest,
   convertManifestCode,
+  fetchGithubAppIdentity,
+  listGithubAppInstallations,
   waitForInstallation,
   verifyRepoAccess,
   validateWebhookUrl,
 } from './manifest.js';
+import {
+  stubGithubFetch,
+  TEST_APP_PRIVATE_KEY,
+  type RecordedGithubRequest,
+} from '../../__test-helpers__/github-fetch.js';
 
 describe('buildGithubAppManifest', () => {
   const m = buildGithubAppManifest({
@@ -136,6 +143,42 @@ describe('convertManifestCode', () => {
       /webhook secret/i,
     );
   });
+
+  describe('the GitHub host it converts on', () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    /** Stub the global fetch the real Octokit uses, recording each request URL. */
+    function recordFetch(): string[] {
+      const urls: string[] = [];
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: string | URL | Request) => {
+          urls.push(typeof input === 'string' ? input : input.toString());
+          return new Response(
+            JSON.stringify({ id: 7, slug: 's', name: 'n', pem: 'p', webhook_secret: 'w' }),
+            { status: 201, headers: { 'content-type': 'application/json' } },
+          );
+        }),
+      );
+      return urls;
+    }
+
+    // fails-when: the conversion ignores githubUrl and exchanges a GHES code at api.github.com
+    it('posts the code to the GitHub Enterprise Server API', async () => {
+      const urls = recordFetch();
+      await convertManifestCode('abc', { githubUrl: 'https://ghe.corp.example' });
+      expect(urls).toEqual(['https://ghe.corp.example/api/v3/app-manifests/abc/conversions']);
+    });
+
+    // breaks-if-wrong: github.com operators keep the api.github.com exchange
+    it('posts the code to api.github.com without a host', async () => {
+      const urls = recordFetch();
+      await convertManifestCode('abc');
+      expect(urls).toEqual(['https://api.github.com/app-manifests/abc/conversions']);
+    });
+  });
 });
 
 describe('waitForInstallation', () => {
@@ -172,5 +215,60 @@ describe('verifyRepoAccess', () => {
     });
     expect(request).toHaveBeenCalledWith('GET /installation/repositories', expect.anything());
     expect(res).toEqual({ repoCount: 3 });
+  });
+});
+
+describe('the App helpers call the App server', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const dotcom = { appId: '1', privateKey: TEST_APP_PRIVATE_KEY };
+  const ghes = { ...dotcom, githubUrl: 'https://ghe.corp.example' };
+  /** An installation list with one entry, so the wait ends on its first poll. */
+  const oneInstallation = (req: RecordedGithubRequest) =>
+    req.url.includes('/app/installations?')
+      ? { status: 200, body: [{ id: 7, account: { login: 'acme' } }] }
+      : undefined;
+
+  // fails-when: a helper builds a client that ignores githubUrl and calls api.github.com
+  // breaks-if-wrong: the same helper without a server keeps calling api.github.com
+  it.each([
+    [ghes, 'https://ghe.corp.example/api/v3'],
+    [dotcom, 'https://api.github.com'],
+  ])('fetchGithubAppIdentity reads GET /app at %j', async (creds, base) => {
+    const requests = stubGithubFetch();
+    await fetchGithubAppIdentity(creds);
+    expect(requests.map((r) => r.url)).toEqual([`${base}/app`]);
+  });
+
+  it.each([
+    [ghes, 'https://ghe.corp.example/api/v3'],
+    [dotcom, 'https://api.github.com'],
+  ])('listGithubAppInstallations lists at %j', async (creds, base) => {
+    const requests = stubGithubFetch();
+    await listGithubAppInstallations(creds);
+    expect(requests.map((r) => r.url)).toEqual([`${base}/app/installations?per_page=100&page=1`]);
+  });
+
+  it.each([
+    [ghes, 'https://ghe.corp.example/api/v3'],
+    [dotcom, 'https://api.github.com'],
+  ])('waitForInstallation polls at %j', async (creds, base) => {
+    const requests = stubGithubFetch(oneInstallation);
+    await waitForInstallation(creds, { timeoutMs: 1000, pollMs: 1 });
+    expect(requests.map((r) => r.url)).toEqual([`${base}/app/installations?per_page=1`]);
+  });
+
+  it.each([
+    [ghes, 'https://ghe.corp.example/api/v3'],
+    [dotcom, 'https://api.github.com'],
+  ])('verifyRepoAccess mints and lists at %j', async (creds, base) => {
+    const requests = stubGithubFetch();
+    await verifyRepoAccess(creds, 7);
+    expect(requests.map((r) => r.url)).toEqual([
+      `${base}/app/installations/7/access_tokens`,
+      `${base}/installation/repositories?per_page=1`,
+    ]);
   });
 });

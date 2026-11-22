@@ -141,6 +141,8 @@ export interface AdminRouteDeps {
   resolveGithubWebhookUrl?: () => Promise<WebhookUrlResolution>;
   /** Builds the direct-ingress URL `source list` prints per GitHub source. */
   resolveSourceIngressUrl?: (row: { id: string; customerId: string | null }) => string | null;
+  /** The Platform's own headless manifest page, for the manifest pre-flight (or null). */
+  resolveGithubManifestCallbackUrl?: () => string | null;
   /** Backs the DB migration endpoints. */
   db?: Kysely<any>;
   /** Backs the DB migration endpoints. */
@@ -315,6 +317,14 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
     const resolved = await routeScope(scope);
     const keys = await resolved.store.listKeys(orgId, resolved.path);
     return c.json({ keys }, 200);
+  });
+
+  // Locations only, never values: the PG rows the master key cannot decrypt (a value
+  // stored as plaintext, or one encrypted under another key). Read-only.
+  app.get('/api/v1/admin/secrets/verify', requireUnscoped, async (c) => {
+    deps.rbac.requirePermission(c.get('role'), 'secret.read');
+    const undecryptable = await deps.secretStore.findUndecryptable();
+    return c.json({ undecryptable }, 200);
   });
 
   // ── Scope CRUD (registered before generic :orgId/:scope/:key routes
@@ -754,6 +764,7 @@ export function createAdminRoutes(deps: AdminRouteDeps): Hono<AdminEnv> {
         sourceStore: deps.sourceStore,
         resolveSourceWebhookUrl: deps.resolveSourceWebhookUrl,
         resolveGithubWebhookUrl: deps.resolveGithubWebhookUrl,
+        resolveGithubManifestCallbackUrl: deps.resolveGithubManifestCallbackUrl,
         resolveSourceIngressUrl: deps.resolveSourceIngressUrl,
         ...(deps.getPlatformOrgId && { getPlatformOrgId: deps.getPlatformOrgId }),
       }),

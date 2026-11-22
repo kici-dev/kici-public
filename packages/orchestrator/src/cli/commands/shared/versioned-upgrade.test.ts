@@ -818,6 +818,66 @@ describe('installRelease — an archive upgrade with --force', () => {
   });
 });
 
+// The two upgrade paths an install with no internet access takes: an archive the operator
+// copied in (`--from`), and npm against the registry the operator's npm config names.
+describe('the offline upgrade paths', () => {
+  let tmp: string;
+  const fetchSpy = vi.fn(() => Promise.reject(new Error('fetch failed: no network')));
+  beforeEach(() => {
+    tmp = makeTempDir('kici-offline-upgrade-');
+    vi.stubGlobal('fetch', fetchSpy);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    fetchSpy.mockClear();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  // fails-when: an archive upgrade downloads anything, which an air-gapped host cannot
+  it('an archive upgrade (--from) installs the release with no network', () => {
+    const installBase = path.join(tmp, 'base');
+    const versionedDirPath = path.join(installBase, 'orchestrator-0.9.0');
+    installRelease({
+      archivePath: releaseArchive(tmp, 'kici-orchestrator-standalone', READS_ENV_FILE),
+      tmpDir: path.join(tmp, 'work'),
+      installBase,
+      versionedDirPath,
+      component: 'orchestrator',
+      platform: 'systemd',
+      version: '0.9.0',
+      config: WINDOWS_ORCH_CONFIG,
+    });
+    expect(fs.existsSync(path.join(versionedDirPath, 'kici-orchestrator-standalone'))).toBe(true);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // fails-when: an npm-source upgrade reaches past the registry the operator's npm config
+  //   names (a default registry, or a fetch of its own)
+  it('an npm-source upgrade asks only the npm registry the operator names', () => {
+    const registry = 'http://registry.internal.example:4873';
+    vi.stubEnv('npm_config_registry', registry);
+    const target = {
+      nodeExecPath: '/n/bin/node',
+      npmPath: '/n/bin/npm',
+      owningPackage: 'kici-admin',
+      globalPrefix: '/n',
+      npmInvocation: { cmd: '/n/bin/node', preArgs: ['/n/lib/node_modules/npm/bin/npm-cli.js'] },
+    };
+    const registries: Array<string | undefined> = [];
+    const run = (_cmd: string, args: string[], opts?: { env?: NodeJS.ProcessEnv }) => {
+      registries.push(opts?.env?.npm_config_registry);
+      // No argv names another registry.
+      expect(args.some((a) => a.startsWith('--registry'))).toBe(false);
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    expect(npmReleaseReadsEnvFile(target, '0.9.0', run)).toEqual({ ok: true, reads: false });
+    expect(installGlobalPackage(target, '0.9.0', run).ok).toBe(true);
+    expect(registries).toEqual([registry, registry]);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
 describe('checkPickFlagConflicts — --pick mutual exclusivity', () => {
   it('returns null when --pick is absent', () => {
     expect(checkPickFlagConflicts({ from: 'x.tar.gz' })).toBeNull();

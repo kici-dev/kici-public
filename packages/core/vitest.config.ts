@@ -3,6 +3,9 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   test: {
+    // The public mirror's CI sets CI=true, which turns colored output on.
+    // Match it so an assertion on plain text fails here when the output is colored.
+    env: { CI: 'true' },
     include: ['src/**/*.test.ts'],
   },
 });

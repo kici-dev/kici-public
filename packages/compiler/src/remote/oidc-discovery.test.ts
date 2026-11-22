@@ -141,15 +141,31 @@ describe('discoverOidcEndpoints', () => {
       body: JSON.stringify({
         issuer: 'http://example.test',
         authorization_endpoint: 'http://example.test/auth',
-        token_endpoint: 'http://example.test/token',
-        // device_authorization_endpoint deliberately missing
+        // token_endpoint deliberately missing
       }),
     }));
     activeServer = server;
 
     await expect(discoverOidcEndpoints(url)).rejects.toThrowError(
-      /missing required field\(s\): device_authorization_endpoint/,
+      /missing required field\(s\): token_endpoint\./,
     );
+  });
+
+  // breaks-if-wrong: PKCE login against an IdP with no device flow
+  it('discovery accepts a document without a device endpoint', async () => {
+    const { url, server } = await startServer(() => ({
+      status: 200,
+      body: JSON.stringify({
+        issuer: 'http://example.test',
+        authorization_endpoint: 'http://example.test/auth',
+        token_endpoint: 'http://example.test/token',
+      }),
+    }));
+    activeServer = server;
+
+    const endpoints = await discoverOidcEndpoints(url);
+    expect(endpoints.token_endpoint).toBe('http://example.test/token');
+    expect(endpoints.device_authorization_endpoint).toBeUndefined();
   });
 
   it('throws an actionable error on a transport failure', async () => {

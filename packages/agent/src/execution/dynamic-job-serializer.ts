@@ -39,7 +39,7 @@ import type {
   LabelMatcher,
 } from '@kici-dev/engine';
 import { normalizeRunsOnToMatchers } from '@kici-dev/engine/labels/compile';
-import { formatLabelMatcher, resolveWhenToRunOn } from '@kici-dev/engine';
+import { formatLabelMatcher, lockCheckoutFields, resolveWhenToRunOn } from '@kici-dev/engine';
 import { withTimeout } from './timeout-util.js';
 
 /**
@@ -219,6 +219,8 @@ async function serializeJob(
     ...(resolvedConcurrencyGroup !== undefined
       ? { concurrencyGroup: resolvedConcurrencyGroup }
       : {}),
+    // Same lock keys the compiler emits for a static job's checkout option.
+    ...lockCheckoutFields(job.checkout),
     // Carried over the eval-round wire so the orchestrator runs it as a gate, like a static one.
     ...(job.invoke
       ? {

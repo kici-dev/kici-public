@@ -137,19 +137,31 @@ export interface ResolvedMasterKeys {
   old: Buffer | undefined;
 }
 
+/** The key file's trimmed content; throws naming the path when it is empty. */
+function readKeyFile(path: string): string {
+  const content = readFileSync(path, 'utf-8').trim();
+  if (!content) throw new Error(`Key file at '${path}' is empty.`);
+  return content;
+}
+
 /**
  * Resolve the master key (and, when configured, its predecessor) from the
- * env-then-file precedence both loaders use. Returns null when no master key is
- * configured at all — the secrets subsystem is off in that case.
+ * value-then-file precedence both loaders use. The values are the settings the
+ * caller resolved (the orchestrator's startup config, or the env file a
+ * `kici-admin` command names), never re-read from the process environment.
+ * Returns null when no master key is configured at all — the secrets subsystem
+ * is off in that case.
  */
 export function resolveMasterKeys(opts: {
   secretKey?: string | undefined;
   secretKeyFile?: string | undefined;
+  secretKeyOld?: string | undefined;
   secretKeyFileOld?: string | undefined;
 }): ResolvedMasterKeys | null {
   if (!opts.secretKey && !opts.secretKeyFile) return null;
-  const material = loadMasterKeyMaterial(undefined, opts.secretKeyFile);
-  const materialOld = loadOldMasterKeyMaterial(undefined, opts.secretKeyFileOld);
+  const material = opts.secretKey ? opts.secretKey.trim() : readKeyFile(opts.secretKeyFile!);
+  const fileOld = opts.secretKeyFileOld ? readFileSync(opts.secretKeyFileOld, 'utf-8').trim() : '';
+  const materialOld = opts.secretKeyOld?.trim() || fileOld || undefined;
   return {
     material,
     materialOld,

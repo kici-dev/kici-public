@@ -108,7 +108,7 @@ The plane runs in one of two modes:
 
 `kici local down` reports success only once the plane port is verified free. If a process still holds it — including a plane left behind by an interrupted boot — the command exits non-zero and names the holder, so a failed teardown is never mistaken for a clean one. A holder that does not identify as a KiCI plane orchestrator is reported and left alone, never stopped.
 
-`kici local status` reports a plane whose process is alive but whose readiness probe fails — for example when its PostgreSQL has stopped — as running but not ready, together with its readiness checks, rather than as not running. When the holder is a KiCI plane orchestrator that this config directory did not start — a plane belonging to another `KICI_CONFIG_DIR`, or one whose record here was lost — status names it as such rather than as not ready, since its readiness is never probed, and points at `kici local down`, which does reclaim it. When the port is held by a process that is not a KiCI plane orchestrator, `kici local status` names that holder instead and points at `KICI_LOCAL_ORCH_PORT`, because `kici local down` will not stop it.
+`kici local status` reports a plane whose process is alive but whose readiness probe fails — for example when its PostgreSQL has stopped — as running but not ready, together with its readiness checks, rather than as not running. When the holder is a KiCI plane orchestrator that this config directory did not start, status names it as such rather than as not ready, since its readiness is never probed. Such a holder is a plane belonging to another `KICI_CONFIG_DIR`, or one whose record here was lost. For such a holder, status points at `kici local down`, which does reclaim it. When the port is held by a process that is not a KiCI plane orchestrator, `kici local status` names that holder instead and points at `KICI_LOCAL_ORCH_PORT`, because `kici local down` will not stop it.
 
 The plane writes its orchestrator log to `orchestrator.log` in its state directory and, when it runs embedded PostgreSQL, the PostgreSQL log to `orchestrator.log.pg` beside it. `kici local logs` prints their location. Each is rotated to a `.1` sibling when it reaches 50 MB, at the next plane start — the plane keeps the current log and one previous generation, so neither can grow without bound.
 
@@ -132,6 +132,8 @@ whenever the plane cannot supply them (for `stopped` that is all of them, and
 (`jq -r '.pid // empty'`).
 
 A local run also fails fast when no agent claims it. If no scaler label set matches the job's `runsOn`, or the agent cannot start, the run gives up within a short acceptance window. The window is 2 minutes by default, and `KICI_LOCAL_ACCEPTANCE_TIMEOUT_MS` overrides it. The CLI then names the plane log instead of waiting out the full no-progress timeout. Whenever the CLI stops following a run before it finishes (a timeout, an error, or Ctrl-C), it cancels the run in the plane, so a later plane start never dispatches it again.
+
+A failed status read does not stop the follow. When the plane answers a status read with a server error (5xx), a rate limit (429) or a request timeout (408), or the connection drops, the CLI prints one warning and retries with backoff. A connection that drops in the middle of an answer counts too. So does a read that the plane does not answer within 30 seconds. It keeps retrying for up to 2 minutes of consecutive failures. If the plane is still failing after that, the command fails. The error names the last error and the status the run last had, and the CLI then cancels the run. A refusal, such as `404` for a run the plane does not know, fails the command at once.
 
 **Verifying an offline-signed bundle:** export the plane's trust root, then pass it to the verifier:
 
@@ -276,7 +278,7 @@ The command auto-detects existing hook tools in your project:
 - **prek** (`prek.toml` or `.prek.toml`): Adds a kici hook to `.pre-commit-config.yaml`, then runs `prek install`
 - **Raw git** (`--git`): Writes `.git/hooks/pre-commit`
 
-The hook runs `npx -y kici@<version> compile`, where `<version>` is the version of the `kici` CLI that installed the hook. When you upgrade `@kici-dev/sdk`, change the version in the hook too.
+The hook runs `npx -y kici@<version> compile`, where `<version>` is the version of the `kici` CLI that installed the hook, and then stages the result with `git add .kici/kici.lock.json`, so the commit carries the fresh lock file. When you upgrade `@kici-dev/sdk`, change the version in the hook too.
 
 If multiple tools are detected, you are prompted to choose. In a non-interactive shell or CI, the command uses the first tool in the list above. If no tool is detected, an interactive shell offers a raw git hook; a non-interactive shell installs nothing and tells you to pass `--git`.
 

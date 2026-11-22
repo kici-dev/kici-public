@@ -62,15 +62,17 @@ type RuleCheckFn = (ctx: RuleContext) => Promise<boolean> | boolean;
 
 Can be sync or async. Receives a `RuleContext`:
 
-| Property             | Type                                      | Description                                                             |
-| -------------------- | ----------------------------------------- | ----------------------------------------------------------------------- |
-| `event`              | `EventPayload`                            | The triggering event payload (discriminated union — narrow on `type`)   |
-| `changedFiles`       | `string[]`                                | Files changed in this event (see availability note below)               |
-| `changedFilesStatus` | `'fetched' \| 'unavailable' \| 'skipped'` | Whether `changedFiles` is available                                     |
-| `sourceRepo`         | `RepoInfo \| undefined`                   | Repo whose event triggered the run, when the evaluation has a checkout  |
-| `workflowRepo`       | `RepoInfo \| undefined`                   | Repo that registered the workflow (same repo outside a global workflow) |
-| `env`                | `Record<string, string\|undefined>`       | Environment variables                                                   |
-| `$`                  | zx shell                                  | Shell executor for running commands                                     |
+| Property             | Type                                                            | Description                                                                                                                                                 |
+| -------------------- | --------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `event`              | `EventPayload`                                                  | The triggering event payload (discriminated union — narrow on `type`)                                                                                       |
+| `changedFiles`       | `string[]`                                                      | Files changed in this event (see availability note below)                                                                                                   |
+| `changedFilesStatus` | `'fetched' \| 'unavailable' \| 'skipped'`                       | Whether `changedFiles` is available                                                                                                                         |
+| `sourceRepo`         | `RepoInfo \| undefined`                                         | Repo whose event triggered the run, when the evaluation has a checkout                                                                                      |
+| `workflowRepo`       | `RepoInfo \| undefined`                                         | Repo that registered the workflow (same repo outside a global workflow)                                                                                     |
+| `env`                | `Record<string, string\|undefined>`                             | Environment variables                                                                                                                                       |
+| `dispatchInputs`     | `Readonly<Record<string, string \| number \| boolean \| null>>` | Validated [dispatch inputs](./triggers.md#typed-dispatch-inputs); empty when the workflow declares none                                                     |
+| `fanout`             | `FanoutPosition \| undefined`                                   | Position within a `runsOnAll` or matrix fan-out ([`ctx.fanout`](./runs-on-all.md#ctxfanout--fan-out-position)); `undefined` on a job that is not fanned out |
+| `$`                  | zx shell                                                        | Shell executor for running commands                                                                                                                         |
 
 `changedFiles` is available on `push` and `pull_request` events — the agent computes the diff from its checkout, so no `paths:` trigger is required. A push to an existing branch diffs `before..after`. A push that creates a branch lists the files the branch adds, compared with the default branch. A pull request lists the files it changes. It is `unavailable` for events with no diff (`schedule`, `tag`, `manual_schedule`) and for a push whose payload has no `before` or `after` commit. It is also `unavailable` for a push that creates the default branch itself, and when the diff cannot be computed (e.g. a history deeper than the agent's bounded fetch). Reading `changedFiles` when it is unavailable throws and fails the job, so guard with `changedFilesStatus` first when a rule can run on such events:
 
@@ -106,6 +108,8 @@ Returns a `RuleEvaluationResult`:
 interface RuleEvaluationResult {
   allPassed: boolean;
   results: RuleResult[];
+  /** Set only when a rule's check threw, never for a clean `return false`. */
+  evaluationError?: { label: string; message: string };
 }
 ```
 
@@ -224,7 +228,7 @@ with the same name, so it fails the job instead — de-duplicate the values your
 (for example, `[...new Set(values)]`). The same rule applies to a static matrix.
 
 A dynamic matrix that would expand to an unreasonable number of raw combinations is refused
-before it is built, so a runaway discovery command fails the job with an error rather than
+before it is built. A runaway discovery command therefore fails the job with an error rather than
 exhausting the agent.
 
 A dynamic matrix is resolved at runtime, then materialized into N instances exactly like a static matrix. Because the combinations are not known until the function runs, the 256-combination cap (and the "zero combinations" guard) is enforced at that point. A dynamic matrix that resolves to more than 256 combinations, or to none, fails the job with a matrix-expansion error rather than dispatching.
@@ -397,6 +401,22 @@ export default workflow('ci', {
   jobs: [discoverJobs],
 });
 ```
+
+**Generated jobs take the same `checkout` option as a static job**, the object form included (see [Checkout depth and tags](./core.md#checkout-depth-and-tags)). A real run clones each generated job's repository at the depth and tags that job asks for:
+
+```typescript
+const releaseJobs: DynamicJobFn = async () => [
+  job('release-notes', {
+    runsOn: 'linux',
+    checkout: { fetchDepth: 0 },
+    run: async ({ $ }) => {
+      await $`git log --oneline $(git describe --tags --abbrev=0)..HEAD`;
+    },
+  }),
+];
+```
+
+`kici run remote` reads the history to ship from the compiled lock file, which does not hold generated jobs. When a generated job needs more history or tags than the static jobs ask for, pass `--git-depth` or `--git-tags`. When the shipped history is shorter than a job asks for, the job's setup log shows a warning that names the flag to add. The job still runs. See [What the remote workspace contains](../cli/runs-and-approvals.md#what-the-remote-workspace-contains).
 
 ### dynamicJob — result-aware generation
 

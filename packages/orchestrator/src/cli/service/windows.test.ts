@@ -47,7 +47,7 @@ const mockGetDepMetadata = vi.fn().mockReturnValue({
 vi.mock('../lazy-deps/downloader.js', () => ({
   ensureDep: (...args: unknown[]) => mockEnsureDep(...args),
 }));
-vi.mock('../lazy-deps/registry.js', () => ({
+vi.mock('@kici-dev/shared/lazy-deps', () => ({
   getDepMetadata: (...args: unknown[]) => mockGetDepMetadata(...args),
 }));
 

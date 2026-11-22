@@ -3,6 +3,7 @@
  * registrations, all behind the shared admin Bearer auth middleware.
  */
 
+import type { Context } from 'hono';
 import { Hono } from 'hono';
 import { z } from 'zod';
 import {
@@ -19,6 +20,7 @@ import type { ContextStore } from '../contexts/context-store.js';
 import { toContext } from '../contexts/context-store.js';
 import { assertWorkflowsSatisfiable } from '../contexts/protection/satisfiability.js';
 import { enforceRoutingKeyScope } from '../secrets/routing-key-scope.js';
+import type { RepoInstallationResolver } from '../registration/repo-installation.js';
 import { createBearerAuthMiddleware } from './admin-auth.js';
 import { type AdminEnv, createAdminApp } from './admin-env.js';
 import {
@@ -55,6 +57,17 @@ export interface AdminRegistrationRoutesDeps {
    * mutually-exclusive fixed branch/trigger/repo restrictions).
    */
   contextStore?: Pick<ContextStore, 'matchContext'>;
+  /**
+   * The org that owns a routing key's source. A routing-key-scoped token may
+   * register only into that org. Without it, a scoped token cannot register.
+   */
+  resolveOrgId?: (routingKey: string) => Promise<string>;
+  /**
+   * The installation of a GitHub App source's App on a repository. A
+   * routing-key-scoped token's registration stores this installation, never
+   * one the request names. Without it, a scoped token cannot register.
+   */
+  resolveRepoInstallation?: RepoInstallationResolver;
 }
 
 const refreshSchema = z.object({
@@ -74,6 +87,63 @@ const registerManualSchema = z.object({
   providerContext: z.record(z.string(), z.unknown()).default({}),
   commitSha: z.string().optional(),
 });
+
+type RegisterManualBody = z.infer<typeof registerManualSchema>;
+
+/**
+ * What a routing-key-scoped token may register: the org of its own routing key,
+ * and, for a GitHub App source, the installation the App really has on the
+ * repository. Returns the provider context to store, or a 403 response.
+ *
+ * An unscoped token is the operator, trusted with any org and context, as with
+ * sources; its request is stored as given.
+ */
+async function scopedRegistration(
+  c: Context<AdminEnv>,
+  deps: AdminRegistrationRoutesDeps,
+  parsed: RegisterManualBody,
+): Promise<Response | Record<string, unknown>> {
+  if (!c.get('routingKey')) return parsed.providerContext;
+  const refuse = (error: string) => c.json({ error }, 403);
+  if (!deps.resolveOrgId || !deps.resolveRepoInstallation) {
+    return refuse('Access denied: this orchestrator cannot verify a scoped registration');
+  }
+  const owner = await deps.resolveOrgId(parsed.routingKey);
+  // fails-when: a scoped token places a registration in another org's
+  //   cross-source, global and lock-fallback lookups
+  if (parsed.customerId !== owner) {
+    return refuse(
+      `Access denied: customerId must be the org of the token's routing key (${owner})`,
+    );
+  }
+  let installationId: number | null | undefined;
+  try {
+    installationId = await deps.resolveRepoInstallation(parsed.routingKey, parsed.repoIdentifier);
+  } catch (err) {
+    // fails-when: a failed lookup stores the request's installation unchecked
+    return refuse(
+      `Access denied: could not verify the App's installation on ${parsed.repoIdentifier}: ` +
+        (err instanceof Error ? err.message : String(err)),
+    );
+  }
+  if (installationId === undefined) return parsed.providerContext;
+  if (installationId === null) {
+    return refuse(
+      `Access denied: the source's GitHub App has no installation on ${parsed.repoIdentifier}`,
+    );
+  }
+  const claimed = parsed.providerContext.installationId;
+  // fails-when: a scoped token picks another account's installation of its App,
+  //   whose tokens its cron and manual runs then mint
+  // breaks-if-wrong: a request naming the repository's own installation still registers
+  if (claimed !== undefined && claimed !== installationId) {
+    return refuse(
+      `Access denied: installationId ${String(claimed)} is not the App's installation on ` +
+        `${parsed.repoIdentifier} (${installationId})`,
+    );
+  }
+  return { ...parsed.providerContext, installationId };
+}
 
 /** Routes mounted at /api/v1/admin/registrations. */
 export function createAdminRegistrationRoutes(deps: AdminRegistrationRoutesDeps): Hono<AdminEnv> {
@@ -182,6 +252,8 @@ export function createAdminRegistrationRoutes(deps: AdminRegistrationRoutesDeps)
 
     const denied = enforceRoutingKeyScope(c, parsed.routingKey);
     if (denied) return denied;
+    const providerContext = await scopedRegistration(c, deps, parsed);
+    if (providerContext instanceof Response) return providerContext;
 
     let lockFile: { workflows: unknown[]; lockfileHash?: unknown; siblingsDigest?: unknown };
     try {
@@ -218,7 +290,7 @@ export function createAdminRegistrationRoutes(deps: AdminRegistrationRoutesDeps)
       parsed.repoIdentifier,
       (lockFile.workflows ?? []) as Parameters<typeof deps.registrationStore.replaceAll>[1],
       parsed.routingKey,
-      parsed.providerContext,
+      providerContext,
       {
         customerId: parsed.customerId,
         commitSha: parsed.commitSha,

@@ -11,6 +11,7 @@ import {
   assertScheduleInputsSatisfiable,
   resolveContentFormat,
   stripStatefulRegexFlags,
+  lockCheckoutFields,
 } from '@kici-dev/engine';
 import type {
   LabelMatcher,
@@ -1100,7 +1101,7 @@ function transformJob(
     exclude: job.exclude?.map((exc) => ({ ...exc })),
     rules: job.rules ? transformRules(job.rules, configPath, index) : undefined,
     description: job.description,
-    ...(job.checkout !== undefined && { checkout: job.checkout }),
+    ...lockCheckoutFields(job.checkout),
     ...(job.cache !== undefined && { cache: normalizeCacheSpecs(job.cache) }),
     ...(job.container !== undefined && { container: job.container }),
     ...(job.sandbox !== undefined && { sandbox: job.sandbox }),

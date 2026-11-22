@@ -10,6 +10,8 @@ import { eventLabelForTag } from './describe-event.js';
 export interface GitHead {
   branch?: string;
   sha?: string;
+  /** The parent of `sha`: a push event's `before`. Absent when it is not known locally. */
+  parentSha?: string;
 }
 
 /** A `SimulatedEvent`-compatible event, as the test trigger route takes it. */
@@ -19,6 +21,11 @@ export interface FixtureEvent {
   targetBranch: string;
   sourceBranch?: string;
   payload: Record<string, unknown>;
+  /**
+   * The files the event changes, computed by the CLI. The orchestrator treats a
+   * list as fetched; absent, the agent computes the changes itself.
+   */
+  changedFiles?: string[];
 }
 
 /** The branch when neither the fixture nor a detached `HEAD` names one, as in `kici init`. */
@@ -28,7 +35,12 @@ const FALLBACK_PR_SOURCE_BRANCH = 'feature/test';
 
 const FALLBACK_TAG = 'v0.0.0';
 
-const PR_EVENT_FAMILY = new Set(['pull_request', 'review', 'review_comment']);
+/** The engine event types whose payload is a pull request: the checkout is its head. */
+export const PR_EVENT_FAMILY: ReadonlySet<string> = new Set([
+  'pull_request',
+  'review',
+  'review_comment',
+]);
 
 /** The engine event type and action a trigger config simulates; an unknown tag is a push. */
 export function fixtureEventKind(event: unknown): { type: string; action?: string } {
@@ -89,6 +101,8 @@ export function buildFixtureEvent(opts: FixtureOptions, head: GitHead): FixtureE
   }
 
   const targetBranch = opts.branch ?? head.branch ?? FALLBACK_BRANCH;
+  // A fixture that pins its own `sha` names a commit whose parent is unknown here.
+  const before = type === 'push' && opts.sha === undefined ? head.parentSha : undefined;
   return {
     type,
     ...(action !== undefined && { action }),
@@ -96,6 +110,7 @@ export function buildFixtureEvent(opts: FixtureOptions, head: GitHead): FixtureE
     payload: {
       ref: `refs/heads/${targetBranch}`,
       repository,
+      ...(before && { before }),
       ...(sha && { after: sha }),
       ...(opts.pr !== undefined && { number: opts.pr }),
     },

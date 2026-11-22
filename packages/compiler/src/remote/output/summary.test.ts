@@ -7,6 +7,7 @@ import {
 } from './summary.js';
 import { formatJsonResult } from './json.js';
 import { formatJunitResult } from './junit.js';
+import { GitTagMode } from '../shipped-git/git-ship-types.js';
 
 const stripAnsi = (text: string): string => text.replace(/\u001b\[[0-9;]*m/g, '');
 
@@ -308,6 +309,31 @@ describe('formatJsonResult', () => {
 
     const parsed = JSON.parse(formatJsonResult(results));
     expect(parsed.results[0].jobs[0]).not.toHaveProperty('durationMs');
+  });
+
+  it('emits the overlay report of a result that carries one', () => {
+    const overlay = {
+      compressedSize: 4096,
+      fileCount: 12,
+      git: {
+        depth: 0,
+        tags: GitTagMode.All,
+        shipped: { fetchDepth: 7, allTags: true },
+        synthetic: true,
+        workspaceSha: 'feed01',
+        baseSha: 'base01',
+        syntheticTags: ['v9.9.9'],
+      },
+    };
+    const parsed = JSON.parse(
+      formatJsonResult([
+        { fixtureId: 'a', runId: 'r1', status: 'success', totalDurationMs: 1, jobs: [], overlay },
+        { fixtureId: 'b', runId: 'r2', status: 'success', totalDurationMs: 1, jobs: [] },
+      ]),
+    );
+    // fails-when: the formatter drops the overlay field
+    expect(parsed.results[0].overlay).toEqual({ ...overlay, git: { ...overlay.git, tags: 'all' } });
+    expect(parsed.results[1]).not.toHaveProperty('overlay');
   });
 });
 

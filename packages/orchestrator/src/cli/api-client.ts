@@ -152,6 +152,53 @@ export function isTransportFailure(err: unknown): boolean {
   return err instanceof TypeError && err.message === 'fetch failed';
 }
 
+/**
+ * The admin API answered with a non-2xx status. The message is unchanged
+ * (`HTTP <status>: <error>`); `status` lets a caller tell a server-side failure,
+ * worth retrying, from a refusal that retrying cannot fix.
+ */
+export class AdminApiHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly body: string,
+  ) {
+    super(`HTTP ${status}: ${body}`);
+    this.name = 'AdminApiHttpError';
+  }
+}
+
+/**
+ * The request was sent and the transport failed (refused, reset, timed out,
+ * unresolvable host), or its answer was cut off mid-body. A malformed request
+ * that never left the process is a plain `Error`, never this class.
+ */
+export class AdminApiUnreachableError extends Error {
+  constructor(message: string, options: { cause: unknown }) {
+    super(message, options);
+    this.name = 'AdminApiUnreachableError';
+  }
+}
+
+/**
+ * The caller's abort is rethrown as it is. A passed deadline (`AbortSignal.timeout`) means the
+ * server did not answer in time, so it is an `AdminApiUnreachableError`.
+ */
+function abortFailure(err: unknown, baseUrl: string): Error | undefined {
+  const name = (err as { name?: unknown } | null)?.name;
+  if (name === 'AbortError') return err as Error;
+  if (name !== 'TimeoutError') return undefined;
+  return new AdminApiUnreachableError(
+    `no answer from the orchestrator admin API at ${baseUrl} before the request deadline.`,
+    { cause: err },
+  );
+}
+
+/** Per-call options of an admin API request. */
+export interface AdminRequestOptions {
+  /** Ends the request, body included; a timeout signal is a deadline. */
+  signal?: AbortSignal;
+}
+
 /** The admin API address kici-admin dials when neither --url nor KICI_ADMIN_URL is set. */
 export const DEFAULT_ADMIN_URL = `http://localhost:${ORCHESTRATOR_DEFAULT_PORT}`;
 
@@ -163,6 +210,8 @@ export async function fetchAdminApi(
   try {
     return await fetch(url, init);
   } catch (err) {
+    const aborted = abortFailure(err, baseUrl);
+    if (aborted) throw aborted;
     // An unbuildable request is a malformed argument, not a connectivity problem;
     // the common shape is a credential with a stray newline (e.g. an env file
     // declaring the key twice).
@@ -189,12 +238,33 @@ export async function fetchAdminApi(
           `port on this host; an orchestrator on another host, or one whose KICI_PORT sets ` +
           `another port, needs KICI_ADMIN_URL or --url.`
         : '';
-    throw new Error(
+    throw new AdminApiUnreachableError(
       `cannot reach the orchestrator admin API at ${baseUrl}${cause}. ` +
         `Set KICI_ADMIN_URL to the orchestrator's HTTP address, or pass --base-url where the ` +
         `subcommand accepts it. Note KICI_ORCHESTRATOR_URL is NOT read by this CLI; if other ` +
         `subcommands appear to work, they are using the --database-url / KICI_DATABASE_URL ` +
         `direct-DB path rather than HTTP.${defaultHint}`,
+      { cause: err },
+    );
+  }
+}
+
+/**
+ * Read a response body. undici errors the body stream with a `TypeError` when
+ * the connection drops mid-body; that is an `AdminApiUnreachableError` too, so
+ * a caller retrying a dropped connection also retries a cut-off answer.
+ * Malformed JSON (`SyntaxError`) is rethrown as is.
+ */
+async function readAdminBody<T>(read: () => Promise<T>, baseUrl: string): Promise<T> {
+  try {
+    return await read();
+  } catch (err) {
+    const aborted = abortFailure(err, baseUrl);
+    if (aborted) throw aborted;
+    if (!(err instanceof TypeError)) throw err;
+    const detail = firstCauseMessage(err) || err.message;
+    throw new AdminApiUnreachableError(
+      `the response from the orchestrator admin API at ${baseUrl} was cut off (${detail}).`,
       { cause: err },
     );
   }
@@ -219,7 +289,12 @@ export class AdminApiClient {
     private readonly token: string,
   ) {}
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async request<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    opts: AdminRequestOptions = {},
+  ): Promise<T> {
     const url = `${this.baseUrl}${path}`;
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.token}`,
@@ -232,12 +307,13 @@ export class AdminApiClient {
         method,
         headers,
         body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: opts.signal,
       },
       this.baseUrl,
     );
 
     if (!res.ok) {
-      const text = await res.text();
+      const text = await readAdminBody(() => res.text(), this.baseUrl);
       let errorBody: string;
       try {
         const json = JSON.parse(text);
@@ -245,7 +321,7 @@ export class AdminApiClient {
       } catch {
         errorBody = text;
       }
-      throw new Error(`HTTP ${res.status}: ${errorBody}`);
+      throw new AdminApiHttpError(res.status, errorBody);
     }
 
     // 204 No Content
@@ -253,11 +329,11 @@ export class AdminApiClient {
       return undefined as T;
     }
 
-    return (await res.json()) as T;
+    return readAdminBody(() => res.json() as Promise<T>, this.baseUrl);
   }
 
-  async get<T>(path: string): Promise<T> {
-    return this.request<T>('GET', path);
+  async get<T>(path: string, opts?: AdminRequestOptions): Promise<T> {
+    return this.request<T>('GET', path, undefined, opts);
   }
 
   async post<T>(path: string, body: unknown): Promise<T> {
@@ -284,9 +360,9 @@ export class AdminApiClient {
       this.baseUrl,
     );
     if (!res.ok) {
-      throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+      throw new AdminApiHttpError(res.status, await readAdminBody(() => res.text(), this.baseUrl));
     }
-    return res.text();
+    return readAdminBody(() => res.text(), this.baseUrl);
   }
 
   // --- Fleet log collection ---
@@ -314,9 +390,9 @@ export class AdminApiClient {
       this.baseUrl,
     );
     if (!res.ok) {
-      throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+      throw new AdminApiHttpError(res.status, await readAdminBody(() => res.text(), this.baseUrl));
     }
-    const buf = Buffer.from(await res.arrayBuffer());
+    const buf = Buffer.from(await readAdminBody(() => res.arrayBuffer(), this.baseUrl));
     fs.writeFileSync(outPath, buf);
   }
 
@@ -334,6 +410,13 @@ export class AdminApiClient {
   async listKeys(orgId: string, scope: string): Promise<{ keys: string[] }> {
     const params = new URLSearchParams({ orgId, scope });
     return this.request<{ keys: string[] }>('GET', `/api/v1/admin/secrets/keys?${params}`);
+  }
+
+  /** The stored secrets the orchestrator master key cannot decrypt, by location only. */
+  async verifySecrets(): Promise<{
+    undecryptable: Array<{ orgId: string; scope: string; key: string }>;
+  }> {
+    return this.request('GET', '/api/v1/admin/secrets/verify');
   }
 
   async setSecret(orgId: string, scope: string, key: string, value: string): Promise<void> {
@@ -808,7 +891,7 @@ export class AdminApiClient {
         ...(json.error ? { error: json.error } : {}),
       };
     }
-    throw new Error(`HTTP ${res.status}: ${json.error ?? text}`);
+    throw new AdminApiHttpError(res.status, json.error ?? text);
   }
 
   /**
@@ -829,7 +912,7 @@ export class AdminApiClient {
       },
       this.baseUrl,
     );
-    const text = await res.text();
+    const text = await readAdminBody(() => res.text(), this.baseUrl);
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
@@ -862,7 +945,7 @@ export class AdminApiClient {
         'this orchestrator predates kici-admin scaler reload; send SIGHUP to it or upgrade it',
       );
     }
-    throw new Error(`HTTP ${res.status}: ${json.error ?? text}`);
+    throw new AdminApiHttpError(res.status, json.error ?? text);
   }
 
   // --- Scaler orphans (live Firecracker VMs a node does not track) ---

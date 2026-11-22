@@ -7,7 +7,7 @@ The `kici-admin` CLI manages the KiCI orchestrator: configuration, secrets, toke
 
 Some command groups deliberately bypass that API, because they must work while the orchestrator is down (or before it exists):
 
-- **Direct database** (`--database-url`, or `KICI_DATABASE_URL`): `check-run`, `cluster`, `signing-key`, `dashboard-encryption-key`, `remote-source`, and `peer prune-credentials` / `reset-raft-state`. `host` and the other `peer` verbs (`create-token`, `list`, `revoke`, `revoke-all`) also go straight to the database, but they read `KICI_DATABASE_URL` only. They carry no `--database-url` flag. Several API-backed commands offer a direct-DB mode through the same flag — each one says so in its guide entry.
+- **Direct database** (`--database-url`, or `KICI_DATABASE_URL`): `check-run`, `cluster`, `cold-store`, `signing-key`, `dashboard-encryption-key`, `remote-source`, `attestations reverify` / `list`, every `db` verb except `migrate`, and `peer prune-credentials` / `reset-raft-state`. `host` and the `peer` verbs `create-token`, `list`, `revoke` and `revoke-all` also go straight to the database, but they read `KICI_DATABASE_URL` only. They carry no `--database-url` flag. Several API-backed commands offer a direct-DB mode through the same flag — each one says so in its guide entry. Such a command uses the database when you pass `--database-url`, or when `KICI_DATABASE_URL` is set and you do not pass `--url`. An explicit `--url` selects the admin API, even on an orchestrator host whose environment sets `KICI_DATABASE_URL`. A command that has no admin API mode, such as `peer prune-credentials`, `peer reset-raft-state`, `backend purge-stale` or `context purge`, reads `KICI_DATABASE_URL` whether or not you pass `--url`.
 - **Local host only** (no orchestrator, no database): `firecracker`, `scaler reap-orphans`, `inspect-bundle`, and the `agent` / `orchestrator` service-lifecycle verbs (`install`, `uninstall`, `start`, `stop`, `restart`, `status`, `logs`, `upgrade`, plus `agent package`; `orchestrator drain` / `resume` are API-backed).
 - **Own transport**: `join` connects straight to the Platform relay or a peer orchestrator.
 
@@ -30,7 +30,7 @@ All API-backed commands require a Bearer token. Provide it via:
 - **Environment variable** (recommended): `export KICI_ADMIN_TOKEN=<token>`
 - **CLI flag**: `--token <token>` or `-t <token>`
 
-The token is validated against the `admin_tokens` table in the orchestrator database. Tokens are stored as SHA-256 hashes and never persisted in plaintext.
+The orchestrator validates the token against the `admin_tokens` table in its database. It stores tokens as SHA-256 hashes and never in plaintext.
 
 ### Bootstrap token
 
@@ -46,7 +46,7 @@ Save this token immediately -- it is only shown once. To use a fixed token for a
 export KICI_BOOTSTRAP_ADMIN_TOKEN=my-fixed-admin-token
 ```
 
-With `KICI_BOOTSTRAP_ADMIN_TOKEN` set, every startup sets the `bootstrap` token to that value with the `owner` role, so a new value replaces the old token. Without it, the orchestrator generates a bootstrap token only when no unrevoked admin token exists.
+With `KICI_BOOTSTRAP_ADMIN_TOKEN` set, every startup sets the `bootstrap` token to that value with the `owner` role, so a new value replaces the old token. The orchestrator then prints the token value to the logs at every startup. Without it, the orchestrator generates a bootstrap token only when no unrevoked admin token exists.
 
 ### Creating additional tokens
 
@@ -126,7 +126,7 @@ Tokens are assigned one of three roles. The role determines which admin API oper
 
 - **owner** -- full access. Use for bootstrap and token management.
 - **admin** -- day-to-day operations (secrets, sources, config). Cannot manage tokens or rotate keys.
-- **auditor** -- read-only access to contexts, audit logs, run status, the event log (metadata only), the access log, the event dead-letter queue, internal events (`event list` / `event show`, which need `event_dlq.read`), and a node's live Firecracker VMs (`scaler orphans`, which needs `scaler.read`), all without payload bodies. Cannot read secret values, event-log payloads, or mutate anything.
+- **auditor** -- read-only access, without payload bodies, to contexts, audit logs, run status, the event log (metadata only), the access log and the event dead-letter queue. It also reads internal events (`event list` / `event show`, which need `event_dlq.read`), a node's live Firecracker VMs (`scaler orphans`, which needs `scaler.read`), and the status and logs of a test run (`test_run.read`). Cannot read secret values, event-log payloads, or mutate anything.
 
 > **Note:** These roles govern the orchestrator admin API only. They are entirely separate from the SaaS dashboard RBAC system (org member roles, custom roles, permission matrices) which is managed through the dashboard UI and applies to OIDC-authenticated users.
 

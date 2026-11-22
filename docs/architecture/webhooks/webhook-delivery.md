@@ -32,7 +32,7 @@ sequenceDiagram
     A->>A: Create sandbox (container/bare-metal/firecracker)
     A->>O: job.context (runtime details)
     Note over A: Inside sandbox child process
-    A->>A: Clone repo (shallow, at ref)
+    A->>A: Clone repo (at ref, job checkout depth)
     A->>A: Restore deps (cache or install)
     A->>A: Load workflow from lock file
     A->>A: Evaluate rules (fail-fast)
@@ -56,7 +56,7 @@ sequenceDiagram
 GitHub POSTs the webhook payload to the KiCI ingest endpoint:
 
 ```
-POST https://kici.dev/webhook/<orgId>/github
+POST https://<platform-host>/webhook/<orgId>/github
 ```
 
 GitHub includes these headers with every webhook delivery:
@@ -114,8 +114,8 @@ written to again.
 The orchestrator reassembles the body from the chunked stream and asks its ingest admission controller for a slot. Admission runs before signature verification, so it needs only the Platform-established routing key. A granted delivery is then verified locally via `verifyInboundWebhook()` (`packages/orchestrator/src/webhook/verify-inbound.ts`), ACKed upstream with the verdict, and on `accepted` run through the provider-agnostic processing pipeline:
 
 1. **Dedup:** Check dual-layer dedup cache (in-memory + DB) by delivery ID
-2. **Provider lookup:** Get the provider bundle from the ProviderRegistry using `getByRoutingKey()` (exact match first, falls back to provider type prefix for backward compatibility; a `generic:` key falls back only to the shared `generic:default` bundle, never to another source's)
-3. **Event normalization:** Use the provider's `WebhookNormalizer` to map the event/action to a `SimulatedEvent` (e.g., `push` -> `{ type: 'push', targetBranch: '...' }`)
+2. **Provider lookup:** Get the provider bundle from the ProviderRegistry using `getByRoutingKey()` (exact match first; a key with no bundle of its own falls back only to its provider type's default bundle, such as `generic:default`, never to another source's)
+3. **Event normalization:** Use the provider's `WebhookNormalizer` to map the event/action to a `SimulatedEvent` (e.g., `push` -> `{ type: 'push', targetBranch: '...' }`). A generic delivery then runs the [cross-source](#cross-source-delivery) pass, and a plain generic delivery with candidates ends there
 4. **Repo and credential extraction:** Extract repository identifier and provider-specific credentials from the payload (e.g., GitHub installation ID)
 5. **Command interception:** For `issue_comment` events, intercept `/kici approve` and `/kici reject` commands via `handleApprovalComment()` for security hold management (before normal trigger matching)
 6. **Trust resolution (PR events):** For pull request events, resolve the tier from the head ref — a fork ref is `unknown`, a same-repo ref is `trusted` — and pick the lock file source (head for trusted, base for untrusted). Then evaluate the org fork switch: an `ignore` verdict drops the delivery here, before any lock file is fetched
@@ -152,10 +152,10 @@ The agent receives the `job.dispatch` message and runs the full job lifecycle. C
 
 1. **Acknowledge and report running:** Send `job.ack` on accepting the dispatch (a busy or draining agent sends `job.reject` instead, and the orchestrator requeues the job), then `job.status: running`
 2. **Create sandbox:** Determine execution mode and create the appropriate sandbox backend
-3. **Sandbox setup:** Prepare the execution environment (container: create + start; bare-metal: validate; firecracker: detect)
+3. **Sandbox setup:** Prepare the execution environment (container: create + start; bare-metal: validate; firecracker: none, because the scaler already booted the VM)
 4. **Emit context:** Send `job.context` with runtime details (Node version, OS, arch, sandbox type)
 5. **Sandbox execution (child process):**
-   - Clone repo: shallow `git clone` at the dispatch ref, unless the job sets `checkout: false`
+   - Clone repo: `git clone` at the dispatch ref, at the job's `checkout` depth and tag policy (default: depth 1, git's default tags). A job that sets `checkout: false` gets no clone: the source restore below provides `.kici/`, or the agent fetches only `.kici/` when the orchestrator caches no workflow source
    - Restore source: download the cached `.kici/` source tarball (`sourceTarUrl`), verify it against `sourceTarDigest`, and replace the clone's `.kici/` with it, so no `npm ci` or compile of `.kici/` is needed at execution time
    - Restore deps: download the cached dependency tarball (`depsUrl`) to a file, verify its SHA-256, then extract it. Install inline instead if the cache missed or the restore failed for a reason other than a hash mismatch
    - Load workflow: register the shared `@kici-dev/core/ts-loader-hook` and dynamic-`import()` the workflow `.ts` from the extracted source. Verify the computed `contentHash` against the lock file's value (drift guard) before any step runs.
@@ -210,7 +210,7 @@ When a workflow's `contentHash` is not in the cache:
 
 ### Lock files without a content hash
 
-A workflow entry without a `contentHash` field bypasses the cache entirely, and agents compile from source. The compiler writes a `contentHash` for every workflow. A lock old enough to lack one (schema version 1) is below the oldest supported schema version, so the orchestrator rejects it when it fetches the lock. The current lock file schema version is 44. The orchestrator does not require an exact match: it accepts a compatibility window of schema versions. A lock is read when its `schemaVersion` is at or above the orchestrator's oldest supported version and the orchestrator's own schema is at or above the lock's `minReaderVersion`. An out-of-window lock is rejected with an actionable error: a lock below the floor must be recompiled with `pnpm kici compile` and pushed again, while a lock requiring a newer reader means the orchestrator must be upgraded.
+A workflow entry without a `contentHash` field bypasses the cache entirely, and agents compile from source. The compiler writes a `contentHash` for every workflow. A lock old enough to lack one (schema version 1) is below the oldest supported schema version, so the orchestrator rejects it when it fetches the lock. The current lock file schema version is 45. The orchestrator does not require an exact match: it accepts a compatibility window of schema versions. A lock is read when its `schemaVersion` is at or above the orchestrator's oldest supported version and the orchestrator's own schema is at or above the lock's `minReaderVersion`. An out-of-window lock is rejected with an actionable error. A lock below the floor must be recompiled with `pnpm kici compile` and pushed again, while a lock requiring a newer reader means the orchestrator must be upgraded.
 
 ### Prometheus metrics
 
@@ -247,7 +247,7 @@ Cross-org leakage is structurally impossible. The lookup map key is `${customerI
 
 ### Per-registration dispatch
 
-For each event-mode registration, the orchestrator builds a synthetic `SimulatedEvent` whose `type` is the user event name (not `'generic_webhook'`) and runs `matchAllWorkflows([reg.lockEntry], syntheticEvent)`. The synthetic event is required because `matchWebhookTrigger` checks `trigger.events.includes(event.type)` — if the type were left as `'generic_webhook'`, no user-defined webhook trigger would ever match. The fix lives entirely in the cross-source branch; the engine matcher is **not** patched (patching the matcher would change semantics for github push, pr, issue_comment, etc.).
+For each event-mode registration, the orchestrator builds a synthetic `SimulatedEvent` whose `type` is the user event name (not `'generic_webhook'`) and runs `matchAllWorkflows([reg.lockEntry], syntheticEvent)`. The synthetic event is required because `matchWebhookTrigger` checks `trigger.events.includes(event.type)` — if the type were left as `'generic_webhook'`, no user-defined webhook trigger would ever match. The cross-source branch owns this synthetic event. The engine matcher stays as it is, because a change there would change semantics for github push, pr, issue_comment, etc.
 
 For a repo-mode registration, the registration bundle's normalizer builds the event, and the orchestrator resolves the changed files **through the registration's bundle** before matching, with `reg.providerContext` as credentials. A registration with no `paths` trigger skips the lookup; the others share one lookup per `(routing key, repository)` within the delivery. The result follows the same rules as the same-source path (see [path filter behavior](../../user/sdk/triggers.md#path-filter-behavior)). An exact list decides. An unavailable list with a git range defers the decision to an `__init__` job. A payload with no range (no `before`/`after`) matches conservatively. A pull request also matches conservatively when its list is unavailable: a cross-source job checks out the registration's commit, not the pull request's head, so no agent can diff the pull request for it. A lookup failure is `unavailable`, so one candidate never stops the fan-out.
 
@@ -296,7 +296,7 @@ Routing-key collisions (e.g., a GitHub App source and a universal-git source tar
 
 **Trigger:** A webhook arrives for an `orgId` that has no matching webhook source registered for the GitHub provider.
 
-**Result:** Platform returns **404**. The webhook provider sees the delivery as failed. The orchestrator must be connected and have sent `source.register` for this org before webhooks will be processed. The Platform caches the miss for five minutes and answers repeat deliveries with 404 from that cache. A miss for a `ping` is answered 404 but not cached, and registering a source clears the cache entry for each accepted key on the KiCI instance that holds the connection. So the ping GitHub sends when an App is created does not block the App's first real deliveries.
+**Result:** Platform returns **404**. The webhook provider sees the delivery as failed. The orchestrator must be connected and have sent `source.register` for this org before webhooks are processed. The Platform caches the miss for five minutes and answers repeat deliveries with 404 from that cache. A miss for a `ping` is answered 404 but not cached, and registering a source clears the cache entry for each accepted key on the KiCI instance that holds the connection. So the ping GitHub sends when an App is created does not block the App's first real deliveries.
 
 ### Ingest admission shed (Step 3)
 
@@ -324,7 +324,7 @@ from, and consumes that key exactly once. Every instance multiplexes its
 subscriptions onto one connection. A large payload published inline would push
 that connection past its output buffer. That costs the instance its whole
 cross-instance plane — every relay, every acknowledgement, every dashboard
-message — rather than just the one delivery. If the pointer has already
+message — rather than the one delivery. If the pointer has already
 expired when the message is read, the receiving instance does not acknowledge:
 the originating instance times out and buffers the delivery for replay.
 
@@ -352,7 +352,7 @@ Buffering is bounded per org and globally (item + byte budgets and a hard cap). 
 
 **Trigger:** The repository does not have a `.kici/kici.lock.json` file at the webhook's commit SHA.
 
-**Result:** The orchestrator logs a debug message and skips processing. This is **not an error** -- the repository may not have KiCI configured, or the lock file may not exist on this branch. No jobs are dispatched.
+**Result:** The orchestrator skips per-repository matching. This is **not an error** -- the repository may not have KiCI configured, or the lock file may not exist on this branch. The orchestrator still runs the [organization-wide workflow](../global-workflows.md) pass for the event. It logs `Webhook processed (no per-repo lock file)` at `info` and records the delivery with status `lockfile_missing`. No per-repository jobs are dispatched.
 
 ### No trigger match (Step 3)
 
@@ -364,7 +364,7 @@ Buffering is bounded per org and globally (item + byte budgets and a hard cap). 
 
 **Trigger:** A workflow matched and jobs need to be dispatched, but no agent with the required `runsOn` labels is currently connected.
 
-**Result:** The job is **queued** in the orchestrator's job queue. It will be dispatched automatically when an agent with matching labels connects and has available capacity.
+**Result:** The job is **queued** in the orchestrator's job queue. It is dispatched automatically when an agent with matching labels connects and has available capacity.
 
 ### Agent disconnect during execution (Step 5)
 
@@ -372,7 +372,7 @@ Buffering is bounded per org and globally (item + byte budgets and a hard cap). 
 
 **Result:** depends on whether the agent is a long-lived (static) agent or an ephemeral one an auto-scaler spawned.
 
-**Static agent -- the job enters a recovery window.** The orchestrator moves the job to the `recovering` state rather than failing it, and persists both the recovery deadline and the owning agent id on the queue row, so a coordinator that takes over after a leader change can re-arm the timer or expire the row. The window is **twice the agent's maximum reconnect delay** (`KICI_AGENT_MAX_RECONNECT_DELAY_MS`, default 60000 -- so 2 minutes by default).
+**Static agent -- the job enters a recovery window.** The orchestrator moves the job to the `recovering` state rather than failing it. It persists both the recovery deadline and the owning agent id on the queue row, so a coordinator that takes over after a leader change can re-arm the timer or expire the row. The window is **twice the agent's maximum reconnect delay** (`KICI_AGENT_MAX_RECONNECT_DELAY_MS`, default 60000 -- so 2 minutes by default).
 
 - **Agent reconnects in time:** it reports its in-flight jobs on `agent.register`, the orchestrator reconciles them against the queue, cancels the recovery timer, flips the row back to `dispatched`, and the job continues. Nothing is re-dispatched and no work is lost.
 - **Window expires:** the job is permanently failed with `Job failed: agent disconnected and did not reconnect within the recovery window`.
@@ -385,7 +385,7 @@ Buffering is bounded per org and globally (item + byte budgets and a hard cap). 
 
 ## Recovery for a missing orchestrator
 
-GitHub Apps do **not** automatically retry a failed webhook delivery -- a delivery that returns a non-2xx status is not redelivered on a schedule; an operator can only replay it by hand from the App's delivery history. So the Platform cannot outsource recovery to the provider for the no-orchestrator window (restart, upgrade, network blip). Instead it **buffers the delivery itself** and replays it when an orchestrator reconnects, as described in [No orchestrator connected](#no-orchestrator-connected----any-instance-step-2) above. This keeps the customer's CI triggers from silently vanishing during an ordinary orchestrator restart.
+GitHub Apps do **not** automatically retry a failed webhook delivery -- a delivery that returns a non-2xx status is not redelivered on a schedule. An operator can only replay it by hand from the App's delivery history. So the Platform cannot outsource recovery to the provider for the no-orchestrator window (restart, upgrade, network blip). Instead it **buffers the delivery itself** and replays it when an orchestrator reconnects, as described in [No orchestrator connected](#no-orchestrator-connected----any-instance-step-2) above. This keeps the customer's CI triggers from silently vanishing during an ordinary orchestrator restart.
 
 For this to work reliably, the Platform must return quickly: 200 for success or buffered, 503 only when the buffer budget is exhausted. It must not hold the connection open waiting for job completion.
 

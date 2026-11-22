@@ -21,6 +21,7 @@ function createMockDeps(overrides?: Partial<AdminRouteDeps>): AdminRouteDeps {
       deleteSecret: vi.fn(),
       listKeys: vi.fn(),
       listScopes: vi.fn(),
+      findUndecryptable: vi.fn(),
       getAllSecrets: vi.fn(),
       rotateKey: vi.fn(),
       createScope: vi.fn(),
@@ -136,6 +137,22 @@ describe('admin routes', () => {
       });
       const res = await request(app, 'GET', '/secrets/scopes?orgId=org-1', { token: validToken });
       expect(res.status).toBe(403);
+    });
+
+    it('verify returns the undecryptable locations, never a value', async () => {
+      const location = { orgId: 'org-1', scope: 'legacy', key: 'PLAIN' };
+      (deps.secretStore.findUndecryptable as any).mockResolvedValue([location]);
+      const res = await request(app, 'GET', '/secrets/verify', { token: validToken });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ undecryptable: [location] });
+    });
+
+    it('verify requires secret.read permission', async () => {
+      // fails-when: a token without secret.read learns where the secrets live
+      (deps.tokenManager.validate as any).mockResolvedValue({ id: 'u', role: 'auditor' as Role });
+      const res = await request(app, 'GET', '/secrets/verify', { token: validToken });
+      expect(res.status).toBe(403);
+      expect(deps.secretStore.findUndecryptable).not.toHaveBeenCalled();
     });
 
     it('list keys requires orgId and scope query params', async () => {

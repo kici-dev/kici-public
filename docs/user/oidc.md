@@ -332,6 +332,8 @@ write one.
 | `iss`                         | Your orchestrator's provenance issuer                                                                                                                                         |
 | `aud`                         | The audience you asked for                                                                                                                                                    |
 | `sub`                         | The build identity — see the two shapes below                                                                                                                                 |
+| `iat` / `nbf` / `exp`         | Issued-at, not-before and expiry times, in seconds since the epoch. `nbf` equals `iat`, and `exp` is about 10 minutes later                                                   |
+| `jti`                         | The token id, `<run id>:<job id>`                                                                                                                                             |
 | `repository`                  | `owner/repo` the run acted on                                                                                                                                                 |
 | `workflow_repository`         | `owner/repo` that defines the workflow. For an organization-wide workflow, `repository` names the repository whose event started the run instead. Otherwise the two are equal |
 | `ref`                         | The branch or tag the run PRESENTS. For a pull request this is the **base** branch, not the contributor's branch                                                              |

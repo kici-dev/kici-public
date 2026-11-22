@@ -4,6 +4,7 @@
     "node_modules",
     "dist",
     "**/*.test.ts",
+    "**/*.test-d.ts",
     "src/__test-helpers__/**",
     "**/*.test-helpers.ts"
   ]

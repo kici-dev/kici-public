@@ -91,6 +91,18 @@ describe('buildStubEnv', () => {
     }
   });
 
+  it('buildStubEnv without platformUrl is unchanged', () => {
+    // breaks-if-wrong: hosted installs keep their default
+    expect(buildStubEnv({})).toContain('\nKICI_PLATFORM_URL=wss://api.kici.dev/ws\n');
+  });
+
+  it('buildStubEnv writes the given platformUrl', () => {
+    const stub = buildStubEnv({ platformUrl: 'wss://kici.corp.example/ws' });
+    // fails-when: the stub keeps the hosted URL despite --platform-url
+    expect(stub).toContain('\nKICI_PLATFORM_URL=wss://kici.corp.example/ws\n');
+    expect(stub).not.toContain('api.kici.dev');
+  });
+
   it('writes the mode the operator named', () => {
     expect(buildStubEnv({ mode: 'platform' })).toContain('KICI_MODE=platform');
     expect(buildStubEnv({ mode: 'independent' })).toContain('KICI_MODE=independent');
@@ -305,6 +317,118 @@ describe('writeInstallEnvFile', () => {
     });
     expect(fs.readFileSync(envFilePath, 'utf-8')).toBe(
       '# mode\nKICI_MODE=independent\nKICI_PORT=4000\n',
+    );
+  });
+
+  it('env-file mode with platformUrl overwrites the copied value', async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-env-'));
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const source = path.join(dir, 'source.env');
+    fs.writeFileSync(
+      source,
+      'KICI_MODE=platform\nKICI_PLATFORM_URL=wss://api.kici.dev/ws\nKICI_PORT=4000\n',
+      'utf-8',
+    );
+    const envFilePath = path.join(dir, 'svc.env');
+    await writeInstallEnvFile({
+      mode: 'env-file',
+      envFilePath,
+      envFileSource: source,
+      platformUrl: 'wss://kici.corp.example/ws',
+    });
+    const content = fs.readFileSync(envFilePath, 'utf-8');
+    // fails-when: the copied hosted URL survives an explicit --platform-url
+    expect(content.match(/^KICI_PLATFORM_URL=.*$/gm)).toEqual([
+      'KICI_PLATFORM_URL=wss://kici.corp.example/ws',
+    ]);
+    expect(content).toBe(
+      'KICI_MODE=platform\nKICI_PLATFORM_URL=wss://kici.corp.example/ws\nKICI_PORT=4000\n',
+    );
+  });
+
+  it('env-file mode without platformUrl leaves the copied value', async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-env-'));
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const source = path.join(dir, 'source.env');
+    fs.writeFileSync(source, 'KICI_PLATFORM_URL=wss://other.example/ws\n', 'utf-8');
+    const envFilePath = path.join(dir, 'svc.env');
+    await writeInstallEnvFile({ mode: 'env-file', envFilePath, envFileSource: source });
+    // breaks-if-wrong: a copied file keeps its own Platform URL without the flag
+    expect(fs.readFileSync(envFilePath, 'utf-8')).toBe(
+      'KICI_PLATFORM_URL=wss://other.example/ws\n',
+    );
+  });
+
+  it('stub mode writes the platformUrl it was given', async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-env-'));
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const envFilePath = path.join(dir, 'svc.env');
+    await writeInstallEnvFile({
+      mode: 'stub',
+      envFilePath,
+      platformUrl: 'wss://kici.corp.example/ws',
+    });
+    expect(fs.readFileSync(envFilePath, 'utf-8')).toContain(
+      '\nKICI_PLATFORM_URL=wss://kici.corp.example/ws\n',
+    );
+  });
+
+  it('wizard mode offers the platformUrl it was given as the prompt default', async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-env-'));
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.mocked(runOrchestratorWizard).mockResolvedValue({
+      mode: 'platform',
+      databaseUrl: 'postgresql://kici:pw@localhost:5432/kici',
+      port: 4000,
+      secretsKey: 'k',
+      bootstrapAdminToken: 't',
+      // The operator changed the offered default at the prompt.
+      platformUrl: 'wss://typed-at-prompt.example/ws',
+    });
+    const envFilePath = path.join(dir, 'svc.env');
+    await writeInstallEnvFile({
+      mode: 'wizard',
+      envFilePath,
+      platformUrl: 'wss://kici.corp.example/ws',
+    });
+    expect(vi.mocked(runOrchestratorWizard)).toHaveBeenCalledWith(
+      expect.objectContaining({ defaultPlatformUrl: 'wss://kici.corp.example/ws' }),
+    );
+    // fails-when: the flag's value is written over the wizard's answer
+    expect(fs.readFileSync(envFilePath, 'utf-8').match(/^KICI_PLATFORM_URL=.*$/gm)).toEqual([
+      'KICI_PLATFORM_URL=wss://typed-at-prompt.example/ws',
+    ]);
+  });
+
+  it('stub mode with an existing env file sets the platformUrl it was given', async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-env-'));
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const envFilePath = path.join(dir, 'svc.env');
+    fs.writeFileSync(
+      envFilePath,
+      'KICI_MODE=platform\nKICI_PLATFORM_URL=wss://api.kici.dev/ws\nKICI_PORT=4000\n',
+      'utf-8',
+    );
+    await writeInstallEnvFile({
+      mode: 'stub',
+      envFilePath,
+      platformUrl: 'wss://kici.corp.example/ws',
+    });
+    // fails-when: a re-run over an existing file ignores a named --platform-url
+    expect(fs.readFileSync(envFilePath, 'utf-8')).toBe(
+      'KICI_MODE=platform\nKICI_PLATFORM_URL=wss://kici.corp.example/ws\nKICI_PORT=4000\n',
+    );
+  });
+
+  it('stub mode with an existing env file and no platformUrl leaves it alone', async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kici-env-'));
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const envFilePath = path.join(dir, 'svc.env');
+    fs.writeFileSync(envFilePath, 'KICI_PLATFORM_URL=wss://other.example/ws\n', 'utf-8');
+    await writeInstallEnvFile({ mode: 'stub', envFilePath });
+    // breaks-if-wrong: an existing file keeps its own Platform URL without the flag
+    expect(fs.readFileSync(envFilePath, 'utf-8')).toBe(
+      'KICI_PLATFORM_URL=wss://other.example/ws\n',
     );
   });
 

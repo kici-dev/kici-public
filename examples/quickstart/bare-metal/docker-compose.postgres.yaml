@@ -16,7 +16,7 @@
 # directory) — it carries the static S3 identity for the kici-cache bucket.
 services:
   postgres:
-    image: docker.io/library/postgres:18.6-alpine@sha256:83148c0bc09eac4d598b70a61e1404d0212b76c95c504bfd6c81a4c59ec91792
+    image: docker.io/library/postgres:18.7-alpine@sha256:ff64c9e3bdf8e2120107d3559de8db314e8305f7e38c5105903c6295876738ff
     environment:
       POSTGRES_DB: kici
       POSTGRES_USER: kici
@@ -38,11 +38,15 @@ services:
     restart: unless-stopped
 
   seaweedfs:
-    image: docker.io/chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+    image: docker.io/chrislusf/seaweedfs:4.54@sha256:4b42c212543a0acd4c0e675215ecdcaf62a186ef98def76c7e12701871222d15
     # S3 gateway on :8333; the static identity lives in seaweedfs-s3.json and
     # the kici-cache bucket is created on first write. Required for
     # `kici run remote` against the native orchestrator on this host.
-    command: 'server -s3 -dir=/data -s3.config=/etc/seaweedfs/s3.json'
+    # -volume.max=64 gives every bucket room for its volumes; without it the
+    # slot count follows the free disk, and a second bucket can fail every
+    # write on a host with little free space. Volumes grow only as data is
+    # written.
+    command: 'server -s3 -dir=/data -s3.config=/etc/seaweedfs/s3.json -volume.max=64'
     volumes:
       - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
       - seaweedfs-data:/data

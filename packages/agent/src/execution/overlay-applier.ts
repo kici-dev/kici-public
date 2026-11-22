@@ -1,6 +1,9 @@
 /**
- * Applies a CLI-uploaded overlay onto the cloned repo: download, decrypt with an
- * X25519 ECDH shared secret, verify manifest checksums, then apply.
+ * Builds a job workspace from a CLI-uploaded overlay: download, decrypt with an
+ * X25519 ECDH shared secret, verify manifest checksums, then apply. A full-repo
+ * run has no clone: the overlay fills an empty workspace with the working tree
+ * and its `.git`. Any other run applies the overlay on top of the workspace
+ * its checkout prepared.
  *
  * Wire format: [12-byte IV][16-byte auth tag][ciphertext], the scheme of
  * packages/compiler/src/remote/encryption.ts.
@@ -10,8 +13,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { makeTempDir } from '@kici-dev/core/tmp';
-import { Readable } from 'node:stream';
-import { x as tarExtract } from 'tar';
+import { overlayGitRecordSchema, type OverlayGitRecord } from '@kici-dev/engine';
 import { createLogger, toErrorMessage, sha256File, deriveSharedSecret } from '@kici-dev/shared';
 import { downloadUrl } from './download.js';
 import {
@@ -19,6 +21,13 @@ import {
   type CheckedManifest,
   type OverlayManifest,
 } from './overlay-manifest-check.js';
+import {
+  extractOverlay,
+  readExtractedRegularFile,
+  skippedLinkNote,
+  type SkippedLink,
+} from './overlay-extract.js';
+import { relinkFileSymlinks, type FileLinkCandidate } from './overlay-file-links.js';
 import { applySymlinks, removeEmptyTree } from './overlay-symlinks.js';
 
 const logger = createLogger({ prefix: 'overlay-applier' });
@@ -34,6 +43,8 @@ interface OverlayConfig {
   /** Base64 DER/PKCS8 orchestrator ephemeral private key. */
   orchestratorPrivateKey: string;
   repoDir: string;
+  /** Apply only entries under this prefix (manifest checksums and deletions filtered the same way). */
+  onlyPathPrefix?: '.kici/';
 }
 
 interface OverlayResult {
@@ -41,6 +52,8 @@ interface OverlayResult {
   filesDeleted: number;
   symlinksApplied: number;
   verified: boolean;
+  /** What the shipped `.git` holds, when the manifest carries a valid record. */
+  git?: OverlayGitRecord;
 }
 
 /** AES-256-GCM over the wire format in the file header. */
@@ -93,12 +106,24 @@ export async function resolveExtractedSource(
   return { path: real };
 }
 
+/** The copied file symlinks, for `relinkFileSymlinks`. */
+function fileLinkCandidates(checked: CheckedManifest): FileLinkCandidate[] {
+  return checked.copies.flatMap(({ key, dest, src, linkText, linkTarget }) =>
+    linkText === undefined || linkTarget === undefined
+      ? []
+      : [{ key, dest, src, text: linkText, target: linkTarget }],
+  );
+}
+
 /**
  * Write a validated overlay at the real paths the check resolved. Order:
  * deletions (so a path that changed between file, symlink and directory is
- * cleared first), then files, then directory symlinks.
+ * cleared first), then files, then directory symlinks, then file symlinks.
  */
-async function applyChecked(checked: CheckedManifest): Promise<Omit<OverlayResult, 'verified'>> {
+async function applyChecked(
+  checked: CheckedManifest,
+  realRoot: string,
+): Promise<Omit<OverlayResult, 'verified' | 'git'>> {
   let filesDeleted = 0;
   for (const { key: file, target: targetPath, mustRemove } of checked.deletions) {
     try {
@@ -129,13 +154,56 @@ async function applyChecked(checked: CheckedManifest): Promise<Omit<OverlayResul
     filesApplied++;
   }
 
-  const symlinksApplied = await applySymlinks(checked.links);
+  const symlinksApplied =
+    (await applySymlinks(checked.links)) +
+    (await relinkFileSymlinks(
+      fileLinkCandidates(checked),
+      realRoot,
+      new Map(checked.copies.map((c) => [c.dest, c.src])),
+    ));
   return { filesApplied, filesDeleted, symlinksApplied };
+}
+
+/** The manifest narrowed to the entries under `prefix`: files, deletions and directory symlinks alike. */
+function filterManifest(manifest: OverlayManifest, prefix: string): OverlayManifest {
+  // The prefix test reads the normalized key, so `.kici/../src/a.ts` (which
+  // normalizes to `src/a.ts`) is not under `.kici/`.
+  const under = (key: string): boolean => path.posix.normalize(key).startsWith(prefix);
+  const pick = (record: Record<string, string>): Record<string, string> =>
+    Object.fromEntries(Object.entries(record).filter(([key]) => under(key)));
+  return {
+    ...manifest,
+    deletions: manifest.deletions.filter(under),
+    checksums: pick(manifest.checksums),
+    ...(manifest.symlinks && { symlinks: pick(manifest.symlinks) }),
+  };
+}
+
+const MANIFEST_PARTS = ['.kici-overlay-tmp', 'manifest.json'] as const;
+
+/**
+ * The manifest text, read as a regular file that no symlink leads to: a link
+ * would read an agent-host file, or a FIFO or device, as the manifest.
+ */
+async function readManifest(
+  extractDir: string,
+  skippedLinks: readonly SkippedLink[],
+): Promise<string> {
+  const name = MANIFEST_PARTS.join('/');
+  const read = await readExtractedRegularFile(extractDir, MANIFEST_PARTS);
+  if ('refused' in read) throw new Error(`Overlay manifest refused: ${name}: ${read.refused}`);
+  if ('missing' in read) {
+    const why = skippedLinkNote(skippedLinks, name);
+    throw new Error(
+      `Overlay manifest not found: expected ${name} in tarball${why ? ` (${why})` : ''}`,
+    );
+  }
+  return read.data.toString('utf-8');
 }
 
 /** Download, decrypt, extract, validate and checksum the manifest, then apply. */
 export async function applyOverlay(config: OverlayConfig): Promise<OverlayResult> {
-  const { tarballUrl, cliPublicKey, orchestratorPrivateKey, repoDir } = config;
+  const { tarballUrl, cliPublicKey, orchestratorPrivateKey, repoDir, onlyPathPrefix } = config;
 
   const { path: tmpDir, cleanup } = await makeTempDir('overlay');
 
@@ -165,29 +233,19 @@ export async function applyOverlay(config: OverlayConfig): Promise<OverlayResult
     const extractDir = path.join(tmpDir, 'extracted');
     await fs.mkdir(extractDir, { recursive: true });
 
+    let skippedLinks: SkippedLink[];
     try {
-      const readable = Readable.from(decryptedData);
-      await new Promise<void>((resolve, reject) => {
-        readable
-          .pipe(tarExtract({ cwd: extractDir, gzip: true }))
-          .on('finish', resolve)
-          .on('error', reject);
-      });
+      ({ skippedLinks } = await extractOverlay(decryptedData, extractDir));
     } catch (err) {
       throw new Error(`Overlay extraction failed: ${toErrorMessage(err)}`);
     }
-
-    const manifestPath = path.join(extractDir, '.kici-overlay-tmp', 'manifest.json');
-    let manifestContent: string;
-    try {
-      manifestContent = await fs.readFile(manifestPath, 'utf-8');
-    } catch {
-      throw new Error(
-        'Overlay manifest not found: expected .kici-overlay-tmp/manifest.json in tarball',
-      );
+    for (const skipped of skippedLinks) {
+      logger.warn('Overlay symlink entry not extracted', { ...skipped });
     }
 
-    const manifest: OverlayManifest = JSON.parse(manifestContent);
+    const fullManifest: OverlayManifest = JSON.parse(await readManifest(extractDir, skippedLinks));
+    // fails-when: a checkout: false full-repo job gets the overlay's `.git` and repository files
+    const manifest = onlyPathPrefix ? filterManifest(fullManifest, onlyPathPrefix) : fullManifest;
     const checked = await checkManifest(manifest, repoDir, extractDir);
 
     const failedChecksums: string[] = [];
@@ -198,8 +256,14 @@ export async function applyOverlay(config: OverlayConfig): Promise<OverlayResult
       try {
         const source = await resolveExtractedSource(realExtractRoot, copy.src);
         if ('refused' in source) {
-          failedChecksums.push(`${file}: ${source.refused}`);
+          // fails-when: a link an older CLI shipped without its target reports only "file not found"
+          failedChecksums.push(`${file}: ${skippedLinkNote(skippedLinks, file) ?? source.refused}`);
           continue;
+        }
+        const entry = await fs.lstat(copy.src);
+        if (entry.isSymbolicLink()) {
+          copy.linkText = await fs.readlink(copy.src);
+          copy.linkTarget = path.relative(realExtractRoot, source.path);
         }
         // The copy reads the same resolved file the checksum covered.
         copy.src = source.path;
@@ -208,7 +272,9 @@ export async function applyOverlay(config: OverlayConfig): Promise<OverlayResult
           failedChecksums.push(`${file}: expected ${manifest.checksums[file]}, got ${actualHash}`);
         }
       } catch {
-        failedChecksums.push(`${file}: file not found in tarball`);
+        failedChecksums.push(
+          `${file}: ${skippedLinkNote(skippedLinks, file) ?? 'file not found in tarball'}`,
+        );
       }
     }
 
@@ -219,9 +285,11 @@ export async function applyOverlay(config: OverlayConfig): Promise<OverlayResult
       );
     }
 
-    const result = await applyChecked(checked);
+    const result = await applyChecked(checked, await fs.realpath(repoDir));
     logger.info('Overlay applied successfully', result);
-    return { ...result, verified: true };
+    // A malformed record is dropped, never fatal: it only feeds a warning.
+    const git = overlayGitRecordSchema.safeParse(fullManifest.git);
+    return { ...result, verified: true, ...(git.success && { git: git.data }) };
   } finally {
     await cleanup().catch(() => {});
   }

@@ -6,6 +6,22 @@
  */
 
 /**
+ * TLS trust settings: paths to the CA bundles an operator sets so git, Node
+ * and OpenSSL-based tools trust a private CA, such as the one a GitHub
+ * Enterprise Server serves under. File and directory paths, never credentials.
+ * They name paths on the agent host, so a job with its own filesystem (a job
+ * container, a bubblewrap sandbox) sees them only through a mount, with the
+ * setting rewritten. `SSL_CERT_DIR` holds a colon-separated list of directories.
+ */
+export const TLS_TRUST_PATH_VARS = [
+  'GIT_SSL_CAINFO',
+  'GIT_SSL_CAPATH',
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
+  'NODE_EXTRA_CA_CERTS',
+] as const;
+
+/**
  * System environment variables that are safe to pass into spawned processes.
  * Anything NOT listed is stripped, so new host variables never leak downstream.
  */
@@ -35,6 +51,7 @@ export const ALLOWED_SYSTEM_VARS = [
   'APPDATA',
   'PROCESSOR_ARCHITECTURE',
   'NUMBER_OF_PROCESSORS',
+  ...TLS_TRUST_PATH_VARS,
 ] as const;
 
 /**

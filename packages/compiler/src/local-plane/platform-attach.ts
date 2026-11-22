@@ -7,6 +7,7 @@
  */
 
 import { toErrorMessage } from '@kici-dev/core';
+import { ClientNewerThanPlatformError, platformFetch } from '../remote/platform-fetch.js';
 
 /** http(s) → ws(s), with exactly one trailing `/ws` segment (idempotent). */
 export function derivePlatformWsUrl(apiBase: string): string {
@@ -44,12 +45,13 @@ export async function mintOrchestratorKey(args: {
   const url = `${args.apiBase.replace(/\/+$/, '')}/api/v1/orgs/${encodeURIComponent(args.orgId)}/orchestrator-keys`;
   let res: Response;
   try {
-    res = await fetch(url, {
+    res = await platformFetch(url, {
       method: 'POST',
       headers: { Authorization: `Bearer ${args.pat}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: args.name ?? `local dev plane (${orgHostLabel()})` }),
     });
   } catch (err) {
+    if (err instanceof ClientNewerThanPlatformError) throw err;
     throw new Error(
       `Could not reach the Platform to mint an orchestrator key: ${toErrorMessage(err)}`,
     );
@@ -87,7 +89,7 @@ export async function revokeOrchestratorKey(args: {
 }): Promise<boolean> {
   const url = `${args.apiBase.replace(/\/+$/, '')}/api/v1/orgs/${encodeURIComponent(args.orgId)}/orchestrator-keys/${encodeURIComponent(args.keyId)}`;
   try {
-    const res = await fetch(url, {
+    const res = await platformFetch(url, {
       method: 'DELETE',
       headers: { Authorization: `Bearer ${args.pat}` },
     });
@@ -106,7 +108,7 @@ export async function probePlatformReachable(apiBase: string, timeoutMs = 4000):
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const url = `${apiBase.replace(/\/+$/, '')}/health`;
-    const res = await fetch(url, { signal: controller.signal });
+    const res = await platformFetch(url, { signal: controller.signal });
     return res.status > 0;
   } catch {
     return false;

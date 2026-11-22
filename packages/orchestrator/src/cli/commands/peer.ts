@@ -21,7 +21,7 @@ import {
   PeerCredentialStore,
   type PeerCredential,
 } from '../../cluster/peer-credentials.js';
-import { cliAction, resolveDirectDbUrl } from './shared/cli-action.js';
+import { cliAction, resolveDbOnlyUrl } from './shared/cli-action.js';
 
 function formatPeerTable(
   peers: Array<{
@@ -270,11 +270,16 @@ export function registerPeerCommands(program: Command, getClient: () => AdminApi
     .requiredOption('--instance-id <id>', 'Instance ID of the peer to revoke')
     .action(
       cliAction(async (opts: { instanceId: string }) => {
-        await withDb(async (db) => {
+        const revoked = await withDb(async (db) => {
           const store = new PeerCredentialStore(db);
-          await store.revoke(opts.instanceId);
+          return store.revoke(opts.instanceId);
         });
 
+        // An instance with no active credential is not an error: a revoke stays idempotent.
+        if (revoked === 0) {
+          console.log(`Peer ${opts.instanceId} has no active credential; nothing was revoked.`);
+          return;
+        }
         console.log(
           `Peer ${opts.instanceId} credential revoked. Its next connection attempt is refused; its open connections stay up.`,
         );
@@ -317,7 +322,7 @@ export function registerPeerCommands(program: Command, getClient: () => AdminApi
     .option('--json', 'Emit JSON { deleted } on stdout', false)
     .action(
       cliAction(async (opts: { filter: string; databaseUrl?: string; json?: boolean }) => {
-        const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
+        const dbUrl = resolveDbOnlyUrl(opts.databaseUrl);
         if (!dbUrl) {
           console.error(
             'Error: prune-credentials requires --database-url (or KICI_DATABASE_URL). ' +
@@ -347,7 +352,7 @@ export function registerPeerCommands(program: Command, getClient: () => AdminApi
     .option('--json', 'Emit JSON { rowsDeleted } on stdout', false)
     .action(
       cliAction(async (opts: { databaseUrl?: string; json?: boolean }) => {
-        const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
+        const dbUrl = resolveDbOnlyUrl(opts.databaseUrl);
         if (!dbUrl) {
           console.error(
             'Error: reset-raft-state requires --database-url (or KICI_DATABASE_URL). ' +

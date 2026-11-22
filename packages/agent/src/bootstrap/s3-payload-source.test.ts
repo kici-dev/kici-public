@@ -13,6 +13,7 @@ function makeDeps(over: Partial<S3PayloadSourceDeps> = {}): {
     fetchToFile,
     cacheDir: '/var/cache/kici-payloads',
     exists: vi.fn(async () => false),
+    evict: vi.fn(async () => []),
     ...over,
   };
   return { deps, fetchToFile };
@@ -48,5 +49,24 @@ describe('S3PayloadSource', () => {
     await expect(src.resolve('linux-x64', '9.9.9')).rejects.toThrow(
       /9\.9\.9.*linux-x64|linux-x64.*9\.9\.9/s,
     );
+  });
+});
+
+describe('S3PayloadSource cache eviction', () => {
+  it('evicts stale versions after both a fetch and a cache hit', async () => {
+    // fails-when: eviction runs only after a download — an agent that keeps
+    // re-staging one cached version never marks it used, so it could age out.
+    for (const exists of [false, true]) {
+      const { deps } = makeDeps({ exists: vi.fn(async () => exists) });
+      await new S3PayloadSource(deps).resolve('linux-x64', '3.1.0');
+      expect(deps.evict).toHaveBeenCalledWith('/var/cache/kici-payloads', '3.1.0');
+    }
+  });
+
+  it('does not evict when the payload object is missing', async () => {
+    // breaks-if-wrong: a failed resolve leaves the cache untouched.
+    const { deps } = makeDeps({ presign: vi.fn(async () => null) });
+    await expect(new S3PayloadSource(deps).resolve('linux-x64', '9.9.9')).rejects.toThrow();
+    expect(deps.evict).not.toHaveBeenCalled();
   });
 });

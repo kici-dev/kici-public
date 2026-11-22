@@ -49,6 +49,7 @@ import { c as tarCreate } from 'tar';
 import { singleLinkTarCaches } from '@kici-dev/core/tar-single-link';
 import { encryptSecretOutputs } from './secret-encryption.js';
 import { buildContainerHardening, type SandboxHardeningOptions } from './container-hardening.js';
+import { applyTrustPathPlan, planTrustPathMounts } from './host-trust-paths.js';
 import {
   applyJobEgressRules,
   ensureJobNetwork,
@@ -123,6 +124,13 @@ interface ContainerSandboxOptions {
   hookPath?: string;
   /** Pre-sanitized. */
   env: Record<string, string>;
+  /**
+   * The TLS trust settings in `env` that the agent host supplied
+   * (`hostSuppliedTrustPaths`). Each names a host path the image lacks: the
+   * container gets a read-only mount under `TRUST_MOUNT_ROOT` and the setting
+   * rewritten to it, or no setting when the host path is unusable.
+   */
+  hostTrustPaths?: Record<string, string>;
   /** Keep failed containers for debugging. */
   keepFailed?: boolean;
   /** For container labeling and orphan cleanup. */
@@ -531,7 +539,9 @@ export class ContainerSandbox implements ExecutionSandbox {
     { username: string; password: string; serveraddress: string } | undefined;
   private readonly runnerMountPath: string;
   private readonly hookHostPath: string;
-  private readonly env: Record<string, string>;
+  /** The job env; setup() rewrites its host TLS trust settings to the mounts. */
+  private env: Record<string, string>;
+  private readonly hostTrustPaths: Record<string, string>;
   private readonly keepFailed: boolean;
   private readonly jobId: string;
   private readonly hardening?: SandboxHardeningOptions;
@@ -559,9 +569,10 @@ export class ContainerSandbox implements ExecutionSandbox {
     this.runnerMountPath = options.runnerMountPath ?? '/opt/kici/workflow-runner.js';
     this.hookHostPath =
       options.hookPath ?? join(dirname(options.runnerPath), 'container-ts-loader-hook.js');
-    this.env = options.env;
     this.keepFailed = options.keepFailed ?? false;
     this.jobId = options.jobId ?? `unknown-${Date.now()}`;
+    this.env = { ...options.env };
+    this.hostTrustPaths = options.hostTrustPaths ?? {};
     this.hardening = options.hardening;
     this.networkIsolation = options.networkIsolation ?? true;
   }
@@ -629,9 +640,6 @@ export class ContainerSandbox implements ExecutionSandbox {
   async setup(options: SandboxSetupOptions): Promise<void> {
     this.containerName = `kici-sandbox-${this.jobId}-${Date.now()}`;
 
-    // this.env went through buildSanitizedEnv(): NO agent credentials.
-    const envArray = [...Object.entries(this.env).map(([k, v]) => `${k}=${v}`), ...INTERNAL_ENV];
-
     logger.info('Creating sandbox container', {
       name: this.containerName,
       image: this.image,
@@ -672,6 +680,12 @@ export class ContainerSandbox implements ExecutionSandbox {
     if (this.resolvedRuntimeNode) {
       await assertImageRunnable(this.docker, this.image);
     }
+
+    // Planned last, right before the create, so the checked paths are the ones
+    // the runtime binds.
+    binds.push(...this.mountHostTrustPaths());
+    // this.env went through buildSanitizedEnv(): NO agent credentials.
+    const envArray = [...Object.entries(this.env).map(([k, v]) => `${k}=${v}`), ...INTERNAL_ENV];
 
     // /workspace is a container-owned anonymous volume, NOT a host bind: under
     // rootful docker a read-write host bind is unwritable by the container uid
@@ -769,9 +783,9 @@ export class ContainerSandbox implements ExecutionSandbox {
 
   /**
    * The read-only bind list (the workspace is a volume, not a bind). Besides
-   * the runner, hook and runtime, two gated additions mirror the bare-metal
-   * bwrap sandbox and leave a production (https-source, bridge-network) job
-   * unchanged:
+   * the runner, hook and runtime, the gated additions below mirror the
+   * bare-metal bwrap sandbox and leave a production job (https source, bridge
+   * network, no host trust settings) unchanged:
    *
    * - **`file://` clone-source dir(s)** (`options.extraReadOnlyBinds`): the
    *   runner clones from inside the container, so a local source dir must be
@@ -806,6 +820,28 @@ export class ContainerSandbox implements ExecutionSandbox {
     }
 
     return binds;
+  }
+
+  /**
+   * The read-only binds for the host TLS trust paths (`hostTrustPaths`), each
+   * under `TRUST_MOUNT_ROOT`, never over the image's own trust store. Rewrites
+   * each setting in `this.env` to its mount and drops one with no usable host
+   * path. No host trust settings (the production default) leaves `this.env`
+   * unchanged and adds no bind.
+   */
+  private mountHostTrustPaths(): string[] {
+    // fails-when: a host trust path reaches a container that lacks the file,
+    // or its mount lands on the image's /etc/ssl/certs.
+    // breaks-if-wrong: a usable host path must arrive with its mount.
+    const plan = planTrustPathMounts(this.hostTrustPaths);
+    this.env = applyTrustPathPlan(this.env, plan);
+    if (plan.unavailableKeys.length > 0) {
+      logger.debug('Not passing TLS trust settings with no usable host path', {
+        jobId: this.jobId,
+        keys: plan.unavailableKeys,
+      });
+    }
+    return plan.mounts.map(({ source, target }) => `${source}:${target}:ro`);
   }
 
   // --- Lifecycle: executeJob ---

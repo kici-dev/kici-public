@@ -137,6 +137,31 @@ describeWithTestDb<any>(
     });
 
     describe('store primitives', () => {
+      it('revoke counts the active credentials it revoked, and 0 when there is none', async () => {
+        // fails-when: revoke reports a revocation for an instance with no active credential,
+        //   which `kici-admin peer revoke` then prints as "credential revoked"
+        for (const [instanceId, hash] of [
+          [INSTANCE, 'a'],
+          ['other-instance', 'b'],
+        ]) {
+          await store.save({
+            instanceId,
+            credentialHash: hash.repeat(64),
+            role: 'coordinator',
+            routingKeys: [],
+          });
+        }
+        expect(await store.revoke(INSTANCE)).toBe(1);
+        expect(await store.findUnrevokedByInstanceId(INSTANCE)).toBeNull();
+        // Already revoked, and never known: nothing to revoke.
+        expect(await store.revoke(INSTANCE)).toBe(0);
+        expect(await store.revoke('never-registered')).toBe(0);
+        // breaks-if-wrong: another instance's credential stays active
+        expect((await store.findUnrevokedByInstanceId('other-instance'))?.credentialHash).toBe(
+          'b'.repeat(64),
+        );
+      });
+
       it('findUnrevokedByInstanceId returns an expired unrevoked row', async () => {
         await store.save({
           instanceId: INSTANCE,

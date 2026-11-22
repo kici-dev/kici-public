@@ -9,11 +9,14 @@
  */
 import { Hono } from 'hono';
 import { z } from 'zod';
-import type { SourceStore } from '../sources/source-store.js';
+import { DuplicateSourceError, type SourceStore } from '../sources/source-store.js';
 import { validateGitHubSource } from '../sources/source-validator.js';
+import { displayedSourceConfig, githubAppConfigOf } from '../sources/github-source-config.js';
+import { parseGithubWebUrl } from '../providers/github/github-host.js';
+import type { GitHubAppConfig } from '../providers/github/auth.js';
 import { WebhookUrlNote, type WebhookUrlResolution } from '../sources/webhook-url-resolvers.js';
 import { createLogger, toErrorMessage } from '@kici-dev/shared';
-import { enforceRoutingKeyScope } from '../secrets/routing-key-scope.js';
+import { enforceRoutingKeyScope, requireUnscopedToken } from '../secrets/routing-key-scope.js';
 import { PlatformAttachment, readPlatformAttachment } from '../db/repos/org-ids-repo.js';
 import { FOREIGN_ORG_CONSEQUENCE, resolveNewSourceOrg } from '../sources/source-org.js';
 import {
@@ -54,6 +57,14 @@ interface SourceRouteDeps {
    */
   resolveGithubWebhookUrl?: () => Promise<WebhookUrlResolution>;
   /**
+   * The headless GitHub App manifest page this orchestrator's Platform serves,
+   * or null when it serves none. The pre-flight reports it as
+   * `manifestCallbackUrl`, so `kici-admin source add github --manifest
+   * --no-browser` prints it instead of the default page. Absent outside
+   * Platform-connected modes.
+   */
+  resolveGithubManifestCallbackUrl?: () => string | null;
+  /**
    * Build this orchestrator's own direct-ingress URL for a listed GitHub
    * source, or null: platform mode serves no direct ingress, and without a
    * public base or a known org there is no URL to print.
@@ -79,9 +90,21 @@ interface SourceRouteDeps {
 
 /** Replay a delivery window for a GitHub App. Matches `redeliverWindow`. */
 export type RedeliverDeliveries = (
-  app: { appId: string; privateKey: string },
+  app: GitHubAppConfig,
   opts: { since: Date; until: Date; dryRun?: boolean },
 ) => Promise<RedeliverWindowResult>;
+
+/**
+ * Read an optional `githubUrl` body field: the validated origin, `null` for an
+ * explicit null (PATCH clears with it), or undefined when absent. Throws with
+ * a message naming `githubUrl` on any other value.
+ */
+function readGithubUrlField(body: Record<string, unknown>): string | null | undefined {
+  if (!('githubUrl' in body) || body.githubUrl === undefined) return undefined;
+  if (body.githubUrl === null) return null;
+  if (typeof body.githubUrl !== 'string') throw new Error('githubUrl must be a string or null');
+  return parseGithubWebUrl(body.githubUrl, 'githubUrl');
+}
 
 /**
  * Body of `POST /sources/:routingKey/redeliver`. Both bounds are required: an
@@ -111,6 +134,16 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
       if (customerId !== undefined && (typeof customerId !== 'string' || customerId === '')) {
         return c.json({ error: 'customerId must be a non-empty string' }, 400);
       }
+      // Checked before any GitHub call: the App's JWT goes to this server.
+      let githubUrl: string | undefined;
+      try {
+        githubUrl = readGithubUrlField(body) ?? undefined;
+      } catch (err) {
+        return c.json({ error: toErrorMessage(err) }, 400);
+      }
+      if (githubUrl !== undefined && provider !== 'github') {
+        return c.json({ error: 'githubUrl applies only to a github source' }, 400);
+      }
 
       // The org check runs before the credential validation: a refused org
       // makes no call to GitHub.
@@ -127,7 +160,7 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
       let storedName = name;
       let storedSlug: string | undefined = slug;
       if (provider === 'github') {
-        const validation = await validateGitHubSource(appId, privateKey);
+        const validation = await validateGitHubSource({ appId, privateKey, githubUrl });
         if (!validation.valid) {
           return c.json({ error: validation.error }, 400);
         }
@@ -143,6 +176,7 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
         appId,
         privateKey,
         webhookSecret,
+        githubUrl,
         customerId: org.orgId,
       });
 
@@ -180,6 +214,7 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
         201,
       );
     } catch (err) {
+      if (err instanceof DuplicateSourceError) return c.json({ error: err.message }, 409);
       logger.error('Failed to add source', { error: toErrorMessage(err) });
       return c.json({ error: toErrorMessage(err) }, 500);
     }
@@ -189,21 +224,30 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
   // `resolveGithubWebhookUrl`). Registered before the parameterized routes so
   // the static segment wins.
   app.get('/sources/github-webhook-url', async (c) => {
+    // Omitted, never null, when the Platform serves no page.
+    const manifestCallbackUrl = deps.resolveGithubManifestCallbackUrl?.() ?? null;
+    const page = manifestCallbackUrl ? { manifestCallbackUrl } : {};
     try {
       if (!deps.resolveGithubWebhookUrl) {
         return c.json({
           webhookUrl: null,
           webhookNote: WebhookUrlNote.enum['resolver-unavailable'],
+          ...page,
         });
       }
       const resolved = await deps.resolveGithubWebhookUrl();
       return c.json({
         webhookUrl: resolved.webhookUrl,
         ...(resolved.webhookNote && { webhookNote: resolved.webhookNote }),
+        ...page,
       });
     } catch (err) {
       logger.error('Failed to resolve github webhook url', { error: toErrorMessage(err) });
-      return c.json({ webhookUrl: null, webhookNote: WebhookUrlNote.enum['resolve-failed'] });
+      return c.json({
+        webhookUrl: null,
+        webhookNote: WebhookUrlNote.enum['resolve-failed'],
+        ...page,
+      });
     }
   });
 
@@ -222,7 +266,10 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
           name: s.name,
           routingKey: s.routing_key,
           customerId: s.customer_id,
-          config: typeof s.config === 'string' ? JSON.parse(s.config) : s.config,
+          // fails-when: a config.githubUrl an older peer wrote shows beside the real server
+          config: displayedSourceConfig(s.config),
+          // breaks-if-wrong: a github.com source's entry gains no githubUrl key
+          ...(s.github_url && { githubUrl: s.github_url }),
           createdAt: s.created_at,
           updatedAt: s.updated_at,
           ingressUrl:
@@ -245,15 +292,58 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
       const body = await c.req.json();
       const { name, privateKey, webhookSecret, config, customerId } = body;
 
+      // A new customer moves the source and every registration of it into
+      // another org, whose lookups and settings they then join: an
+      // orchestrator-wide decision a token scoped to this source may not make.
+      // fails-when: a scoped token moves its source, and so its registrations, into another org
+      if ('customerId' in body) {
+        const unscopedDenied = requireUnscopedToken(c);
+        if (unscopedDenied) return unscopedDenied;
+      }
+
+      // The App's JWT goes to its server on every call, so moving a source to
+      // another server is an orchestrator-wide decision: a token scoped to this
+      // source may not make it.
+      // fails-when: a scoped token can redirect the App's JWT
+      let githubUrl: string | null | undefined;
+      if ('githubUrl' in body) {
+        const unscopedDenied = requireUnscopedToken(c);
+        if (unscopedDenied) return unscopedDenied;
+        try {
+          githubUrl = readGithubUrlField(body);
+        } catch (err) {
+          return c.json({ error: toErrorMessage(err) }, 400);
+        }
+      }
+
       const existing = await deps.sourceStore.getSource(routingKey);
       if (!existing) return c.json({ error: 'Source not found' }, 404);
+      if (githubUrl !== undefined && existing.provider !== 'github') {
+        return c.json({ error: 'githubUrl applies only to a github source' }, 400);
+      }
 
-      // A new privateKey is re-validated against the existing appId.
-      if (privateKey) {
-        const parsed = (
-          typeof existing.config === 'string' ? JSON.parse(existing.config) : existing.config
-        ) as { appId: string };
-        const validation = await validateGitHubSource(parsed.appId, privateKey);
+      // A new privateKey or a new server is validated before it is stored: the
+      // App, with its new key if one is given, must answer at its new server.
+      if (privateKey || githubUrl !== undefined) {
+        const withKey = privateKey
+          ? { ...existing, privateKey: privateKey as string }
+          : await deps.sourceStore.getSourceWithSecrets(routingKey);
+        if (!withKey) {
+          return c.json({ error: `Source ${routingKey} has no stored private key` }, 400);
+        }
+        let stored: GitHubAppConfig;
+        try {
+          // A new server replaces the stored one, which then need not parse: an
+          // operator repairs a refused source this way.
+          stored = githubAppConfigOf(withKey, { ignoreStoredServer: githubUrl !== undefined });
+        } catch (err) {
+          // fails-when: a source with no stored App id answers 500 instead of a client error
+          return c.json({ error: toErrorMessage(err) }, 400);
+        }
+        const validation = await validateGitHubSource({
+          ...stored,
+          githubUrl: githubUrl === undefined ? stored.githubUrl : (githubUrl ?? undefined),
+        });
         if (!validation.valid) return c.json({ error: validation.error }, 400);
       }
 
@@ -262,6 +352,7 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
         privateKey,
         webhookSecret,
         config,
+        ...(githubUrl !== undefined && { githubUrl }),
         customerId,
       });
       const { platformAttachment, attachedOrgId } = readPlatformAttachment(deps.getPlatformOrgId);
@@ -367,7 +458,7 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
       }
 
       const source = await deps.sourceStore.getSourceWithSecrets(routingKey);
-      if (!source) return c.json({ error: 'Source not found' }, 404);
+      if (!source) return c.json({ error: `Source not found: ${routingKey}` }, 404);
       if (source.provider !== 'github') {
         return c.json(
           {
@@ -376,18 +467,15 @@ export function createSourceRoutes(deps: SourceRouteDeps): Hono<AdminEnv> {
           400,
         );
       }
-      const appConfig = (
-        typeof source.config === 'string' ? JSON.parse(source.config) : source.config
-      ) as { appId?: string };
-      if (!appConfig?.appId) {
-        return c.json({ error: `Source ${routingKey} has no stored GitHub App id` }, 400);
+      let appConfig: GitHubAppConfig;
+      try {
+        appConfig = githubAppConfigOf(source);
+      } catch (err) {
+        return c.json({ error: toErrorMessage(err) }, 400);
       }
 
       const redeliver = deps.redeliverDeliveries ?? redeliverWindow;
-      const result = await redeliver(
-        { appId: appConfig.appId, privateKey: source.privateKey },
-        { since, until, dryRun: parsed.data.dryRun },
-      );
+      const result = await redeliver(appConfig, { since, until, dryRun: parsed.data.dryRun });
       logger.info('Replayed GitHub delivery window', {
         routingKey,
         since: result.since,

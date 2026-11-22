@@ -5,11 +5,13 @@
  * Two properties, both of which a bare `mkdtempSync(join(tmpdir(), prefix))`
  * lacks:
  *
- *  1. **One parent.** Every tree lands under `TEST_TMP_ROOT`, so the host's
- *     leak sweeper needs a single tight pattern instead of one per suite. The
- *     caller's readable prefix is preserved inside it —
- *     `/tmp/kici-test/drain-rules-a7f3k2` — so a tree left behind by a run that
- *     was killed mid-test still names the suite that made it.
+ *  1. **One parent.** Every tree lands under `TEST_TMP_ROOT`, `kici-test` in
+ *     the system temp directory. Inside a vitest run, `tmpdir()` is the run's
+ *     own folder (`hack/lib/test-run-dir.ts`), so a tree sits at
+ *     `<base>/kici-test/run-a7f3k2/kici-test/drain-rules-x9q2m4` and goes with
+ *     the run folder when the run passes. The caller's readable prefix is kept
+ *     in the name, so a tree a killed or failed run leaves behind still names
+ *     the suite that made it.
  *  2. **Registered cleanup.** `makeTempDir` registers the tree itself. A suite
  *     cannot leak by forgetting an `afterEach`, because there is nothing for
  *     the author to remember.
@@ -34,8 +36,10 @@ import path from 'node:path';
 import { onTestFinished } from 'vitest';
 
 /**
- * The parent's name inside the system temp directory. The host leak sweeper
- * matches on this, so it is a constant here rather than a literal at each end.
+ * The parent's name inside the system temp directory. The run folders in
+ * `hack/lib/test-run-dir.ts` use the same name for their parent
+ * (`TEST_RUN_PARENT`, pinned equal by its test), so a tree made outside a
+ * vitest run lands beside the run folders, where the host sweeps reach it.
  */
 export const TEST_TMP_DIR_NAME = 'kici-test';
 

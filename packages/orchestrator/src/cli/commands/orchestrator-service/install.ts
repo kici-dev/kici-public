@@ -37,13 +37,19 @@ import { getInstallBase } from '../shared/versioned-upgrade.js';
 import { resolveWizardMode, writeInstallEnvFile, DEFAULT_INSTALL_MODE } from './install-env.js';
 import { OrchestratorMode } from '@kici-dev/engine';
 import { formatSourceAddHint } from '../../wizard/orchestrator-wizard.js';
+import {
+  DEFAULT_PLATFORM_RELAY_URL,
+  parsePlatformRelayUrl,
+} from '../../../helpers/platform-relay-url.js';
 import { kiciMkdtemp } from '@kici-dev/shared';
 import { isCiEnvironment } from '@kici-dev/shared/ci-env';
 import { cliAction } from '../shared/cli-action.js';
+import { imageRegistryOption, installImageRegistry } from '../shared/image-registry-option.js';
 
 interface InstallOptions {
   platform?: ServicePlatform;
   mode?: string;
+  platformUrl?: string;
   envFile?: string;
   binary?: string;
   dev?: boolean;
@@ -54,6 +60,7 @@ interface InstallOptions {
   user?: string;
   instanceDir?: string;
   force?: boolean;
+  imageRegistry?: string;
 }
 
 /** Start a dev PostgreSQL container (Podman or Docker); returns its DATABASE_URL. */
@@ -137,6 +144,10 @@ Token vocabulary:
       `Operating mode written to the env file (${OrchestratorMode.options.join(', ')}). Naming it with --env-file overwrites the copied file's own KICI_MODE; omitting it leaves that value alone`,
       DEFAULT_INSTALL_MODE,
     )
+    .option(
+      '--platform-url <url>',
+      `Platform WebSocket URL written to the env file as KICI_PLATFORM_URL (default: ${DEFAULT_PLATFORM_RELAY_URL}). Naming it also replaces the KICI_PLATFORM_URL of an existing or copied (--env-file) env file`,
+    )
     .option('--env-file <path>', 'Path to existing env/config file to use')
     .option('--binary <path>', 'Path to orchestrator binary (default: current executable)')
     .option('--dev', 'Dev mode: spin up PostgreSQL container on port 15432')
@@ -154,8 +165,13 @@ Token vocabulary:
       'Deploy folder; the instance manifest is written here (default: current working directory)',
     )
     .option('--force', 'Overwrite an existing same-named foreign instance')
+    .addOption(imageRegistryOption())
     .action(
       cliAction(async (opts: InstallOptions, command: Command) => {
+        // Checked before anything else runs, so a wrong URL never leaves a
+        // half-written install behind.
+        const platformUrl =
+          opts.platformUrl === undefined ? undefined : parsePlatformRelayUrl(opts.platformUrl);
         // A standalone-package kici-admin has no import.meta.resolve: without
         // --binary it cannot locate the server, so it stops before the wizard
         // or any file.
@@ -187,12 +203,18 @@ Token vocabulary:
         const modeExplicit = command.getOptionValueSource('mode') !== 'default';
 
         const platform = detectPlatform(opts.platform as ServicePlatform | undefined);
+        const imageRegistry = installImageRegistry(
+          platform,
+          opts.imageRegistry,
+          command.getOptionValueSource('imageRegistry'),
+        );
         const userLevel = resolveUserLevel(opts);
         const serviceName = opts.name;
         const instanceDir = path.resolve(opts.instanceDir ?? process.cwd());
         const kiciRoot = kiciConfigRoot(userLevel);
 
         console.log(`Platform: ${platform}`);
+        if (imageRegistry) console.log(`Image registry: ${imageRegistry}`);
         console.log(`Privilege: ${userLevel ? 'user' : 'system'}`);
         console.log(`Service name: ${serviceName}`);
         console.log(`Instance dir: ${instanceDir}`);
@@ -265,6 +287,7 @@ Token vocabulary:
           devDbUrl,
           orchestratorMode,
           modeExplicit,
+          platformUrl,
         });
 
         // Deployment-identity env vars let the orchestrator report its shape in
@@ -339,6 +362,7 @@ Token vocabulary:
           component: 'orchestrator',
           instanceDir,
           restartPolicy: DEFAULT_RESTART_POLICY,
+          imageRegistry,
         };
 
         await manager.install(config);
@@ -357,6 +381,8 @@ Token vocabulary:
           installBase: getInstallBase(platform, serviceName),
           createdAt: new Date().toISOString(),
           kiciVersion: readKiciVersion(),
+          // Always set for compose, so a re-install without the flag clears an earlier one.
+          ...(platform === 'compose' && { imageRegistry }),
         };
         const { file: manifestFile, warning: manifestWarning } = writeInstallManifest(
           instanceDir,

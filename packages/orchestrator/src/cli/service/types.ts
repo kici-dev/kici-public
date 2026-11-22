@@ -79,6 +79,11 @@ export interface ServiceConfig {
    */
   component?: 'orchestrator' | 'agent';
   /**
+   * Compose only: the image registry prefix that replaces `quay.io/kici-dev` in the
+   * `image:` line (`--image-registry`). The manifest-list digest stays.
+   */
+  imageRegistry?: string;
+  /**
    * The deploy folder holding this instance's manifest. Embedded in the unit
    * (X-KiCI-InstanceDir for systemd, KiCIInstanceDir for launchd,
    * dev.kici.instance-dir for compose, a description suffix for Windows) so

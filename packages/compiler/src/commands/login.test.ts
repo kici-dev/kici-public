@@ -51,6 +51,21 @@ import {
 } from '../remote/prod-defaults.js';
 import { isHeadless } from '../auth/headless-detect.js';
 
+/**
+ * Run `kici login` with `options`, assert it failed before either OAuth flow
+ * started, and return what it printed to stderr.
+ */
+async function refusedBeforeAnyFlow(options: Parameters<typeof loginCommand>[0]): Promise<string> {
+  const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const result = await loginCommand(options);
+  const printed = stderr.mock.calls.map((c: unknown[]) => String(c[0])).join('\n');
+  stderr.mockRestore();
+  expect(result).toBe(false);
+  expect(pkceFlow).not.toHaveBeenCalled();
+  expect(deviceFlow).not.toHaveBeenCalled();
+  return printed;
+}
+
 describe('kici login', () => {
   let tempDir: string;
 
@@ -60,13 +75,31 @@ describe('kici login', () => {
     // The homedir mock alone does not isolate this suite: getConfigDir() refuses
     // the ambient config under the test-isolation marker before consulting homedir().
     process.env.KICI_CONFIG_DIR = path.join(tempDir, '.kici');
+    // The OAuth helpers are mocked, so the only request a login can make is the
+    // login-settings lookup; a test that does not stub it must never reach the
+    // network.
+    vi.stubGlobal('fetch', async (input: unknown) => {
+      throw new Error(`unexpected network request: ${String(input)}`);
+    });
   });
 
   afterEach(async () => {
     delete process.env.KICI_CONFIG_DIR;
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
     await fs.rm(tempDir, { recursive: true, force: true });
   });
+
+  /** Reset the mocks (keeping the home and host names) and unset every login override. */
+  function resetLoginState(): void {
+    vi.clearAllMocks();
+    vi.mocked(os.homedir).mockReturnValue(tempDir);
+    vi.mocked(os.hostname).mockReturnValue('test-machine');
+    delete process.env.KICI_PLATFORM_URL;
+    delete process.env.KICI_OIDC_ISSUER;
+    delete process.env.KICI_OIDC_CLIENT_ID;
+    delete process.env.KICI_OIDC_EXTRA_SCOPES;
+  }
 
   /** Mock a successful desktop OAuth login that mints `pat`. */
   function mockOauthLogin(pat: string): void {
@@ -309,6 +342,64 @@ describe('kici login', () => {
     });
   });
 
+  describe('extra OIDC scopes', () => {
+    beforeEach(() => {
+      resetLoginState();
+    });
+
+    // fails-when: --oidc-scope replaces KICI_OIDC_EXTRA_SCOPES instead of adding to it
+    it('the flag adds to the env scopes', async () => {
+      process.env.KICI_OIDC_EXTRA_SCOPES = 'groups,audience:server:client_id:kici-platform';
+      mockOauthLogin('kici_pat_scopes');
+
+      await loginCommand({ oidcScopes: ['api://kici/.default'], noAttachPrompt: true });
+
+      expect(pkceFlow).toHaveBeenCalledWith({
+        issuer: PROD_OIDC_ISSUER,
+        clientId: PROD_OIDC_CLIENT_ID,
+        extraScopes: ['groups', 'audience:server:client_id:kici-platform', 'api://kici/.default'],
+      });
+    });
+
+    it('passes the extra scopes to the device flow', async () => {
+      process.env.KICI_OIDC_EXTRA_SCOPES = 'groups';
+      mockOauthLogin('kici_pat_device_scopes');
+      vi.mocked(deviceFlow).mockResolvedValue('oidc-token');
+
+      await loginCommand({ device: true, noAttachPrompt: true });
+
+      expect(deviceFlow).toHaveBeenCalledWith({
+        issuer: PROD_OIDC_ISSUER,
+        clientId: PROD_OIDC_CLIENT_ID,
+        extraScopes: ['groups'],
+      });
+    });
+
+    // fails-when: a scope with a quote or a backslash reaches the identity provider's scope parameter
+    it.each([
+      ['KICI_OIDC_EXTRA_SCOPES', { env: 'groups a"b', flag: [] as string[] }],
+      ['--oidc-scope', { env: '', flag: ['a\\b'] }],
+    ])('refuses a scope that is not one scope token from %s', async (source, input) => {
+      process.env.KICI_OIDC_EXTRA_SCOPES = input.env;
+      mockOauthLogin('kici_pat_bad_scope');
+      const printed = await refusedBeforeAnyFlow({ oidcScopes: input.flag, noAttachPrompt: true });
+      expect(printed).toContain(source);
+    });
+
+    // breaks-if-wrong: a blank variable keeps today's flow options
+    it('a blank KICI_OIDC_EXTRA_SCOPES adds nothing', async () => {
+      process.env.KICI_OIDC_EXTRA_SCOPES = ' , ';
+      mockOauthLogin('kici_pat_blank_scopes');
+
+      await loginCommand({ noAttachPrompt: true });
+
+      expect(pkceFlow).toHaveBeenCalledWith({
+        issuer: PROD_OIDC_ISSUER,
+        clientId: PROD_OIDC_CLIENT_ID,
+      });
+    });
+  });
+
   describe('production defaults', () => {
     beforeEach(() => {
       vi.clearAllMocks();
@@ -347,8 +438,10 @@ describe('kici login', () => {
       });
     });
 
-    it('defaults KICI_OIDC_ISSUER and KICI_OIDC_CLIENT_ID when unset', async () => {
-      process.env.KICI_PLATFORM_URL = 'https://platform.example.com';
+    it('defaults KICI_OIDC_ISSUER and KICI_OIDC_CLIENT_ID for the hosted Platform URL', async () => {
+      // A Platform other than the hosted one publishes its own issuer instead
+      // (see "a Platform other than the hosted one" below).
+      process.env.KICI_PLATFORM_URL = `${PROD_PLATFORM_URL}/`;
 
       const result = await loginCommand({});
 
@@ -411,12 +504,7 @@ describe('kici login', () => {
 
   describe('OAuth endpoint resolution + config reset', () => {
     beforeEach(() => {
-      vi.clearAllMocks();
-      vi.mocked(os.homedir).mockReturnValue(tempDir);
-      vi.mocked(os.hostname).mockReturnValue('test-machine');
-      delete process.env.KICI_PLATFORM_URL;
-      delete process.env.KICI_OIDC_ISSUER;
-      delete process.env.KICI_OIDC_CLIENT_ID;
+      resetLoginState();
       vi.mocked(isHeadless).mockResolvedValue(false);
       vi.mocked(pkceFlow).mockResolvedValue('tok');
       vi.mocked(exchangeTokenForPat).mockResolvedValue({
@@ -559,6 +647,8 @@ describe('kici login', () => {
       planeStatusMock.mockResolvedValue({ running: false, mode: 'independent' });
       attachPlaneMock.mockResolvedValue({ mode: 'hybrid', url: 'http://127.0.0.1:4319' });
       process.env.KICI_PLATFORM_URL = 'https://platform.example.com';
+      // An explicit issuer: the login makes no login-settings request.
+      process.env.KICI_OIDC_ISSUER = 'https://keycloak.example.com';
       // The prompt fires only with an active org, which login preserves for the same endpoint.
       await saveGlobalConfig({
         platformEndpoint: 'https://platform.example.com',
@@ -568,6 +658,7 @@ describe('kici login', () => {
     afterEach(() => {
       Object.defineProperty(process.stdin, 'isTTY', { value: savedTTY, configurable: true });
       delete process.env.KICI_PLATFORM_URL;
+      delete process.env.KICI_OIDC_ISSUER;
     });
 
     it('attaches on Y when interactive with an active org', async () => {
@@ -584,22 +675,118 @@ describe('kici login', () => {
     it('does not attach on n', async () => {
       Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
       scriptedAnswer = 'n';
-      await loginCommand({});
+      expect(await loginCommand({})).toBe(true);
       expect(attachPlaneMock).not.toHaveBeenCalled();
     });
 
     it('does not prompt in non-interactive (piped) input', async () => {
       Object.defineProperty(process.stdin, 'isTTY', { value: undefined, configurable: true });
       scriptedAnswer = 'y';
-      await loginCommand({});
+      expect(await loginCommand({})).toBe(true);
       expect(attachPlaneMock).not.toHaveBeenCalled();
     });
 
     it('does not prompt when --no-attach is set', async () => {
       Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
       scriptedAnswer = 'y';
-      await loginCommand({ noAttachPrompt: true });
+      expect(await loginCommand({ noAttachPrompt: true })).toBe(true);
       expect(attachPlaneMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('a Platform other than the hosted one', () => {
+    const PLATFORM = 'https://kici.corp.example';
+    const PUBLISHED = { issuer: 'https://login.corp.example/realms/eng', clientId: 'corp-cli' };
+    const fetchCalls: string[] = [];
+
+    beforeEach(() => {
+      resetLoginState();
+      fetchCalls.length = 0;
+    });
+
+    /** Stub the global fetch the login-settings request goes through. */
+    function stubFetch(respond: () => Response | Promise<Response>): void {
+      vi.stubGlobal('fetch', async (input: string | URL | Request) => {
+        fetchCalls.push(String(input instanceof Request ? input.url : input));
+        return respond();
+      });
+    }
+
+    it('passes the published issuer to the OAuth flow and saves it', async () => {
+      stubFetch(() => Response.json(PUBLISHED));
+      mockOauthLogin('kici_pat_published');
+      const logs = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      const result = await loginCommand({ platformEndpoint: PLATFORM, noAttachPrompt: true });
+
+      const printed = logs.mock.calls.map((c: unknown[]) => String(c[0])).join('\n');
+      logs.mockRestore();
+      expect(result).toBe(true);
+      expect(fetchCalls).toEqual([`${PLATFORM}/api/v1/cli/login-config`]);
+      expect(pkceFlow).toHaveBeenCalledWith({
+        issuer: PUBLISHED.issuer,
+        clientId: PUBLISHED.clientId,
+      });
+      expect(exchangeTokenForPat).toHaveBeenCalledWith({
+        platformUrl: PLATFORM,
+        accessToken: 'oidc-token',
+        machineName: 'test-machine',
+      });
+      expect(printed).toContain(
+        `Using identity provider ${PUBLISHED.issuer} (published by ${PLATFORM})`,
+      );
+      const config = await loadGlobalConfig();
+      expect(config.oidcIssuer).toBe(PUBLISHED.issuer);
+      expect(config.platformEndpoint).toBe(PLATFORM);
+      // breaks-if-wrong: a Platform that publishes no extra scopes keeps the plain line
+      expect(printed).not.toContain('extra scopes');
+    });
+
+    // fails-when: the line hides the scopes the Platform published, so the user cannot see what
+    // the identity provider is asked for
+    it('names the published extra scopes on the identity provider line', async () => {
+      stubFetch(() => Response.json({ ...PUBLISHED, extraScopes: ['groups', 'api://kici'] }));
+      mockOauthLogin('kici_pat_published_line');
+      const logs = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      await loginCommand({ platformEndpoint: PLATFORM, noAttachPrompt: true });
+
+      const printed = logs.mock.calls.map((c: unknown[]) => String(c[0])).join('\n');
+      logs.mockRestore();
+      expect(printed).toContain(
+        `Using identity provider ${PUBLISHED.issuer} (published by ${PLATFORM}), extra scopes: groups api://kici`,
+      );
+    });
+
+    // fails-when: the published scopes are dropped, or come before the user's own
+    it('appends the published scopes after the env scopes', async () => {
+      stubFetch(() => Response.json({ ...PUBLISHED, extraScopes: ['groups'] }));
+      process.env.KICI_OIDC_EXTRA_SCOPES = 'api://corp/.default groups';
+      mockOauthLogin('kici_pat_published_scopes');
+      vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      await loginCommand({ platformEndpoint: PLATFORM, noAttachPrompt: true });
+
+      expect(pkceFlow).toHaveBeenCalledWith({
+        issuer: PUBLISHED.issuer,
+        clientId: PUBLISHED.clientId,
+        extraScopes: ['api://corp/.default', 'groups'],
+      });
+    });
+
+    // fails-when: a failed lookup falls back to the hosted issuer and the
+    // browser is sent to the hosted identity provider
+    it('fails before any OAuth flow when discovery fails', async () => {
+      stubFetch(() => {
+        throw new TypeError('fetch failed');
+      });
+      const printed = await refusedBeforeAnyFlow({
+        platformEndpoint: PLATFORM,
+        noAttachPrompt: true,
+      });
+      expect(exchangeTokenForPat).not.toHaveBeenCalled();
+      expect(printed).toContain(`Could not reach Platform at ${PLATFORM}`);
+      expect(printed).not.toContain('kici.dev');
     });
   });
 });

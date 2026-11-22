@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isPgUniqueViolation } from './pg-errors.js';
+import { isPgUndefinedTable, isPgUniqueViolation } from './pg-errors.js';
 
 describe('isPgUniqueViolation', () => {
   it('returns true for a 23505 error matching the named constraint', () => {
@@ -38,4 +38,19 @@ describe('isPgUniqueViolation', () => {
       false,
     );
   });
+});
+
+describe('isPgUndefinedTable', () => {
+  // fails-when: a missing licensing or migration table is read as an ordinary error
+  it('returns true for a 42P01 error', () => {
+    expect(isPgUndefinedTable({ code: '42P01' })).toBe(true);
+  });
+
+  // breaks-if-wrong: any other database error is taken for a missing table
+  it.each([{ code: '42703' }, { code: '23505' }, new Error('connection refused'), null, '42P01'])(
+    'returns false for %s',
+    (err) => {
+      expect(isPgUndefinedTable(err)).toBe(false);
+    },
+  );
 });

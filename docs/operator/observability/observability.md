@@ -121,29 +121,42 @@ kici-admin diagnose
 
 **Checks performed:**
 
-| Check        | Description                                       |
-| ------------ | ------------------------------------------------- |
-| Database     | Connectivity and basic query execution            |
-| WebSocket    | Connection to Platform relay endpoint             |
-| Agents       | Active agent count (warns if zero)                |
-| Disk         | Available disk space (warns < 1GB, fails < 100MB) |
-| Config       | Required configuration fields present             |
-| Certificates | TLS certificate validity and expiration           |
+| Check                        | Description                                                                                                                                                                                                                                                                                   |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Database connectivity        | Reads one row from the orchestrator database and reports the latency                                                                                                                                                                                                                          |
+| DB backup freshness          | Age of the newest `kici-admin db backup`. Fails when no backup was ever recorded. Warns past `KICI_BACKUP_STALENESS_WARN_HOURS` (default 24), or past the strictest [per-org threshold](../orchestrator/kici-admin/org-settings.md#backup-freshness--per-org-backup-staleness-warn-threshold) |
+| Run history retention        | Warns when every retention window is disabled, no object store is configured, and `execution_runs` holds more than 500,000 rows                                                                                                                                                               |
+| Platform connectivity        | HTTP(S) request to the Platform health endpoint. Warns when no Platform URL is configured                                                                                                                                                                                                     |
+| Agent connectivity           | Connected agent count (warns if zero)                                                                                                                                                                                                                                                         |
+| Disk space                   | Available space on the root filesystem (warns < 1GB, fails < 100MB)                                                                                                                                                                                                                           |
+| Config validity              | Required configuration fields present and a known mode                                                                                                                                                                                                                                        |
+| TLS certificate              | Warns within 30 days of expiry and fails once expired. Passes when no certificate is configured                                                                                                                                                                                               |
+| `scaler:<name>`              | One row per scaler backend: spawn failures in the last 5 minutes, and an active spawn backoff                                                                                                                                                                                                 |
+| `firecracker:<bridge>`       | One row per Firecracker backend: the bridge, its gateway address and its nft table are present                                                                                                                                                                                                |
+| Workflow lock compile schema | Warns when a registered workflow lock declares a compile schema that the agents of this release do not implement                                                                                                                                                                              |
 
 **Example output:**
 
 ```
-Orchestrator diagnostics
-========================
-  [PASS] Database connectivity          1ms
-  [PASS] WebSocket to Platform            12ms
-  [WARN] Agent connectivity            0 agents connected
-  [PASS] Disk space                   45.2 GB available
-  [PASS] Configuration valid
-  [PASS] TLS certificates             expires in 89 days
+Orchestrator diagnostics (2026-11-18T09:12:04.512Z)
+Overall: degraded
 
-Result: 5 passed, 1 warning, 0 failed
+Status  | Check                    | Message                                    | Duration
+------------------------------------------------------------------------------------------
+pass   | Database connectivity    | Connected (1ms latency)                    | 1ms
+pass   | DB backup freshness      | Last backup 6.2h ago                       | 2ms
+pass   | Run history retention    | Effective windows: runs 90d, audit 365d, p | 3ms
+pass   | Platform connectivity    | Platform reachable (12ms)                  | 12ms
+warn   | Agent connectivity       | No agents connected                        | 0ms
+pass   | Disk space               | 45.2GB available                           | 0ms
+pass   | Config validity          | Config valid (mode: platform)              | 0ms
+pass   | TLS certificate          | Certificate valid for 89 days              | 1ms
+pass   | scaler:container         | 0 spawn failures in last 5m                | 0ms
+pass   | firecracker              | No firecracker backends configured         | 0ms
+pass   | Workflow lock compile schema | All 4 registered workflow locks match comp | 2ms
 ```
+
+The table cuts each message at 42 characters. Add `--json` for the full messages and the `details` of each check. The overall status is `healthy`, `degraded` (a check warns) or `unhealthy` (a check fails), and the exit code is 0, 1 or 2 to match.
 
 **HTTP endpoint:** The same checks are available via `GET /admin/diagnose` for monitoring system integration.
 
@@ -159,15 +172,14 @@ kici-admin debug-bundle [--output /path/to/bundle.zip] [--log-dir /var/log/kici]
 
 **Bundle contents:**
 
-- `manifest.json` -- bundle version, timestamp, orchestrator ID
-- `config.json` -- configuration with secrets redacted
-- `system-info.json` -- OS, Node.js version, memory, CPU
-- `metrics.txt` -- current Prometheus metrics snapshot
-- `logs/` -- recent log files (up to 50MB)
-- `cluster-state.json` -- cluster membership and peer status
-- `execution-state.json` -- recent run and job statuses
+- `manifest.json` -- bundle version, timestamp, Node.js version and platform of the CLI host
+- `diagnostics/results.json` -- the `kici-admin diagnose` results
+- `config/config.json` -- the shared configuration, with its sensitive fields masked
+- `system/metrics.txt` -- current Prometheus metrics snapshot
+- `cluster/health.json` -- cluster membership and peer status
+- `logs/` -- recent log files (up to 50MB), with a `logs/summary.json`
 
-**Security:** All secrets, tokens, and credentials are automatically redacted using an allowlist approach. Only known-safe configuration fields are included.
+**Security:** The orchestrator masks the sensitive configuration fields before it returns the configuration to the CLI. In a fleet bundle, each node redacts its own configuration with an allowlist: a string value stays only under a known-safe field name.
 
 **Fleet-wide collection:** Add `--fleet` to collect from every node in the cluster at once — the orchestrator, its coordinator-mesh peers, every worker, and every connected agent — over the existing authenticated WebSocket channels. The result is one nested ZIP (`local/`, `agents/<id>.zip`, `workers/<id>.zip`, `peers/<id>.zip`) plus a `fleet-manifest.json` recording each node's status, with each node redacting its own config at source. Use `--list` to enumerate the fleet and `--pick` to collect a subset. See the [debug-bundle reference](../orchestrator/kici-admin/inspection-recovery.md#fleet-wide-collection) for the full flag set.
 
@@ -200,27 +212,17 @@ Debug bundle: kici-debug-2026-03-12T10-30-00.zip
 
 ## Grafana dashboards
 
-KiCI ships five Grafana dashboard templates that operators can import into their own Grafana instance.
-
-### Available dashboards
-
-| Dashboard          | Description                                                                                                                       |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| System overview    | WS connections, webhook throughput, relay latency, error rates, stale detection                                                   |
-| Execution pipeline | Job dispatch rates, build vs execution split, cache hit/miss ratios, dispatch queue depth overall + per label                     |
-| Org / tenant view  | Per-org connection counts, execution totals, plan distribution, registrations (24h count + hourly signup rate)                    |
-| Scheduled jobs     | Per-job last success age, run rate, duration histograms, consecutive failures, orphan sweep count                                 |
-| Orchestrator fleet | Orchestrator agents, trigger latency, build duration, dedup, stale runs, execution events, log volume, log-streaming backpressure |
+KiCI ships an importable Grafana dashboard and a set of Prometheus alert rules for the orchestrator: the [orchestrator monitoring pack](./monitoring-pack.md). The pack page tells you how to import the dashboard and install the rules.
 
 ### Queue depth and backpressure
 
 When the execution pipeline feels slow but the orchestrator isn't reporting
-errors, check the "Execution pipeline" dashboard panels for
+errors, check the **Queue & dispatch** row of the monitoring pack dashboard for
 `kici_orch_dispatch_queue_depth`. A rising or sustained pending depth means
 one of:
 
 - **Agents are starved** — no agent with matching labels is available for the
-  queued jobs. Inspect the "Dispatch queue depth by label" panel to see which
+  queued jobs. Inspect the "Pending depth by runner label" panel to see which
   label pool is blocked, then scale the matching scaler pool (container,
   bare-metal, or Firecracker).
 - **`runs_on` labels are mismatched** — the workflow requests labels that
@@ -237,30 +239,19 @@ the threshold for two consecutive refresher ticks (~10s). Set to `0` to
 silence the warn log while keeping the Prometheus gauge and the Grafana
 panel alert active.
 
-For agent log-streaming pressure, the "Orchestrator fleet" dashboard's
-**Log-streaming backpressure** row exposes `kici_agent_log_backpressure_events_total`
-(rising-edge pause/drop events) and `kici_agent_log_lines_dropped_total` (lines
-lost under drop mode). A non-zero rate of the latter means operators are
-losing real log content — increase the streamer's buffer (raise
-`BACKPRESSURE_THRESHOLD`) or reduce the producer's output rate.
-
-### Import instructions
-
-1. Download the dashboard JSON files from `infra/terraform/modules/grafana/dashboards/`
-2. In Grafana, go to **Dashboards > New > Import**
-3. Upload or paste the JSON file
-4. Select your Prometheus datasource when prompted
-5. Click **Import**
-
-The dashboards use the standard `${DS_PROMETHEUS}` template variable, so they work with any Prometheus-compatible datasource.
+For agent log-streaming pressure, watch the agent metrics
+`kici_agent_log_backpressure_events_total` (rising-edge pause/drop events) and
+`kici_agent_log_lines_dropped_total` (lines lost under drop mode). A non-zero
+rate of the latter means operators are losing real log content — increase the
+streamer's buffer (raise `BACKPRESSURE_THRESHOLD`) or reduce the producer's
+output rate.
 
 ### Required Prometheus configuration
 
-The dashboards expect metrics from both the Platform relay and orchestrator services. Ensure your Prometheus instance scrapes both `/metrics` endpoints (see the scrape configuration above).
+The dashboard reads the orchestrator's metrics. Make sure your Prometheus instance scrapes the orchestrator `/metrics` endpoint (see the scrape configuration above).
 
 Key metric prefixes:
 
-- `kici_` -- Platform relay metrics (webhooks, connections, relay)
 - `kici_orch_` -- Orchestrator metrics (dispatch, execution, agents)
 - `kici_agent_` -- Agent metrics (jobs, steps, clone duration)
 
@@ -337,7 +328,7 @@ A direct-ingress `202` means the delivery is durably queued, not that its pipeli
 **Database tables on the orchestrator:**
 
 - `dedup_cache` — `delivery_id` + `expires_at` only, no payload. Useful to confirm "did this delivery arrive at least once in the last 24h".
-- `execution_runs.webhook_delivery_id` / `routing_key` — every run carries the delivery that spawned it.
+- `execution_runs.delivery_id` / `routing_key` — every run carries the delivery that spawned it.
 
 **Prometheus metrics** (scrape `http://orchestrator:4000/metrics`):
 

@@ -204,6 +204,26 @@ export class AgentTokenStore {
     return BigInt(result.numUpdatedRows) > 0n;
   }
 
+  /**
+   * Revoke every live scaler-issued token bound to one agent id. The scaler
+   * calls it when a spawn produced no agent, so a failed launch leaves no
+   * usable credential behind. Static and bootstrap tokens are never matched:
+   * neither stores the bare agent id in `created_by`.
+   *
+   * @returns The number of tokens revoked.
+   */
+  async revokeEphemeralForAgent(agentId: string): Promise<number> {
+    const result = await this.db
+      .updateTable('agent_tokens')
+      .set({ revoked_at: sql`now()` })
+      .where('agent_type', '=', 'ephemeral')
+      .where('created_by', '=', agentId)
+      .where('revoked_at', 'is', null)
+      .executeTakeFirst();
+
+    return Number(result.numUpdatedRows);
+  }
+
   /** List non-revoked tokens, newest first, without token_hash. */
   async list(opts?: { agentType?: string }): Promise<SafeAgentTokenRow[]> {
     let q = this.db

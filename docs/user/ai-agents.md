@@ -196,7 +196,7 @@ which credential you used:
   — the same `agentLabel` provenance rides in its actor metadata.
 
 Either way the label is stored in a dedicated `agent_label` column on every such
-row, so you can filter the access log down to just agent activity:
+row, so you can filter the access log down to agent activity only:
 
 ```bash
 # Every action a specific agent took, by its label:

@@ -62,7 +62,8 @@ kici-admin db restore --input <path> [--yes] [--database-url <url>]
 - `ensure` creates the database when it is missing. `--owner` sets a separate owner role, `--revoke-connect-public` revokes `CONNECT` from `PUBLIC`, and `--grant-connect-role` (repeatable) grants `CONNECT` to a named role. Every successful migration run records the bundled-migration content hash in `_migration_content_hash` — including warm runs that apply zero migrations — so `check-schema` reports the schema as current on a long-lived database whose migrations are already up to date.
 - `fresh` / `ensure` / `create-role` / `create-readonly-user` / `check-schema` / `schema-diff` / `collation-check` / `reindex` / `refresh-collation-version` / `stats-check` / `analyze` open their own pool and run SQL directly — needed for deploy / bootstrap / DR workflows.
 - `fresh` prompts for the target database name as a confirmation. Pass `--yes` to skip the prompt (scripted use).
-- `check-schema` compares the bundled migration manifest (names + body hash) against the live schema and the stored `_migration_content_hash` marker. Exit code 2 means drift — call `fresh` or run `migrate` depending on intent. Exit code 1 means the database could not be read. `--json` prints `{"current", "kind", "reason"}`; `kind` is one of `current`, `missing`, `pending`, `unknown-applied`, `hash-missing` or `hash-mismatch`.
+- `create-role` and `create-readonly-user` send the password inside a SQL statement. On a superuser connection they turn off statement logging and statement tracking for that statement. The password then does not reach the PostgreSQL server log or the `pg_stat_statements` view. A connection that is not a superuser cannot change those settings. The server then logs the statement when its `log_statement` is `ddl` or `all`.
+- `check-schema` compares the bundled migration manifest (names + body hash) against the live schema and the stored `_migration_content_hash` marker. Exit code 2 means drift — call `fresh` or run `migrate` depending on intent. Exit code 1 means the database could not be read. `--json` prints `{"current", "kind", "reason"}`; `kind` is one of `current`, `missing`, `pending`, `unknown-applied`, `hash-missing` or `hash-mismatch`. For `unknown-applied`, `unknown` lists the applied migrations this release does not carry; for `pending`, `pending` lists the migrations still to apply.
 - `schema-diff` reads the live schema from the PostgreSQL catalog — columns, constraints, indexes, functions, triggers, sequences and extensions — and compares it with the schema this release builds from its migrations. It prints one line per difference: `missing` (the release expects it, the database does not have it), `extra` (the database has it, the release does not expect it) or `changed`. `--json` prints `{"differences": [...]}`. Exit code 0 means the schema matches, 2 means at least one difference, and 1 means an error. The indexes the orchestrator builds in the background after startup are not compared. An extension that the database has and the release does not use is not a difference, because your database host can install its own extensions. Use it after an upgrade, or after a restore, to find a schema that `check-schema` reports as current but that a manual change or an edited migration made different.
 - `collation-check` compares `pg_database.datcollversion` against the running libc collation version. Exit code 2 means the stamped and actual collation versions differ — a libc upgrade changed sort order out from under existing indexes.
 - `reindex` runs `REINDEX DATABASE CONCURRENTLY`, rebuilding every index under the current libc collation rules. Non-blocking but takes minutes and roughly 2× temporary disk. Requires `--confirm` and `--reason`.
@@ -264,7 +265,7 @@ Synopsis: `kici-admin db analyze [options]`
 
 | Option                   | Default | Description                                                       |
 | ------------------------ | ------- | ----------------------------------------------------------------- |
-| `--database-url <url>`   |         | Target DB URL (else KICI_DATABASE_URL / DATABASE_URL)             |
+| `--database-url <url>`   |         | Target DB URL (else KICI_DATABASE_URL)                            |
 | `--table <schema.table>` |         | Table to analyze, schema-qualified. Repeatable.                   |
 | `--reason <text>`        |         | Reason (recorded in the access log)                               |
 | `--dry-run`              |         | Validate the tables and print the statements without running them |
@@ -279,7 +280,7 @@ Synopsis: `kici-admin db backup [options]`
 
 | Option                  | Default | Description                                                                                                    |
 | ----------------------- | ------- | -------------------------------------------------------------------------------------------------------------- |
-| `--database-url <url>`  |         | Source DB URL (else KICI_DATABASE_URL / DATABASE_URL)                                                          |
+| `--database-url <url>`  |         | Source DB URL (else KICI_DATABASE_URL)                                                                         |
 | `--output <path>`       |         | Dump output path (default ./kici-orchestrator-backup-<ts>.dump)                                                |
 | `--output-dir <path>`   |         | Write a timestamped dump into this directory, then prune it to --keep dumps                                    |
 | `--keep <n>`            | `7`     | Dumps to retain in --output-dir                                                                                |
@@ -300,10 +301,10 @@ Synopsis: `kici-admin db check-schema [options]`
 
 **Options**
 
-| Option                 | Default | Description                                           |
-| ---------------------- | ------- | ----------------------------------------------------- |
-| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL / DATABASE_URL) |
-| `--json`               | `false` | Emit JSON instead of a human-readable line            |
+| Option                 | Default | Description                                |
+| ---------------------- | ------- | ------------------------------------------ |
+| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL)     |
+| `--json`               | `false` | Emit JSON instead of a human-readable line |
 
 ### `kici-admin db collation-check`
 
@@ -313,10 +314,10 @@ Synopsis: `kici-admin db collation-check [options]`
 
 **Options**
 
-| Option                 | Default | Description                                           |
-| ---------------------- | ------- | ----------------------------------------------------- |
-| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL / DATABASE_URL) |
-| `--json`               | `false` | Emit JSON instead of a human-readable line            |
+| Option                 | Default | Description                                |
+| ---------------------- | ------- | ------------------------------------------ |
+| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL)     |
+| `--json`               | `false` | Emit JSON instead of a human-readable line |
 
 ### `kici-admin db create-readonly-user`
 
@@ -340,12 +341,12 @@ Synopsis: `kici-admin db create-role [options]`
 
 **Options**
 
-| Option                  | Default | Description                                          |
-| ----------------------- | ------- | ---------------------------------------------------- |
-| `--database-url <url>`  |         | Admin DB URL (else KICI_DATABASE_URL / DATABASE_URL) |
-| `--user <name>`         |         | Role name to create or update                        |
-| `--password <password>` |         | Role password (raw — quote as needed)                |
-| `--createdb`            | `false` | Grant CREATEDB to the new role                       |
+| Option                  | Default | Description                           |
+| ----------------------- | ------- | ------------------------------------- |
+| `--database-url <url>`  |         | Admin DB URL (else KICI_DATABASE_URL) |
+| `--user <name>`         |         | Role name to create or update         |
+| `--password <password>` |         | Role password (raw — quote as needed) |
+| `--createdb`            | `false` | Grant CREATEDB to the new role        |
 
 ### `kici-admin db ensure`
 
@@ -363,7 +364,7 @@ Synopsis: `kici-admin db ensure <name> [options]`
 
 | Option                        | Default | Description                                                                                                                                       |
 | ----------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--database-url <url>`        |         | Admin DB URL (else KICI_DATABASE_URL / DATABASE_URL)                                                                                              |
+| `--database-url <url>`        |         | Admin DB URL (else KICI_DATABASE_URL)                                                                                                             |
 | `--owner <role>`              |         | DB owner role (default: URL user). Pass when the admin connection is privileged but the new DB should be owned by a separate non-privileged role. |
 | `--revoke-connect-public`     |         | After ensure, REVOKE CONNECT ON DATABASE "<name>" FROM PUBLIC (recommended on shared clusters).                                                   |
 | `--grant-connect-role <role>` |         | After ensure (and any --revoke-connect-public), GRANT CONNECT ON DATABASE "<name>" TO "<role>". Repeatable.                                       |
@@ -376,11 +377,11 @@ Synopsis: `kici-admin db fresh [options]`
 
 **Options**
 
-| Option                 | Default | Description                                                 |
-| ---------------------- | ------- | ----------------------------------------------------------- |
-| `--database-url <url>` |         | Target database URL (else KICI_DATABASE_URL / DATABASE_URL) |
-| `--confirm`            |         | Explicit confirmation (destructive)                         |
-| `--yes`                |         | Skip interactive confirmation (for scripted use)            |
+| Option                 | Default | Description                                      |
+| ---------------------- | ------- | ------------------------------------------------ |
+| `--database-url <url>` |         | Target database URL (else KICI_DATABASE_URL)     |
+| `--confirm`            |         | Explicit confirmation (destructive)              |
+| `--yes`                |         | Skip interactive confirmation (for scripted use) |
 
 ### `kici-admin db migrate`
 
@@ -404,10 +405,10 @@ Synopsis: `kici-admin db refresh-collation-version [options]`
 
 **Options**
 
-| Option                 | Default | Description                                           |
-| ---------------------- | ------- | ----------------------------------------------------- |
-| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL / DATABASE_URL) |
-| `--reason <text>`      |         | Reason (recorded in stderr banner)                    |
+| Option                 | Default | Description                            |
+| ---------------------- | ------- | -------------------------------------- |
+| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL) |
+| `--reason <text>`      |         | Reason (recorded in stderr banner)     |
 
 ### `kici-admin db reindex`
 
@@ -417,11 +418,11 @@ Synopsis: `kici-admin db reindex [options]`
 
 **Options**
 
-| Option                 | Default | Description                                           |
-| ---------------------- | ------- | ----------------------------------------------------- |
-| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL / DATABASE_URL) |
-| `--confirm`            |         | Explicit confirmation (destructive — long-running)    |
-| `--reason <text>`      |         | Reason (recorded in stderr banner)                    |
+| Option                 | Default | Description                                        |
+| ---------------------- | ------- | -------------------------------------------------- |
+| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL)             |
+| `--confirm`            |         | Explicit confirmation (destructive — long-running) |
+| `--reason <text>`      |         | Reason (recorded in stderr banner)                 |
 
 ### `kici-admin db restore`
 
@@ -431,11 +432,11 @@ Synopsis: `kici-admin db restore [options]`
 
 **Options**
 
-| Option                 | Default | Description                                           |
-| ---------------------- | ------- | ----------------------------------------------------- |
-| `--input <path>`       |         | Path to a .dump file produced by `db backup`          |
-| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL / DATABASE_URL) |
-| `--yes`                |         | Skip interactive confirmation (for scripted use)      |
+| Option                 | Default | Description                                      |
+| ---------------------- | ------- | ------------------------------------------------ |
+| `--input <path>`       |         | Path to a .dump file produced by `db backup`     |
+| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL)           |
+| `--yes`                |         | Skip interactive confirmation (for scripted use) |
 
 ### `kici-admin db schema-diff`
 
@@ -458,9 +459,9 @@ Synopsis: `kici-admin db stats-check [options]`
 
 **Options**
 
-| Option                 | Default | Description                                           |
-| ---------------------- | ------- | ----------------------------------------------------- |
-| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL / DATABASE_URL) |
-| `--json`               | `false` | Emit JSON instead of human-readable lines             |
+| Option                 | Default | Description                               |
+| ---------------------- | ------- | ----------------------------------------- |
+| `--database-url <url>` |         | Target DB URL (else KICI_DATABASE_URL)    |
+| `--json`               | `false` | Emit JSON instead of human-readable lines |
 
 <!-- END GENERATED: kici-admin-config-and-db -->

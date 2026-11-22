@@ -59,6 +59,8 @@ export interface SingleJobContextOptions {
   contextStore?: unknown;
   /** A checkRunReporter stub, to observe the queued check runs dispatch setup creates. */
   checkRunReporter?: unknown;
+  /** The static job's lock checkout: a boolean sets `checkout`, an object sets `checkoutOptions`. */
+  jobCheckout?: boolean | Record<string, unknown>;
 }
 
 /** The single static `build` job workflow, shaped by the fixture options. */
@@ -85,6 +87,8 @@ function makeSingleJobWorkflow(over: SingleJobContextOptions): LockWorkflow {
         ...(over.jobApproval ? { approval: over.jobApproval } : {}),
         ...(over.withDynamicEnv ? { dynamicEnv: true } : {}),
         ...(over.withDynamicContext ? { contexts: [{ dynamic: true }] } : {}),
+        ...(typeof over.jobCheckout === 'boolean' ? { checkout: over.jobCheckout } : {}),
+        ...(typeof over.jobCheckout === 'object' ? { checkoutOptions: over.jobCheckout } : {}),
         ...(over.withDeferredInit
           ? {
               matrix: {

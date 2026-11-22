@@ -1,4 +1,10 @@
-import type { CheckMode, CheckStepOutcome, LogStream, ProvenanceContext } from '@kici-dev/engine';
+import type {
+  CheckMode,
+  CheckStepOutcome,
+  LockCheckoutOptions,
+  LogStream,
+  ProvenanceContext,
+} from '@kici-dev/engine';
 import type { SandboxStepResult } from './types.js';
 import type { DepRestoreReport } from '../dep-restore-report.js';
 
@@ -677,6 +683,10 @@ export interface JobExecutionRequest {
   provenanceContext?: ProvenanceContext;
   /** Default: true. */
   checkout?: boolean;
+  /** Clone depth and tag policy for the job's repo; unset clones at depth 1 with git's default tags. */
+  checkoutOptions?: LockCheckoutOptions | undefined;
+  /** The orchestrator dispatched a cached `.kici/` source tarball. */
+  sourceCached?: boolean | undefined;
   /** Part of a developer-initiated `kici run`. */
   isTestRun?: boolean;
   /**

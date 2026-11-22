@@ -36,6 +36,7 @@ import {
   EventLogSource,
   InitFailureCategory,
   PLATFORM_CONNECTED_MODES,
+  SourceProvider,
   truncateReasonText,
 } from '@kici-dev/engine';
 import type { OrchestratorMode } from '@kici-dev/engine';
@@ -70,6 +71,7 @@ import {
   type WorkflowModification,
 } from '../security/workflow-diff.js';
 import { parseKiciCommand, handleApprovalComment } from '../security/comment-handler.js';
+import { githubIdentityProvider } from '../providers/github/github-host.js';
 import type { IdentityLink, PermissionLevel } from '../security/identity-link.js';
 import { extractRegisterableWorkflows, extractGlobalWorkflows } from '../registration/extractor.js';
 import { payloadFromObject } from '../webhook/event-log.js';
@@ -1004,6 +1006,19 @@ export async function resolveApprovalDirectory(
 }
 
 /**
+ * The identity namespace a commenter is matched in. User ids are numbered per
+ * GitHub server, so a GitHub Enterprise Server commenter is matched only
+ * against links in that server's namespace (`github:<host>`), never against a
+ * github.com link with the same id.
+ */
+function commenterIdentityProvider(provider: string, githubUrl: string | undefined): string {
+  if (provider !== SourceProvider.enum.github) return provider;
+  // fails-when: a GHES commenter matches a github.com identity link with the same id
+  // breaks-if-wrong: a github.com commenter is still matched as 'github'
+  return githubIdentityProvider(githubUrl);
+}
+
+/**
  * Phase C.2 — Handle `/kici approve|reject` in `issue_comment` events, BEFORE
  * trigger matching. The event still continues through trigger matching, for
  * workflows with issue_comment triggers.
@@ -1015,8 +1030,10 @@ async function handleApprovalCommentIfPresent(args: {
   payload: Record<string, unknown>;
   resolvedOrgId: string;
   repoIdentifier: string;
+  /** The GitHub Enterprise Server of the delivering source, from its live config. */
+  githubUrl: string | undefined;
 }): Promise<void> {
-  const { info, deps, event, payload, resolvedOrgId, repoIdentifier } = args;
+  const { info, deps, event, payload, resolvedOrgId, repoIdentifier, githubUrl } = args;
   if (info.event !== 'issue_comment' || !deps.heldRunStore) return;
 
   const commentBody = (payload.comment as { body?: string } | undefined)?.body;
@@ -1037,7 +1054,7 @@ async function handleApprovalCommentIfPresent(args: {
     commentBody,
     commenterUsername: senderUsername,
     commenterUserId: event.senderUserId,
-    provider: info.provider,
+    provider: commenterIdentityProvider(info.provider, githubUrl),
     repoIdentifier,
     prNumber,
     orgId: resolvedOrgId,
@@ -3398,8 +3415,8 @@ async function processWebhookPipeline(
   const { repoIdentifier, credentials } = repoCreds;
   const payload = info.payload as Record<string, unknown>;
 
-  // No `bundle` / `credentials`: each ended hold's check uses its own run's
-  // commit, bundle and credentials, not this comment's.
+  // The delivering bundle names only the commenter's identity namespace: each
+  // ended hold's check uses its own run's commit, bundle and credentials.
   await handleApprovalCommentIfPresent({
     info,
     deps,
@@ -3407,6 +3424,7 @@ async function processWebhookPipeline(
     payload,
     resolvedOrgId,
     repoIdentifier,
+    githubUrl: bundle.githubUrl,
   });
 
   const ref = bundle.normalizer.extractRef(info.event, payload);

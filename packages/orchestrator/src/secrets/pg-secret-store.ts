@@ -38,6 +38,46 @@ export class SecretScopeExistsError extends Error {
   }
 }
 
+/** Where a stored secret lives: never its value. */
+export interface SecretLocation {
+  orgId: string;
+  scope: string;
+  key: string;
+}
+
+/** What the stored secrets say about the configured master key. */
+export enum StoredKeyCheck {
+  /** At least one stored secret decrypts: the key is this database's. */
+  Match = 'match',
+  /** No stored secret is ciphertext (none stored yet, or only legacy plaintext): nothing confirms or refutes the key. */
+  Unconfirmed = 'unconfirmed',
+  /** Ciphertext is stored and none of it decrypts: the key is another one. */
+  Mismatch = 'mismatch',
+}
+
+/** The length of the IV and the auth tag every ciphertext opens with (`@kici-dev/shared` secret-crypto). */
+const CIPHERTEXT_MIN_BYTES = 12 + 16;
+const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+/**
+ * Whether `value` has the shape of the store's ciphertext: canonical base64 of at least the IV
+ * and the auth tag. A value the old direct write stored as given (plaintext) mostly does not;
+ * one that does is read as ciphertext, so the check refuses rather than guesses.
+ */
+export function looksLikeCiphertext(value: string): boolean {
+  if (!BASE64_RE.test(value)) return false;
+  return Buffer.from(value, 'base64').length >= CIPHERTEXT_MIN_BYTES;
+}
+
+/** The columns a decryption check reads from one `scoped_secrets` row. */
+interface StoredSecretRow {
+  org_id: string;
+  scope: string;
+  key: string;
+  encrypted_value: string;
+  key_version: number;
+}
+
 /**
  * PostgreSQL secret store with AES-256-GCM encryption.
  * Uses scoped_secrets table keyed by (org_id, scope, key).
@@ -278,6 +318,79 @@ export class PgSecretStore implements SecretStore {
   ): string {
     const aad = `${orgId}:${scope}:${key}`;
     return this.decryptWithFallback({ data: encryptedValue, keyVersion }, aad);
+  }
+
+  /** Whether the configured keys decrypt `row` under its AAD. */
+  private decrypts(row: StoredSecretRow): boolean {
+    try {
+      this.decryptValue(row.org_id, row.scope, row.key, row.encrypted_value, row.key_version);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Every stored row the configured keys cannot decrypt, as its location only: a value
+   * stored as plaintext, or one encrypted under another key. One such row makes
+   * `rotateKey` fail for the whole install and `renameScope` fail for its scope. The scope
+   * sentinel rows count too, because rotation decrypts them as well.
+   */
+  async findUndecryptable(pageSize = 500): Promise<SecretLocation[]> {
+    const found: SecretLocation[] = [];
+    // fails-when: an install with more rows than one page lists only the first page
+    for await (const rows of this.storedRowPages(pageSize)) {
+      for (const row of rows) {
+        if (!this.decrypts(row)) found.push({ orgId: row.org_id, scope: row.scope, key: row.key });
+      }
+    }
+    return found;
+  }
+
+  /**
+   * Every `scoped_secrets` row, in keyset pages in (org_id, scope, key) order, so a large
+   * install never holds every ciphertext in memory at once.
+   */
+  private async *storedRowPages(pageSize: number): AsyncGenerator<StoredSecretRow[]> {
+    let after: StoredSecretRow | undefined;
+    for (;;) {
+      let query = this.db
+        .selectFrom('scoped_secrets')
+        .select(['org_id', 'scope', 'key', 'encrypted_value', 'key_version'])
+        .orderBy('org_id')
+        .orderBy('scope')
+        .orderBy('key')
+        .limit(pageSize);
+      if (after) {
+        const { org_id, scope, key } = after;
+        query = query.where(sql<boolean>`(org_id, scope, key) > (${org_id}, ${scope}, ${key})`);
+      }
+      const rows = await query.execute();
+      yield rows;
+      if (rows.length < pageSize) return;
+      after = rows.at(-1);
+    }
+  }
+
+  /**
+   * What the stored secrets say about the configured keys, read from every stored row:
+   * {@link StoredKeyCheck.Match} when one decrypts, {@link StoredKeyCheck.Mismatch} when
+   * ciphertext is stored and none of it decrypts, and {@link StoredKeyCheck.Unconfirmed} when
+   * no stored row is ciphertext (an empty store, or one holding only the legacy plaintext rows
+   * the old direct write left). It stops at the first row that decrypts.
+   */
+  async checkKeyAgainstStoredSecrets(pageSize = 500): Promise<StoredKeyCheck> {
+    let sawCiphertext = false;
+    // fails-when: only a sample is read, so a store whose sampled rows are all plaintext
+    //   reads as Unconfirmed while older ciphertext refutes the key
+    for await (const rows of this.storedRowPages(pageSize)) {
+      for (const row of rows) {
+        if (this.decrypts(row)) return StoredKeyCheck.Match;
+        sawCiphertext ||= looksLikeCiphertext(row.encrypted_value);
+      }
+    }
+    // breaks-if-wrong: an install whose secrets are all legacy plaintext accepts the right key
+    return sawCiphertext ? StoredKeyCheck.Mismatch : StoredKeyCheck.Unconfirmed;
   }
 
   // ── Scope CRUD ──────────────────────────────────────────────────

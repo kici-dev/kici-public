@@ -9,6 +9,8 @@ import { displayDryRun } from '../test-runner/dry-run.js';
 import { loadSecretsFile, type ParsedSecrets } from '../test-runner/secrets-file.js';
 import type { Workflow } from '@kici-dev/sdk';
 import { parseEventArg } from '../test-runner/event-types.js';
+import type { GitTagMode } from '../remote/shipped-git/git-ship-types.js';
+import type { RemoteGitCliFlags } from './remote-git-flags.js';
 
 export interface PreviewOptions extends PayloadOptions {
   workflow?: string;
@@ -57,13 +59,41 @@ export interface RemoteRunOptions extends PreviewOptions {
   /** `--target-allow-empty`: a target that zeroes a runsOnAll job skips it instead of failing. */
   targetAllowEmpty?: boolean;
   /**
-   * `--approve-all` (alias `--yes`): auto-approve every gate of the run this
-   * invocation dispatched. The operator must still be clause-eligible per hold;
-   * an ineligible hold blocks.
+   * `--approve-all` (`--yes`): auto-approve every gate of the dispatched run. The operator must
+   * still be clause-eligible per hold; an ineligible hold blocks.
    */
   approveAll?: boolean;
   /** `--input KEY=VALUE` values (repeatable): typed workflow-dispatch inputs. */
   inputs?: string[];
+  /** Flags shaping the remote `.git`; absent: the jobs' depth and tags, a synthetic commit, no tag. */
+  git?: RemoteGitCliFlags;
+}
+
+/** What the overlay of a remote run carried. */
+export interface OverlayReport {
+  compressedSize: number;
+  fileCount: number;
+  /** Absent when no `.git` shipped. */
+  git?: {
+    /** Commits of history the CLI asked for; 0 = full history. */
+    depth: number;
+    /** The tag policy the CLI asked for. */
+    tags: GitTagMode;
+    /**
+     * The history that really shipped (0 = full history). A shallow local repository can make
+     * it shallower than `depth`: a smaller number, or a positive one when `depth` is 0. `allTags`:
+     * every tag shipped.
+     */
+    shipped: { fetchDepth: number; allTags: boolean };
+    /** Whether the workspace commit is a synthetic commit of the uncommitted changes. */
+    synthetic: boolean;
+    /** The commit the remote workspace checks out. */
+    workspaceSha: string;
+    /** The developer's HEAD. */
+    baseSha: string;
+    /** Names of the synthetic tags created (from ShippedGit.createdTags). */
+    syntheticTags: string[];
+  };
 }
 
 export interface RemoteRunResult {
@@ -84,12 +114,11 @@ export interface RemoteRunResult {
     durationMs?: number;
     jobs: Array<{ name: string; status: string; durationMs?: number; workflowName?: string }>;
   }>;
+  /** Present once the overlay was built. */
+  overlay?: OverlayReport;
 }
 
-/**
- * `kici preview <event>`: a dry-run trigger preview that executes nothing. A
- * fixture-name argument prints a migration message.
- */
+/** `kici preview <event>`: a dry-run trigger preview; a fixture-name argument prints a migration message. */
 export async function previewCommand(
   event: string | undefined,
   options: PreviewOptions,

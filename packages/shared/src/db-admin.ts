@@ -3,6 +3,7 @@ import pg from 'pg';
 import type { MigrationProvider } from 'kysely/migration';
 import { createPool } from './db.js';
 import { depCacheKeyOf } from './dep-cache-key.js';
+import { isPgUndefinedTable } from './pg-errors.js';
 
 /**
  * DB-operation helpers shared by `kici-admin` (orchestrator DB) and
@@ -136,6 +137,60 @@ export async function ensureDatabase(
   });
 }
 
+/**
+ * Session settings that keep a password-bearing statement out of the server
+ * log and the statement statistics. `CREATE` / `ALTER ROLE … PASSWORD
+ * '<literal>'` is logged verbatim under `log_statement: ddl` (Spilo's
+ * default), and `log_min_duration_statement` (a slow write) or
+ * `log_min_error_statement` (a failed one) would log it too. A failure inside
+ * a `DO` block's `EXECUTE` quotes the statement in the error's own `CONTEXT`
+ * line, which `log_min_error_statement` does not cover: `log_error_verbosity`
+ * `terse` drops it and keeps the `ERROR` line.
+ * `pg_stat_statements` keeps a utility statement's text with the literal
+ * unnormalised, readable by any `pg_read_all_stats` member (`pg_monitor`), and
+ * `pgaudit` logs role DDL. All are superuser-only; setting the two module
+ * parameters when the module is not loaded creates a harmless placeholder. This
+ * is the suppression Patroni applies to its own role writes.
+ */
+export const QUIET_STATEMENT_SETTINGS: ReadonlyArray<readonly [string, string]> = [
+  ['log_statement', 'none'],
+  ['log_min_duration_statement', '-1'],
+  ['log_min_error_statement', 'panic'],
+  ['log_error_verbosity', 'terse'],
+  ['pg_stat_statements.track_utility', 'off'],
+  ['pgaudit.log', 'none'],
+];
+
+/**
+ * Run one role-password statement on its own connection. A superuser session
+ * runs it in a transaction with `QUIET_STATEMENT_SETTINGS` set locally, so the
+ * password never reaches the server log. Any other role cannot change those
+ * settings, so its statement is logged as the server's own settings decide.
+ */
+async function runRolePasswordStatement(pool: pg.Pool, statement: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    const su = await client.query("SELECT current_setting('is_superuser') = 'on' AS su");
+    if (su.rows[0]?.su !== true) {
+      await client.query(statement);
+      return;
+    }
+    await client.query('BEGIN');
+    try {
+      for (const [name, value] of QUIET_STATEMENT_SETTINGS) {
+        await client.query(`SET LOCAL ${name} = '${value}'`);
+      }
+      await client.query(statement);
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    }
+  } finally {
+    client.release();
+  }
+}
+
 /** CREATE ROLE ... LOGIN [CREATEDB]; an existing role gets the new password. */
 export async function createDbRole(
   adminUrl: string,
@@ -147,10 +202,13 @@ export async function createDbRole(
     const pw = escapeSqlLiteral(opts.password);
     if (exists.rows.length === 0) {
       const createDbClause = opts.createDb ? ' CREATEDB' : '';
-      await pool.query(`CREATE ROLE "${opts.username}" LOGIN${createDbClause} PASSWORD '${pw}'`);
+      await runRolePasswordStatement(
+        pool,
+        `CREATE ROLE "${opts.username}" LOGIN${createDbClause} PASSWORD '${pw}'`,
+      );
       return 'created';
     }
-    await pool.query(`ALTER ROLE "${opts.username}" PASSWORD '${pw}'`);
+    await runRolePasswordStatement(pool, `ALTER ROLE "${opts.username}" PASSWORD '${pw}'`);
     return 'updated';
   });
 }
@@ -173,10 +231,10 @@ export async function createReadOnlyDbUser(
     const pw = escapeSqlLiteral(opts.password);
     let outcome: 'created' | 'updated';
     if (exists.rows.length === 0) {
-      await pool.query(`CREATE ROLE "${opts.username}" LOGIN PASSWORD '${pw}'`);
+      await runRolePasswordStatement(pool, `CREATE ROLE "${opts.username}" LOGIN PASSWORD '${pw}'`);
       outcome = 'created';
     } else {
-      await pool.query(`ALTER ROLE "${opts.username}" PASSWORD '${pw}'`);
+      await runRolePasswordStatement(pool, `ALTER ROLE "${opts.username}" PASSWORD '${pw}'`);
       outcome = 'updated';
     }
     await pool.query(`GRANT CONNECT ON DATABASE "${dbName}" TO "${opts.username}"`);
@@ -953,38 +1011,6 @@ export async function createContextTemplateDirect(
   }
 }
 
-export interface SetContextSecretOpts {
-  orgId: string;
-  context: string;
-  key: string;
-  encryptedValue: string;
-}
-
-/** Upsert a context-scoped secret, written verbatim: the caller encrypts it. */
-export async function setContextSecretDirect(
-  databaseUrl: string,
-  opts: SetContextSecretOpts,
-): Promise<{ inserted: boolean }> {
-  if (!opts.orgId) throw new Error('context: orgId required');
-  if (!opts.context) throw new Error('context: context name required');
-  if (!opts.key) throw new Error('context: key required');
-  const pool = new pg.Pool({ connectionString: databaseUrl, max: 1 });
-  try {
-    const result = await pool.query<{ inserted: boolean }>(
-      `INSERT INTO scoped_secrets (org_id, scope, key, encrypted_value)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (org_id, scope, key) DO UPDATE SET
-           encrypted_value = EXCLUDED.encrypted_value,
-           updated_at = now()
-         RETURNING (xmax = 0) AS inserted`,
-      [opts.orgId, opts.context, opts.key, opts.encryptedValue],
-    );
-    return { inserted: result.rows[0]?.inserted ?? false };
-  } finally {
-    await pool.end();
-  }
-}
-
 // ── queue + execution read ops ─────────────────────────────────────────
 
 export interface DispatchQueueRow {
@@ -1677,10 +1703,9 @@ export interface SchemaStatus {
   reason?: string;
   /** Migrations the provider carries that the database has not applied. */
   pending?: string[];
+  /** Applied migrations the provider does not carry (`unknown-applied` only). */
+  unknown?: string[];
 }
-
-/** PostgreSQL's `undefined_table` SQLSTATE. */
-const UNDEFINED_TABLE = '42P01';
 
 /**
  * Compare the applied ledger and the stored content hash against `provider`.
@@ -1705,7 +1730,7 @@ export async function isSchemaCurrent(
     );
     applied = result.rows.map((r) => r.name);
   } catch (err) {
-    if ((err as { code?: string }).code !== UNDEFINED_TABLE) throw err;
+    if (!isPgUndefinedTable(err)) throw err;
     return {
       current: false,
       kind: SchemaStatusKind.Missing,
@@ -1726,6 +1751,7 @@ export async function isSchemaCurrent(
         applied.length !== expected.length
           ? countReason
           : `migration names mismatch (unknown applied: ${unknown.join(', ')})`,
+      unknown,
     };
   }
   if (pending.length > 0) {

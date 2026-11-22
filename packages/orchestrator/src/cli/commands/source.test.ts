@@ -118,6 +118,116 @@ describe('kici-admin source add github', () => {
     expect(httpUsed).toBe(false);
     expect(stderr).toMatch(/both the private key and the webhook secret from stdin/);
   });
+
+  /** A client that records every call; any call at all fails the refusal tests. */
+  function recordingClient(): { client: Partial<AdminApiClient>; calls: string[] } {
+    const calls: string[] = [];
+    const record = (async (path: string) => {
+      calls.push(path);
+      return {};
+    }) as never;
+    return { client: { get: record, post: record }, calls };
+  }
+
+  it.each([
+    'http://ghe.corp.example',
+    'https://ghe.corp.example/path',
+    'https://acme.ghe.com',
+    'github.com',
+  ])('refuses --github-url %s before the pre-flight call', async (githubUrl) => {
+    const { client, calls } = recordingClient();
+    const { exitCode, stderr } = await runCommand(
+      [
+        'source',
+        'add',
+        'github',
+        '--name',
+        'n',
+        '--manifest',
+        '--no-browser',
+        '--github-url',
+        githubUrl,
+      ],
+      client,
+    );
+    // fails-when: the value is checked only after the orchestrator was asked anything
+    expect(exitCode).toBe(1);
+    expect(stderr).toMatch(/--github-url/);
+    expect(calls).toEqual([]);
+  });
+
+  /** `source add github --manifest --no-browser --github-url <value>`. */
+  function manifestArgs(githubUrl: string): string[] {
+    return [
+      'source',
+      'add',
+      'github',
+      '--name',
+      'n',
+      '--manifest',
+      '--no-browser',
+      '--github-url',
+      githubUrl,
+    ];
+  }
+
+  // fails-when: --manifest refuses a GitHub Enterprise Server URL instead of creating the App there
+  // breaks-if-wrong: an explicit --github-url naming github.com is the default host and
+  //   must reach the manifest flow (here: its first orchestrator calls)
+  it.each([
+    'https://github.com',
+    'https://github.com/',
+    ' https://GitHub.com ',
+    'https://ghe.corp.example',
+    'https://GHE.corp.example:8443/',
+  ])('accepts --github-url %j and proceeds to the orchestrator', async (githubUrl) => {
+    const { client, calls } = recordingClient();
+    const { stderr } = await runCommand(manifestArgs(githubUrl), client);
+    expect(stderr).not.toContain('GitHub Enterprise Server');
+    expect(calls).toContain('/api/v1/admin/sources/github-webhook-url');
+  });
+
+  it('lists --github-url in the help as the App server', () => {
+    const program = new Command();
+    registerSourceCommands(program, () => ({}) as AdminApiClient);
+    const github = program.commands
+      .find((c) => c.name() === 'source')!
+      .commands.find((c) => c.name() === 'add')!
+      .commands.find((c) => c.name() === 'github')!;
+    const stdout = github.helpInformation();
+    expect(stdout).toContain('--github-url <url>');
+    expect(stdout.replace(/\s+/g, ' ')).toContain('set it for GitHub Enterprise Server');
+  });
+
+  /** Run `source add github --app-id 1` with `extra` and return the POSTed body. */
+  async function postedBody(extra: string[]): Promise<Record<string, unknown> | undefined> {
+    let posted: Record<string, unknown> | undefined;
+    const client: Partial<AdminApiClient> = {
+      post: (async (_path: string, body: Record<string, unknown>) => {
+        posted = body;
+        return { routingKey: 'github:1', id: 's1', name: 'n', webhookUrl: null };
+      }) as never,
+    };
+    const args = ['source', 'add', 'github', '--name', 'n', '--app-id', '1'];
+    await runCommand([...args, '--private-key', 'pem', ...extra], client);
+    return posted;
+  }
+
+  it('posts the server of an App added with --app-id', async () => {
+    // fails-when: a GitHub Enterprise Server App added with --app-id is stored as a
+    //   github.com source
+    expect(await postedBody(['--github-url', 'https://GHE.corp.example/'])).toMatchObject({
+      appId: '1',
+      githubUrl: 'https://ghe.corp.example',
+    });
+  });
+
+  it('posts no server for github.com', async () => {
+    // breaks-if-wrong: a github.com add posts today's body
+    for (const extra of [[], ['--github-url', 'https://github.com']]) {
+      expect(await postedBody(extra)).not.toHaveProperty('githubUrl');
+    }
+  });
 });
 
 describe('kici-admin source list --json', () => {
@@ -204,6 +314,21 @@ describe('kici-admin source list (text)', () => {
       clientWith([{ ...row, ingressUrl: 'https://ci.example.com/webhook/org-a/github/s1' }]),
     );
     expect(stdout).toContain('ingress: https://ci.example.com/webhook/org-a/github/s1');
+  });
+
+  it('prints the server of a GitHub Enterprise Server source', async () => {
+    const ghes = { ...row, githubUrl: 'https://ghe.corp.example' };
+    const { stdout } = await runCommand(['source', 'list'], clientWith([ghes]));
+    expect(stdout).toContain('    server: https://ghe.corp.example');
+    // fails-when: a config.githubUrl (an older peer can store one) prints as the server
+    const planted = { ...row, config: { appId: '42', githubUrl: 'https://evil.example' } };
+    expect((await runCommand(['source', 'list'], clientWith([planted]))).stdout).not.toContain(
+      'server:',
+    );
+    // breaks-if-wrong: a github.com source prints no server line
+    expect((await runCommand(['source', 'list'], clientWith([row]))).stdout).not.toContain(
+      'server:',
+    );
   });
 
   // breaks-if-wrong: a null or absent field (platform mode, an older orchestrator)
@@ -298,6 +423,52 @@ describe('kici-admin source add generic --provider-type', () => {
     expect(exitCode).toBeNull();
     expect(received).toHaveLength(1);
     expect(received[0].providerType).toBe('local');
+  });
+});
+
+describe('kici-admin source update --github-url', () => {
+  async function patchedBody(value: string): Promise<CommandResult & { bodies: unknown[] }> {
+    const bodies: unknown[] = [];
+    const client: Partial<AdminApiClient> = {
+      patch: async <T>(_path: string, body: unknown): Promise<T> => {
+        bodies.push(body);
+        return { routingKey: 'github:42' } as unknown as T;
+      },
+    };
+    const result = await runCommand(
+      ['source', 'update', 'github:42', '--github-url', value],
+      client,
+    );
+    return { ...result, bodies };
+  }
+
+  it('sends the server origin', async () => {
+    const { bodies } = await patchedBody('https://ghe.corp.example:8443/');
+    expect(bodies).toEqual([{ githubUrl: 'https://ghe.corp.example:8443' }]);
+  });
+
+  it.each(['https://github.com', 'https://GitHub.com/'])('resets with %s', async (value) => {
+    const { bodies } = await patchedBody(value);
+    expect(bodies).toEqual([{ githubUrl: null }]);
+  });
+
+  // fails-when: update accepts a value that source add github refuses
+  it.each(['github.com', 'GitHub.com', 'ghe.corp.example'])(
+    'refuses %s without a scheme, as source add github does',
+    async (value) => {
+      const { bodies, exitCode, stderr } = await patchedBody(value);
+      expect(exitCode).toBe(1);
+      expect(stderr).toContain('--github-url must be the https:// web URL');
+      expect(bodies).toEqual([]);
+    },
+  );
+
+  it('refuses an invalid value before calling the orchestrator', async () => {
+    const { bodies, exitCode, stderr } = await patchedBody('https://api.github.com');
+    // fails-when: an unvalidated value is sent to the orchestrator
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('--github-url takes the web URL');
+    expect(bodies).toEqual([]);
   });
 });
 
@@ -650,6 +821,21 @@ describe('kici-admin source --database-url dispatch (bypasses HTTP client)', () 
       '--database-url',
       'postgresql://127.0.0.1:1/none',
     ]);
+    expect(httpUsed).toBe(false);
+    expect(exitCode).toBe(1);
+  });
+
+  it('rejects a GitHub server update in --database-url mode before touching the DB', async () => {
+    const { httpUsed, exitCode } = await runDirect([
+      'source',
+      'update',
+      'github:1',
+      '--github-url',
+      'https://ghe.corp.example',
+      '--database-url',
+      'postgresql://127.0.0.1:1/none',
+    ]);
+    // fails-when: a new server is written without validating the App there
     expect(httpUsed).toBe(false);
     expect(exitCode).toBe(1);
   });

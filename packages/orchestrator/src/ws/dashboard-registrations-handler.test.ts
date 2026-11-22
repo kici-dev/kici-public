@@ -713,8 +713,16 @@ describe('DashboardRegistrationsHandler', () => {
   });
 
   describe('source enrichment', () => {
+    let lastSourcesChain: { select: ReturnType<typeof vi.fn> } | undefined;
+
     function makeListMockDb(opts: {
-      sources?: Array<{ routing_key: string; name: string; provider: string }>;
+      sources?: Array<{
+        routing_key: string;
+        name: string;
+        provider: string;
+        config?: Record<string, unknown>;
+        github_url?: string | null;
+      }>;
       genericSources?: Array<{
         routing_key: string;
         name: string;
@@ -752,6 +760,7 @@ describe('DashboardRegistrationsHandler', () => {
           updated_at: new Date('2026-01-01'),
         }),
       };
+      lastSourcesChain = sourcesChain;
       return vi.fn().mockImplementation((table: string) => {
         if (table === 'sources') return sourcesChain;
         if (table === 'generic_webhook_sources') return genericChain;
@@ -767,7 +776,14 @@ describe('DashboardRegistrationsHandler', () => {
         makeRegistrationRow({ routing_key: 'github:42' }),
       ]);
       db.selectFrom = makeListMockDb({
-        sources: [{ routing_key: 'github:42', name: 'Test App', provider: 'github' }],
+        sources: [
+          {
+            routing_key: 'github:42',
+            name: 'Test App',
+            provider: 'github',
+            config: { appId: '42' },
+          },
+        ],
       });
 
       await handler.handle({
@@ -781,6 +797,113 @@ describe('DashboardRegistrationsHandler', () => {
         name: 'Test App',
         subtype: 'github_app',
         provider: 'github',
+      });
+    });
+
+    it("a GHES source's registrations carry its webUrl", async () => {
+      registrationStore.getAll.mockResolvedValue([
+        makeRegistrationRow({ routing_key: 'github:42' }),
+      ]);
+      db.selectFrom = makeListMockDb({
+        sources: [
+          {
+            routing_key: 'github:42',
+            name: 'GHE App',
+            provider: 'github',
+            github_url: 'https://ghe.corp.example',
+          },
+        ],
+      });
+
+      await handler.handle({
+        type: 'dashboard.registrations.list',
+        requestId: 'req-ghes',
+        actor: { type: 'user' as const, sub: 'zsub-test' },
+      });
+
+      // The server is read from the github_url column, which the query must select.
+      expect(lastSourcesChain?.select).toHaveBeenCalledWith(expect.arrayContaining(['github_url']));
+      // fails-when: a GHES registration's workflow link goes to github.com
+      expect(send.mock.calls[0][0].registrations[0].source).toEqual({
+        routingKey: 'github:42',
+        name: 'GHE App',
+        subtype: 'github_app',
+        provider: 'github',
+        webUrl: 'https://ghe.corp.example',
+      });
+    });
+
+    it("a github.com source's registrations carry no webUrl key", async () => {
+      registrationStore.getAll.mockResolvedValue([
+        makeRegistrationRow({ routing_key: 'github:42' }),
+        makeRegistrationRow({ id: 'reg-2', routing_key: 'github:43' }),
+        makeRegistrationRow({ id: 'reg-3', routing_key: 'github:44' }),
+      ]);
+      db.selectFrom = makeListMockDb({
+        sources: [
+          { routing_key: 'github:42', name: 'A', provider: 'github', github_url: null },
+          // A stored default server reads as github.com.
+          {
+            routing_key: 'github:43',
+            name: 'B',
+            provider: 'github',
+            github_url: 'https://github.com',
+          },
+          // A config.githubUrl (an older peer can store one) is never read.
+          {
+            routing_key: 'github:44',
+            name: 'C',
+            provider: 'github',
+            config: { appId: '44', githubUrl: 'https://ghe.corp.example' },
+            github_url: null,
+          },
+        ],
+      });
+
+      await handler.handle({
+        type: 'dashboard.registrations.list',
+        requestId: 'req-dotcom',
+        actor: { type: 'user' as const, sub: 'zsub-test' },
+      });
+
+      // breaks-if-wrong: a github.com registration's source is byte-for-byte unchanged
+      const registrations = send.mock.calls[0][0].registrations;
+      expect(registrations).toHaveLength(3);
+      for (const reg of registrations) {
+        expect(reg.source).not.toHaveProperty('webUrl');
+        expect(reg.source).not.toHaveProperty('refused');
+      }
+    });
+
+    it('a refused source still enriches, marked refused and naming no server', async () => {
+      registrationStore.getAll.mockResolvedValue([
+        makeRegistrationRow({ routing_key: 'github:42' }),
+      ]);
+      db.selectFrom = makeListMockDb({
+        sources: [
+          {
+            routing_key: 'github:42',
+            name: 'Odd App',
+            provider: 'github',
+            github_url: 'http://evil.example/x',
+          },
+        ],
+      });
+
+      await handler.handle({
+        type: 'dashboard.registrations.list',
+        requestId: 'req-odd',
+        actor: { type: 'user' as const, sub: 'zsub-test' },
+      });
+
+      // fails-when: the refused source reads as github.com, so the dashboard links there
+      // breaks-if-wrong: one refused source must not drop its name and subtype
+      expect(send.mock.calls[0][0].registrations[0].source).toEqual({
+        routingKey: 'github:42',
+        name: 'Odd App',
+        subtype: 'github_app',
+        provider: 'github',
+        refused: true,
       });
     });
 
@@ -885,7 +1008,14 @@ describe('DashboardRegistrationsHandler', () => {
         makeRegistrationRow({ routing_key: 'github:42' }),
       ]);
       db.selectFrom = makeListMockDb({
-        sources: [{ routing_key: 'github:42', name: 'Native App', provider: 'github' }],
+        sources: [
+          {
+            routing_key: 'github:42',
+            name: 'Native App',
+            provider: 'github',
+            config: { appId: '42' },
+          },
+        ],
         genericSources: [
           {
             routing_key: 'github:42',

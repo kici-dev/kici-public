@@ -121,6 +121,26 @@ describe('ProviderRegistry', () => {
     });
   });
 
+  describe('githubSourceOf', () => {
+    it("names the server of exactly the key's own GitHub bundle, and no source when it is gone", () => {
+      const registry = new ProviderRegistry();
+      registry.registerByRoutingKey(
+        'github:7',
+        createMockBundle({ githubUrl: 'https://ghe.corp.example' }),
+      );
+      registry.registerByRoutingKey('github:1', createMockBundle());
+      registry.register('github', createMockBundle({ githubUrl: 'https://default.example' }));
+
+      expect(registry.githubSourceOf('github:7')).toEqual({
+        githubUrl: 'https://ghe.corp.example',
+      });
+      // breaks-if-wrong: a github.com source is a live source that names no server
+      expect(registry.githubSourceOf('github:1')).toEqual({});
+      // fails-when: a removed source reads as a github.com source, or borrows the default's server
+      expect(registry.githubSourceOf('github:999')).toBeUndefined();
+    });
+  });
+
   describe('getRoutingKeys', () => {
     it('returns all registered routing keys', () => {
       const registry = new ProviderRegistry();

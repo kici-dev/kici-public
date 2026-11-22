@@ -9,6 +9,13 @@ export const authRequestSchema = z.object({
   token: z.string().min(1),
   protocolVersion: z.number().int().positive(),
   capabilities: orchCapabilitiesSchema,
+  /**
+   * The sender's release (`0.30.0-4512`). Optional: older releases send none. Any value parses,
+   * as it did before the field existed, so no value can refuse a handshake. A reader uses it only
+   * when it is a string of at most `COMPONENT_VERSION_MAX_LENGTH` characters that matches
+   * `RELEASE_VERSION_PATTERN` (`readComponentVersion`), and treats anything else as absent.
+   */
+  componentVersion: z.unknown().optional(),
 });
 
 /** Auth success response sent by Platform to orchestrator. */
@@ -42,6 +49,14 @@ export const authSuccessSchema = z.object({
    * handshake.
    */
   dashboardUrl: z.string().optional(),
+  /**
+   * The headless GitHub App manifest page this Platform serves, when it serves
+   * one. Absent otherwise. `kici-admin source add github --manifest
+   * --no-browser` reads it through the orchestrator's manifest pre-flight and
+   * prints it in place of the default page. A plain string, like
+   * `dashboardUrl`, so an odd value never refuses the handshake.
+   */
+  githubManifestCallbackUrl: z.string().optional(),
 });
 
 /** Auth failure response sent by Platform to orchestrator when authentication fails. */

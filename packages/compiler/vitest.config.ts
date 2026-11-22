@@ -4,6 +4,9 @@ import path from 'node:path';
 
 export default defineConfig({
   test: {
+    // The public mirror's CI sets CI=true, which turns colored output on.
+    // Match it so an assertion on plain text fails here when the output is colored.
+    env: { CI: 'true' },
     include: ['src/**/*.test.ts'],
     // Several compileFixtures tests do real ESM compilation via the SDK,
     // which can take >5s under heavy parallel load (e.g. `pnpm -r test`).

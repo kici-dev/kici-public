@@ -17,11 +17,14 @@
 import { randomUUID } from 'node:crypto';
 import { AdminApiClient } from '@kici-dev/orchestrator';
 import { EventLogStatus, sleep } from '@kici-dev/engine';
+import {
+  ReadRetryExhaustedError,
+  readWithRetry,
+  type ReadRetryOptions,
+} from '../remote/read-retry.js';
+import { PLANE_READ_ERRORS, withReadDeadline, type PlaneReadClient } from './plane-read-errors.js';
 
-/** AdminApiClient.get subset, injectable for tests. */
-export interface RunDiscoveryClient {
-  get<T>(path: string): Promise<T>;
-}
+export type RunDiscoveryClient = PlaneReadClient;
 
 export interface LocalTriggerInput {
   orgId: string;
@@ -130,6 +133,10 @@ export interface TriggerRunOptions {
   logPath?: string;
   /** Wait for more runs once the delivery is recorded. Default 5 s. */
   settleMs?: number;
+  /** Retry for the runs-list read; a transient failure is retried up to the budget. */
+  readRetry?: ReadRetryOptions;
+  /** Deadline of each plane read; defaults to `READ_REQUEST_TIMEOUT_MS`. */
+  readTimeoutMs?: number;
 }
 
 interface ClusterHealthResponse {
@@ -241,7 +248,9 @@ export async function triggerRuns(
   input: LocalTriggerInput,
   opts: TriggerRunOptions = {},
 ): Promise<LocalTriggeredRun[]> {
-  const client: RunDiscoveryClient = opts.client ?? new AdminApiClient(planeUrl, adminToken);
+  const client = withReadDeadline(opts.client ?? new AdminApiClient(planeUrl, adminToken), {
+    timeoutMs: opts.readTimeoutMs,
+  });
   const pollIntervalMs = opts.pollIntervalMs ?? 750;
   const resendAfterMs = opts.resendAfterMs ?? 8_000;
   const timeoutMs = opts.timeoutMs ?? 60_000;
@@ -260,7 +269,7 @@ export async function triggerRuns(
   let deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (deliveryId) {
-      const runs = await findRunsByDelivery(client, deliveryId);
+      const runs = await findRunsWithRetry(client, deliveryId, opts.readRetry);
       if (runs.length > 0) {
         if (found.length === 0) deadline = Date.now() + timeoutMs;
         found = runs;
@@ -298,6 +307,27 @@ export async function triggerRuns(
     ...(opts.logPath !== undefined && { logPath: opts.logPath }),
   });
   throw new Error(`offline run: ${cause}`);
+}
+
+/** {@link findRunsByDelivery}, retrying a transient failure; names the delivery when it gives up. */
+async function findRunsWithRetry(
+  client: RunDiscoveryClient,
+  deliveryId: string,
+  retry: ReadRetryOptions | undefined,
+): Promise<LocalTriggeredRun[]> {
+  try {
+    return await readWithRetry(() => findRunsByDelivery(client, deliveryId), {
+      ...PLANE_READ_ERRORS,
+      ...retry,
+    });
+  } catch (err) {
+    if (!(err instanceof ReadRetryExhaustedError)) throw err;
+    throw new Error(
+      `offline run: lost contact with the local plane while looking up the runs of ` +
+        `delivery ${deliveryId}: its admin API ${err.message}`,
+      { cause: err },
+    );
+  }
 }
 
 /** The delivery's runs, oldest first: the order the plane dispatched the workflows in. */

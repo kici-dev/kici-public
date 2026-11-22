@@ -295,6 +295,7 @@ async function initializeWorkerScaler(
       instanceId: config.cluster.instanceId,
     },
     onScalerEvent,
+    revokeAgentTokens: (agentId) => tokenStore.revokeEphemeralForAgent(agentId),
     // The worker has no DB; the spawn deadline is the cluster-wide default.
     spawnTimeoutMs: config.scalerSpawnTimeoutMs,
     // The reloaded config, not the boot-time one — see orchestrator-core.
@@ -389,11 +390,15 @@ function buildWorkerOnDispatch(
     // No DB lookup needed -- just forward to the agent.
     entry.ws.send(
       JSON.stringify(
-        buildWorkerDispatchMessage(job, {
-          messageId: randomUUID(),
-          timestamp: Date.now(),
-          concurrencyWaitTimeoutMs: concurrencyWaitTimeoutMs(),
-        }),
+        buildWorkerDispatchMessage(
+          job,
+          {
+            messageId: randomUUID(),
+            timestamp: Date.now(),
+            concurrencyWaitTimeoutMs: concurrencyWaitTimeoutMs(),
+          },
+          entry,
+        ),
       ),
     );
     onDelivered(job.id);

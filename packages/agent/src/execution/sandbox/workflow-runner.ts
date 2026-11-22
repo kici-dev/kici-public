@@ -29,6 +29,7 @@ import {
   LogStream,
   TimeoutReason,
   repoIdentifierFromUrl,
+  describeHistoryGap,
 } from '@kici-dev/engine';
 import type { ChangedFilesStatus } from '@kici-dev/engine';
 import { computeChangedFiles } from '../../checkout/changed-files.js';
@@ -126,6 +127,7 @@ import { expandInitDirectives } from '../env-init/presets/expand.js';
 import { armJobDeadline } from './job-deadline.js';
 import { executeHook, buildOutcomeMetadata } from '../hook-executor.js';
 import { cloneJobRepos, type CloneJobReposRequest } from '../../checkout/clone-job-repos.js';
+import { SourceRestoreOrder, sourceRestoreOrder } from './source-restore-order.js';
 import { excludeScratchFromGit } from '../dep-restore.js';
 import { tryRestoreDeps } from '../dep-restore-fallback.js';
 import { redactUrl } from '../resumable-download.js';
@@ -885,15 +887,6 @@ async function relayProvenanceIpc(
 }
 
 /**
- * `owner/repo` for a deferred statement's `externalParameters.workflow.repository`;
- * the live path reads it from the minted token claim, which the deferred path lacks.
- */
-function extractRepoIdentifier(repoUrl: string): string {
-  const match = repoUrl.match(/(?:github|gitlab|bitbucket)\.\w+\/([^/]+\/[^/.]+)/);
-  return match ? match[1] : 'unknown/unknown';
-}
-
-/**
  * The context a deferred attestation's frozen statement is built from.
  *
  * Prefers the orchestrator's `provenanceContext`: server truth from the run row the
@@ -908,7 +901,7 @@ function extractRepoIdentifier(repoUrl: string): string {
  * and the defer is dropped: a green job with no attestation, never an unchecked
  * statement the orchestrator signs.
  */
-function buildLocalContext(request: JobExecutionRequest): LocalBuildContext {
+export function buildLocalContext(request: JobExecutionRequest): LocalBuildContext {
   const ctx = request.provenanceContext;
   if (ctx) {
     return {
@@ -926,7 +919,9 @@ function buildLocalContext(request: JobExecutionRequest): LocalBuildContext {
     };
   }
   return {
-    repository: extractRepoIdentifier(request.repoUrl),
+    // `owner/repo` of the clone URL, from any git host. The live path reads the
+    // repository from the minted token claim, which the deferred path lacks.
+    repository: repoIdentifierFromUrl(request.repoUrl),
     ref: request.ref,
     sha: request.sha || null,
     workflowRef: request.workflowRef ?? request.workflowName,
@@ -1665,6 +1660,9 @@ async function cloneRepoIfRequested(
 /**
  * Phase 1b — Apply the encrypted overlay tarball (test runs with uncommitted
  * changes); a global workflow's overlay targets the workflow repo (`.kici/`).
+ * A full-repo job that declares `checkout: false` takes only the overlay's
+ * `.kici/` entries, so it sees no `.git` and no repository files; any other
+ * full-repo job is warned when it asks for more history than the run shipped.
  */
 async function applyOverlayIfRequested(
   request: JobExecutionRequest,
@@ -1682,6 +1680,7 @@ async function applyOverlayIfRequested(
     cliPublicKey: request.cliPublicKey,
     orchestratorPrivateKey: request.orchestratorPrivateKey,
     repoDir: workflowDir,
+    ...(request.fullRepo && request.checkout === false && { onlyPathPrefix: '.kici/' as const }),
   });
   sendMessage({
     type: 'log.line',
@@ -1691,6 +1690,10 @@ async function applyOverlayIfRequested(
   trace(
     `overlay applied: ${overlayResult.filesApplied} files, ${overlayResult.filesDeleted} deletions`,
   );
+  if (request.fullRepo && request.checkout !== false) {
+    const gap = describeHistoryGap(request.checkoutOptions, overlayResult.git);
+    if (gap) sendMessage({ type: 'log.line', stepIndex: -1, line: gap });
+  }
 }
 
 /**
@@ -1818,6 +1821,41 @@ async function restoreSourceTarballIfRequested(
   });
   await restoreSource(workflowRoot, request.sourceTarUrl, request.sourceTarDigest);
   trace('source tarball restored');
+}
+
+/**
+ * Phases 1–2b — clone + overlay, deps, then the cached `.kici/` source. A
+ * `checkout: false` job with no `.kici/` yet also takes the cached source
+ * before deps (`sourceRestoreOrder`), so the deps phase sees its `package.json`.
+ */
+async function prepareWorkspace(
+  request: JobExecutionRequest,
+  dirs: { workDir: string; workflowDir: string; sourceDir: string; isGlobal: boolean },
+  send: (msg: RunnerToAgentMessage) => void,
+  onReport: (report: DepRestoreReport) => void,
+): Promise<void> {
+  const { workDir, workflowDir, sourceDir, isGlobal } = dirs;
+  // Phase 1: clone + overlay
+  await cloneRepoIfRequested(request, workDir, workflowDir, sourceDir, isGlobal);
+  await applyOverlayIfRequested(request, workflowDir);
+  await makeOverlayGitUsable(request, workflowDir);
+  if (aborted) abortAndExit('aborted after clone');
+
+  const restoreOrder = sourceRestoreOrder({
+    checkout: request.checkout,
+    sourceCached: Boolean(request.sourceTarUrl),
+    workspacePresent: existsSync(join(workflowDir, '.kici')),
+  });
+  if (restoreOrder === SourceRestoreOrder.enum['before-and-after-deps']) {
+    await restoreSourceTarballIfRequested(workflowDir, request);
+  }
+
+  // Phase 2: deps
+  await installDependenciesIfNeeded(workflowDir, request, send, onReport);
+  if (aborted) abortAndExit('aborted after deps');
+
+  // Phase 2b: cached .kici/ source
+  await restoreSourceTarballIfRequested(workflowDir, request);
 }
 
 /**
@@ -2760,18 +2798,12 @@ async function main(): Promise<void> {
   await runSetupThenSendDepRestoreReport(
     async (onReport) => {
       if (request.cleanupOnly) return;
-      // Phase 1: clone + overlay
-      await cloneRepoIfRequested(request, workDir, workflowDir, sourceDir, isGlobal);
-      await applyOverlayIfRequested(request, workflowDir);
-      await makeOverlayGitUsable(request, workflowDir);
-      if (aborted) abortAndExit('aborted after clone');
-
-      // Phase 2: deps
-      await installDependenciesIfNeeded(workflowDir, request, maskedSend, onReport);
-      if (aborted) abortAndExit('aborted after deps');
-
-      // Phase 2b: cached .kici/ source
-      await restoreSourceTarballIfRequested(workflowDir, request);
+      await prepareWorkspace(
+        request,
+        { workDir, workflowDir, sourceDir, isGlobal },
+        maskedSend,
+        onReport,
+      );
     },
     (report) => maskedSend({ type: 'dep-restore.report', ...(report && { report }) }),
   );

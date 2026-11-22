@@ -24,7 +24,10 @@ description = "Public-by-design placeholder/fixture content — no real secrets"
 paths = [
   # Unit-test fixtures embed fake tokens and keys by construction
   # (e.g. ghs_abc123xyz, "-----BEGIN RSA PRIVATE KEY-----\nfake").
-  '''.*\.test\.ts$''',
+  '''.*\.test\.tsx?$''',
+  # Component-test fixtures (`*.ct.fixtures.ts`) hold the same fake values for the
+  # component tests and their stories.
+  '''.*\.ct\.fixtures\.ts$''',
   # Runnable examples ship placeholder templates (REPLACE_ME_* etc.).
   '''(^|/)examples/.*''',
   # Operator/user/architecture docs illustrate config with placeholders

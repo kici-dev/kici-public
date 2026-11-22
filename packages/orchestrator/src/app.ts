@@ -123,7 +123,8 @@ import { createVerifyAttestationRoutes } from './routes/verify-attestation.js';
 import { createMetricsRoutes } from '@kici-dev/shared';
 import { createDiagnosticsRoutes } from './routes/diagnostics.js';
 import { createFleetRoutes } from './routes/fleet.js';
-import { processWebhook } from './pipeline/processor.js';
+import { processWebhook, resolveOrgId } from './pipeline/processor.js';
+import { createRepoInstallationResolver } from './registration/repo-installation.js';
 import type { ProcessingDeps } from './pipeline/processor.js';
 import type { InvokeGateDeps } from './pipeline/invoke-gate.js';
 import { WebhookIngestOutcome } from './pipeline/process-webhook.js';
@@ -364,6 +365,8 @@ export interface AppDependencies {
    * pre-flight (before any App exists). Passed into the admin source routes.
    */
   resolveGithubWebhookUrl?: AdminRouteDeps['resolveGithubWebhookUrl'];
+  /** The Platform's own headless manifest page. Passed into the admin source routes. */
+  resolveGithubManifestCallbackUrl?: AdminRouteDeps['resolveGithubManifestCallbackUrl'];
   /** Builds the direct-ingress URL for `source list`. Passed into the admin source routes. */
   resolveSourceIngressUrl?: AdminRouteDeps['resolveSourceIngressUrl'];
   /** Config admin API route dependencies. Optional -- mounted when config management is available. */
@@ -1726,6 +1729,7 @@ export function createApp(deps: AppDependencies) {
         accessLog: deps.accessLogWriter,
         resolveSourceWebhookUrl: deps.resolveSourceWebhookUrl,
         resolveGithubWebhookUrl: deps.resolveGithubWebhookUrl,
+        resolveGithubManifestCallbackUrl: deps.resolveGithubManifestCallbackUrl,
         resolveSourceIngressUrl: deps.resolveSourceIngressUrl,
         retryAttestations: deps.retryAttestations,
         globalWorkflowsEnabledDefault: deps.config.globalWorkflowsEnabled,
@@ -1804,6 +1808,14 @@ export function createApp(deps: AppDependencies) {
         tokenManager: deps.adminDeps.tokenManager,
         rbac: deps.adminDeps.rbac,
         ...(deps.contextStore && { contextStore: deps.contextStore }),
+        resolveOrgId: (routingKey) => resolveOrgId(deps.db, routingKey),
+        // Read at request time: the source store is attached after the app is built.
+        // With no store, a GitHub routing key is refused, not read as non-GitHub.
+        resolveRepoInstallation: (routingKey, repoIdentifier) =>
+          createRepoInstallationResolver(deps.adminDeps?.sourceStore ?? deps.githubSourceStore)(
+            routingKey,
+            repoIdentifier,
+          ),
       }),
     );
   }

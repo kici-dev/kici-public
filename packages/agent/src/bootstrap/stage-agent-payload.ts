@@ -14,11 +14,13 @@
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import path from 'node:path';
-import type { AgentPlatform } from '@kici-dev/shared';
+import { createLogger, type AgentPlatform } from '@kici-dev/shared';
 import { sshExec, sshPushFile, type SshDeps } from './ssh-exec.js';
 import type { HostReach } from './reach.js';
 import type { AgentPayloadSource } from './payload-source.js';
 import { shQuote } from '@kici-dev/core';
+
+const logger = createLogger({ prefix: 'stage-agent-payload' });
 
 /** `s3-direct` carries the sha256 the box verifies before extracting. */
 export type DeliveryMode =
@@ -154,7 +156,11 @@ async function stageS3Direct(
   }
 }
 
-/** Returns the launcher path the caller runs as the init-runner's `agentCommand`. */
+/**
+ * Returns the launcher path the caller runs as the init-runner's `agentCommand`.
+ * Logs the delivery mode per target before any transfer; the presigned URL is a
+ * credential and never reaches the log.
+ */
 export async function stageAgentPayload(
   reach: HostReach,
   privateKey: string,
@@ -162,6 +168,12 @@ export async function stageAgentPayload(
   deps: StageDeps,
 ): Promise<{ launcherPath: string }> {
   const extractDir = deps.extractDir ?? DEFAULT_EXTRACT_DIR;
+  logger.info(`Delivering agent payload to ${reach.agentId} via ${opts.delivery.mode}`, {
+    targetAgentId: reach.agentId,
+    deliveryMode: opts.delivery.mode,
+    platform: opts.platform,
+    version: opts.version,
+  });
   switch (opts.delivery.mode) {
     case 'ssh-push':
       await stageSshPush(reach, privateKey, opts, extractDir, deps);

@@ -82,12 +82,32 @@ function parseNameOnly(out: string): string[] {
     .filter((s) => s.length > 0);
 }
 
+/**
+ * Whether the clone holds truncated history. A job checked out at fetchDepth 0
+ * is a full clone: a `--depth` fetch there would make it shallow, so every
+ * fetch below drops `--depth` / `--deepen` for it. An unreadable answer counts
+ * as shallow, the agent's default clone.
+ */
+function isShallowRepository(workDir: string, ctx: GitAuthCtx): boolean {
+  try {
+    return git(workDir, ['rev-parse', '--is-shallow-repository'], ctx).trim() !== 'false';
+  } catch {
+    return true;
+  }
+}
+
 /** Ensure `commitish` exists locally; fetch / deepen (bounded) if not. */
 function ensureCommit(workDir: string, commitish: string, ctx: GitAuthCtx): boolean {
   if (tryGit(workDir, ['cat-file', '-e', `${commitish}^{commit}`], ctx)) return true;
-  if (tryGit(workDir, ['fetch', '--depth', '1', 'origin', commitish], ctx)) {
+  const shallow = isShallowRepository(workDir, ctx);
+  // fails-when: a full clone fetches the missing commit with --depth 1 and turns shallow
+  const fetchArgs = shallow
+    ? ['fetch', '--depth', '1', 'origin', commitish]
+    : ['fetch', 'origin', commitish];
+  if (tryGit(workDir, fetchArgs, ctx)) {
     if (tryGit(workDir, ['cat-file', '-e', `${commitish}^{commit}`], ctx)) return true;
   }
+  if (!shallow) return false;
   for (let i = 0; i < MAX_DEEPEN; i++) {
     if (!tryGit(workDir, ['fetch', `--deepen=${DEEPEN_STEP}`, 'origin'], ctx)) break;
     if (tryGit(workDir, ['cat-file', '-e', `${commitish}^{commit}`], ctx)) return true;
@@ -122,7 +142,8 @@ function twoDotDiff(
  */
 function prDiff(workDir: string, base: string, ctx: GitAuthCtx, head = 'HEAD'): ChangedFilesResult {
   if (!ensureCommit(workDir, head, ctx)) return { files: [], status: 'unavailable' };
-  // The clone is shallow and single-branch (`--depth` implies it), so the base
+  const shallow = isShallowRepository(workDir, ctx);
+  // The default clone is shallow and single-branch (`--depth` implies it), so the base
   // is usually absent. Fetch it into its own remote-tracking ref: a bare
   // `fetch origin <base>` lands only in FETCH_HEAD, which the next fetch
   // overwrites, and a FETCH_HEAD left by the clone's fetch of HEAD would diff
@@ -136,18 +157,25 @@ function prDiff(workDir: string, base: string, ctx: GitAuthCtx, head = 'HEAD'): 
   if (!baseRef) {
     // fails-when: a single-branch clone resolves no base and reports unavailable
     // breaks-if-wrong: a clone that already holds the base branch never fetches
-    tryGit(workDir, ['fetch', '--depth', '1', 'origin', baseSpec], ctx);
+    tryGit(
+      workDir,
+      shallow ? ['fetch', '--depth', '1', 'origin', baseSpec] : ['fetch', 'origin', baseSpec],
+      ctx,
+    );
     baseRef = resolveBase();
   }
   if (!baseRef) return { files: [], status: 'unavailable' };
   // Deepen (bounded) until a merge-base exists. Each round deepens both sides:
   // the base through its refspec (keeping the base ref current), `head`
-  // through its own commit.
+  // through its own commit. A full clone already holds every commit, so a
+  // missing merge-base there is final.
   for (let i = 0; i <= MAX_DEEPEN; i++) {
     if (tryGit(workDir, ['merge-base', baseRef, head], ctx)) {
       const out = git(workDir, ['diff', '--name-only', `${baseRef}...${head}`], ctx);
       return { files: parseNameOnly(out), status: 'fetched' };
     }
+    // fails-when: the deepen fetches run on a full clone
+    if (!shallow) break;
     if (!tryGit(workDir, ['fetch', `--deepen=${DEEPEN_STEP}`, 'origin', baseSpec], ctx)) break;
     deepenCommit(workDir, head, ctx);
   }

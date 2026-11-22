@@ -22,6 +22,7 @@ import type {
   PlatformTriggerResponse,
   PlatformUploadInitInput,
   PlatformUploadInitResponse,
+  ReadRequestOptions,
   RunLogPosition,
 } from './platform-client.js';
 import { HoldsUnavailableError, type DirectRunClient, type DirectWhoami } from './direct-client.js';
@@ -51,8 +52,12 @@ export interface RunRemoteTransport {
     orchestratorPublicKey: Buffer;
   }): Promise<UploadResult>;
   trigger(body: PlatformTriggerInput): Promise<PlatformTriggerResponse>;
-  status(runId: string): Promise<PlatformRunStatusResponse>;
-  logs(runId: string, position: RunLogPosition): Promise<PlatformRunLogsResponse>;
+  status(runId: string, opts?: ReadRequestOptions): Promise<PlatformRunStatusResponse>;
+  logs(
+    runId: string,
+    position: RunLogPosition,
+    opts?: ReadRequestOptions,
+  ): Promise<PlatformRunLogsResponse>;
   cancel(runId: string): Promise<PlatformCancelResponse>;
   readonly holds: RunHoldAccess;
 }
@@ -93,8 +98,8 @@ export function createPlatformTransport(opts: {
     initUpload: (body) => client.initUpload(orgId, target, body),
     uploadTarball: uploadWithDiagnosis,
     trigger: (body) => client.trigger(orgId, target, body),
-    status: (runId) => client.runStatus(orgId, runId, target),
-    logs: (runId, position) => client.runLogs(orgId, runId, position, target),
+    status: (runId, readOpts) => client.runStatus(orgId, runId, target, readOpts),
+    logs: (runId, position, readOpts) => client.runLogs(orgId, runId, position, target, readOpts),
     cancel: (runId) => client.cancel(orgId, runId, target),
     holds: {
       list: (runId) => listHeldRunsForRun(holdContext, runId),
@@ -135,8 +140,8 @@ export function createDirectTransport(opts: {
     initUpload: (body) => client.initUpload(body),
     uploadTarball: uploadWithDiagnosis,
     trigger: (body) => client.trigger(body),
-    status: (runId) => client.runStatus(runId),
-    logs: (runId, position) => client.runLogs(runId, position),
+    status: (runId, readOpts) => client.runStatus(runId, readOpts),
+    logs: (runId, position, readOpts) => client.runLogs(runId, position, readOpts),
     cancel: (runId) => client.cancel(runId),
     holds: {
       list: async (runId) => {

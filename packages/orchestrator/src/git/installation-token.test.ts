@@ -1,5 +1,6 @@
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { mintInstallationToken } from './installation-token.js';
+import { stubGithubFetch, TEST_APP_PRIVATE_KEY } from '../__test-helpers__/github-fetch.js';
 
 function fakeOctokit(response: unknown) {
   return {
@@ -199,4 +200,53 @@ describe('mintInstallationToken', () => {
       }),
     ).rejects.toThrow(/boom/);
   });
+});
+
+describe('mintInstallationToken on the App server', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const base = {
+    appId: '1',
+    privateKey: TEST_APP_PRIVATE_KEY,
+    installationId: '7',
+    repositories: ['acme/app'],
+  };
+
+  it('mints a scoped token at the GHES API', async () => {
+    const requests = stubGithubFetch();
+    const minted = await mintInstallationToken({ ...base, githubUrl: 'https://ghe.corp.example' });
+    expect(minted.token).toBe('ghs_test');
+    // fails-when: the default factory ignores githubUrl and mints at api.github.com
+    expect(requests).toEqual([
+      {
+        method: 'POST',
+        url: 'https://ghe.corp.example/api/v3/app/installations/7/access_tokens',
+        auth: 'bearer',
+      },
+    ]);
+  });
+
+  it('mints at api.github.com without a server', async () => {
+    const requests = stubGithubFetch();
+    await mintInstallationToken(base);
+    // breaks-if-wrong: a github.com App keeps minting at api.github.com
+    expect(requests.map((r) => r.url)).toEqual([
+      'https://api.github.com/app/installations/7/access_tokens',
+    ]);
+  });
+
+  it.each([undefined, 'https://ghe.corp.example'])(
+    'translates a 422 from the server (%s)',
+    async (githubUrl) => {
+      stubGithubFetch(() => ({
+        status: 422,
+        body: { message: 'The permissions requested are not granted to this installation.' },
+      }));
+      await expect(
+        mintInstallationToken({ ...base, githubUrl, permissions: { contents: 'write' } }),
+      ).rejects.toThrow(/acme\/app.*contents=write/s);
+    },
+  );
 });

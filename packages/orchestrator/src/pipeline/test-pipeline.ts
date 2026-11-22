@@ -41,7 +41,11 @@ import type {
   SimulatedEvent,
   WorkflowDecision,
 } from '@kici-dev/engine';
-import { matchAllWorkflows, createWorkflowDecision } from '@kici-dev/engine';
+import {
+  changedFilesStatusSchema,
+  matchAllWorkflows,
+  createWorkflowDecision,
+} from '@kici-dev/engine';
 import { agentLabelOf, stringifyActor, type ActorPrincipal } from '@kici-dev/engine';
 import { coerceDispatchInputs } from '@kici-dev/engine';
 import type { CheckMode, HostTargetSelector, InputsDescriptorMap } from '@kici-dev/engine';
@@ -57,6 +61,7 @@ export interface TestTriggerInput {
     targetBranch: string;
     sourceBranch?: string;
     payload: Record<string, unknown>;
+    /** The files the event changes, as the CLI computed them; a list counts as fetched. */
     changedFiles?: string[];
   };
   /** Routing key for provider lookup and lock file fetch. */
@@ -656,6 +661,13 @@ export async function processTestTrigger(
     sourceBranch: input.event.sourceBranch,
     payload: input.event.payload,
     changedFiles: input.event.changedFiles,
+    // The CLI computed the list from the developer's own history: the agent
+    // takes it as is and never diffs against the git host.
+    // fails-when: a CLI-sent list arrives unstamped, so the agent recomputes it
+    // breaks-if-wrong: an event with no list (an older CLI) keeps the agent's own diff
+    ...(Array.isArray(input.event.changedFiles) && {
+      changedFilesStatus: changedFilesStatusSchema.enum.fetched,
+    }),
   };
 
   const matchResult = selectMatchedDecisions(input, fullLockFile, simulatedEvent);

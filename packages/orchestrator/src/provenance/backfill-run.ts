@@ -11,6 +11,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import type { OrchestratorToPlatformMessage } from '@kici-dev/engine';
+import type { GithubSource } from '../provider-registry.js';
 
 /** The local `execution_runs` fields the backfill needs (production reads via Kysely). */
 export interface BackfillRunRow {
@@ -58,6 +59,11 @@ export interface BackfillRunDeps {
   send: (message: OrchestratorToPlatformMessage) => void;
   loadRun: (runId: string) => Promise<BackfillRunRow | null>;
   loadJobs: (runId: string) => Promise<BackfillJobRow[]>;
+  /**
+   * The live GitHub App source at a routing key (`ProviderRegistry.githubSourceOf`);
+   * its server is forwarded as `repoWebUrl` like the live path does.
+   */
+  githubSourceOf?: (routingKey: string) => GithubSource | undefined;
 }
 
 const ms = (d: Date | null | undefined): number | undefined => (d ? d.getTime() : undefined);
@@ -78,6 +84,7 @@ export async function backfillRunToPlatform(deps: BackfillRunDeps, runId: string
     throw new Error(`cannot backfill run ${runId}: not found in local execution_runs`);
   }
   const now = Date.now();
+  const githubUrl = run.routing_key ? deps.githubSourceOf?.(run.routing_key)?.githubUrl : undefined;
   deps.send({
     type: 'execution.status',
     messageId: randomUUID(),
@@ -90,6 +97,8 @@ export async function backfillRunToPlatform(deps: BackfillRunDeps, runId: string
       ? { workflowRepoIdentifier: run.workflow_repo_identifier }
       : {}),
     ...(run.provider ? { repoProvider: run.provider } : {}),
+    // fails-when: a backfilled GHES run reaches the mirror with no server
+    ...(githubUrl ? { repoWebUrl: githubUrl } : {}),
     ...(run.local_working_tree != null ? { localWorkingTree: run.local_working_tree } : {}),
     ...(run.sha ? { sha: run.sha } : {}),
     ...(run.ref ? { ref: run.ref } : {}),

@@ -187,12 +187,12 @@ When the orchestrator starts (or restarts), it must handle jobs from the previou
 
 Scaler-managed agents are single-use and destroyed on disconnect, so they never enter the recovery window. Their in-flight jobs are triaged immediately:
 
-| Aspect            | Behavior                                                                                                                                                                         |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Never-started job | Requeued to `pending` (bumps `dispatch_queue.dispatch_attempts`) and immediately re-dispatched to another agent, or handed to the scaler so a fresh agent is spawned bound to it |
-| Started job       | Failed fast — "Job failed: scaler-managed agent disconnected mid-execution"; not re-run, since steps may have external side effects                                              |
-| Attempt cap       | A job re-dispatched more than `MAX_DISPATCH_ATTEMPTS` (5) times is failed permanently instead of requeued again; `expires_at` is the time-based backstop                         |
-| No dead wait      | There is no 2-minute recovery timeout for these agents — the outcome (requeue or fail) is decided at disconnect                                                                  |
+| Aspect            | Behavior                                                                                                                                                                           |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Never-started job | Requeued to `pending` (bumps `dispatch_queue.dispatch_attempts`) and immediately re-dispatched to another agent, or handed to the scaler so a fresh agent is spawned bound to it   |
+| Started job       | Failed fast — "Job failed: scaler-managed agent disconnected mid-execution (ephemeral agents are destroyed on disconnect)"; not re-run, since steps may have external side effects |
+| Attempt cap       | A job re-dispatched more than `MAX_DISPATCH_ATTEMPTS` (5) times is failed permanently instead of requeued again; `expires_at` is the time-based backstop                           |
+| No dead wait      | There is no 2-minute recovery timeout for these agents — the outcome (requeue or fail) is decided at disconnect                                                                    |
 
 ### Orchestrator crash during recovery
 
@@ -228,13 +228,13 @@ Scaler-managed agents are single-use and destroyed on disconnect, so they never 
 
 Recovery events are logged with the following structured fields for log dashboards and alerting:
 
-| Field                     | Type   | Description                                   |
-| ------------------------- | ------ | --------------------------------------------- |
-| `recovery_duration`       | number | Milliseconds between disconnect and reconnect |
-| `agent_id`                | string | Agent that reconnected                        |
-| `job_id`                  | string | Job that was recovered                        |
-| `run_id`                  | string | Execution run ID                              |
-| `buffered_messages_count` | number | Messages buffered during outage               |
+| Field                     | Type   | Description                                                               |
+| ------------------------- | ------ | ------------------------------------------------------------------------- |
+| `recovery_duration`       | number | Milliseconds between disconnect and reconnect                             |
+| `agent_id`                | string | Agent that reconnected                                                    |
+| `job_id`                  | string | Job that was recovered                                                    |
+| `run_id`                  | string | Execution run ID                                                          |
+| `buffered_messages_count` | number | Always `0`: the orchestrator does not count the agent's buffered messages |
 
 ### Database queries
 

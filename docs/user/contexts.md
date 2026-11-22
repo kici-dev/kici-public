@@ -91,11 +91,11 @@ job('deploy', {
 
 **Protection rules combine all-must-pass.** A job must satisfy **every** bound context's gates — adding a context can never loosen access. Branch restrictions, trigger-type filters, and repo patterns must pass for all contexts. The minimum trust tier is the most restrictive across them, and required reviewers are the union of all contexts' reviewers. The wait timer is the longest, and the hold expiry is the shortest. If a rule rejects a job, that job is not dispatched. It still appears on the run, as a failed job whose reason names the context and the rule that rejected it. Read the reason with `kici runs show <run-id>`, or on the run detail page.
 
-**Skip-on-test (allow-and-warn).** On a test or local run (`kici run remote`, `kici run <event> --local`), a bound context never rejects the run. Any bound context that disallows local execution (`allowLocalExecution: false`) — or that is not configured — is **skipped**: its variables and secrets are omitted from the merge and its gates are not evaluated. The run proceeds, and a user-visible warning naming the skipped context(s) is shown both on the `kici run remote` CLI output and on the dashboard run view. This makes the test-only-variables pattern work: with `contexts: ['staging', 'my-testing']` where only `my-testing` allows local execution, a test run resolves just `my-testing`'s variables and warns that `staging` was skipped. If every bound context is skipped, the job runs with no environment variables. This is intentionally different from a fixture `secrets:` mapping, which is fail-closed — see the [testing guide](./testing-guide.md).
+**Skip-on-test (allow-and-warn).** On a test or local run (`kici run remote`, `kici run <event> --local`), a bound context never rejects the run. Any bound context that disallows local execution (`allowLocalExecution: false`) — or that is not configured — is **skipped**: its variables and secrets are omitted from the merge and its gates are not evaluated. The run proceeds, and a user-visible warning naming the skipped context(s) is shown both on the `kici run remote` CLI output and on the dashboard run view. This makes the test-only-variables pattern work: with `contexts: ['staging', 'my-testing']` where only `my-testing` allows local execution, a test run resolves only `my-testing`'s variables and warns that `staging` was skipped. If every bound context is skipped, the job runs with no environment variables. This is intentionally different from a fixture `secrets:` mapping, which is fail-closed — see the [testing guide](./testing-guide.md).
 
-**Unconfigured contexts contribute nothing at dispatch.** At dispatch time a bound context name with no matching configured context (and no matching glob context) adds no variables, secrets, or protection rules — the job still runs, exactly as a single dynamic context resolving to an as-yet-unconfigured name does today.
+**Unconfigured contexts contribute nothing at dispatch.** At dispatch time a bound context name with no matching configured context (and no matching glob context) adds no variables, secrets, or protection rules. The job still runs, exactly as a single dynamic context does when it resolves to a name that is not configured yet.
 
-**Registration rejects a provably-unsatisfiable binding.** When a workflow is registered, KiCI statically checks the static context names each job binds, the workflow-level names included. A disabled context makes the binding provably unsatisfiable. So do two contexts with mutually-exclusive fixed branch / trigger-type / repository restrictions, which no value can satisfy together. The registration is then rejected with a precise message naming the job, the contexts, and the rule — for example `unsatisfiable context binding: job 'deploy' binds contexts [staging, my-testing] with mutually exclusive branch restrictions (no value satisfies all bound contexts)`. A bound name with no configured context is not rejected (see below). Bindings whose restrictions use globs are undecidable at registration and fall through to the dispatch-time gate check instead.
+**Registration rejects a provably-unsatisfiable binding.** When a workflow is registered, KiCI statically checks the static context names each job binds, the workflow-level names included. A disabled context makes the binding provably unsatisfiable. So do two contexts with mutually-exclusive fixed branch / trigger-type / repository restrictions, which no value can satisfy together. The registration is then rejected with a precise message naming the job, the contexts, and the rule — for example `unsatisfiable context binding: job 'deploy' binds contexts [staging, my-testing] with mutually exclusive branch restrictions (no value satisfies all bound contexts)`. A bound name with no configured context is not rejected (see above). Bindings whose restrictions use globs are undecidable at registration and fall through to the dispatch-time gate check instead.
 
 ### Job-level environment variables
 
@@ -107,7 +107,9 @@ job('deploy', {
   context: 'production',
   env: { DEPLOY_TARGET: 'us-east-1' },
   // Or dynamic:
-  // env: (event) => ({ DEPLOY_SHA: event.payload.after?.slice(0, 7) }),
+  // env: (event) => ({
+  //   DEPLOY_SHA: event.type === 'push' ? event.payload.after.slice(0, 7) : '',
+  // }),
   steps: [
     step('deploy', async (ctx) => {
       // DEPLOY_TARGET is available in ctx.env
@@ -129,7 +131,8 @@ job('deploy', {
   context: 'production',
   concurrencyGroup: 'production-api',
   // Or dynamic:
-  // concurrencyGroup: (event) => `review-${event.payload.pull_request.number}`,
+  // concurrencyGroup: (event) =>
+  //   event.type === 'pull_request' ? `review-${event.payload.pull_request.number}` : 'review',
   steps: [/* ... */],
 });
 ```

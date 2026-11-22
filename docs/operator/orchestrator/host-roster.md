@@ -181,6 +181,10 @@ The payload is stored in **your own** object storage bucket (never a vendor CDN)
 | **S3-direct** | The box is declared `--s3-reachable`.                        | The orchestrator mints a short-lived presigned URL and the box pulls the payload itself — no large transfer through the ops agent. |
 | **SSH-push**  | Default (box not `--s3-reachable`, or storage unconfigured). | The ops agent fetches the payload from object storage and streams it to the box over a binary-safe SSH copy.                       |
 
+The ops agent logs the path it takes for each box, as `Delivering agent payload to <agent-id> via s3-direct` or `via ssh-push`.
+
+For SSH-push, the ops agent downloads each payload version once into a local cache, `kici-agent-payloads/<version>/` under its temp directory. Each bring-up marks its version as used. The ops agent keeps the three most recently used versions, and removes any other version that has not been used for one day.
+
 Both paths verify the payload's `sha256` **on the box before extraction**, so a corrupted or tampered payload is never unpacked. `KICI_AGENT_BINARY_SOURCE` defaults to the orchestrator's own cache bucket; set it to an `s3://bucket[/prefix]` value to point the delivery at a mirror bucket. An external HTTP(S) source is rejected — payloads always come from object storage you control.
 
 ### Fleet convergence — one workflow, init-or-not

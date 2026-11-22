@@ -115,9 +115,16 @@ Inside the sandbox child process (workflow runner), the following steps execute 
 
 ### Repository clone
 
-The sandbox performs a shallow `git clone` at the dispatch ref. For private repositories, a GitHub App installation token from `job.dispatch.token` is injected via `http.extraHeader` git config (keeps it out of the clone URL). After clone, `HEAD` is verified against the expected SHA.
+The sandbox runs `git clone` at the dispatch ref. The job config's `checkoutOptions` (the lock file form of the job's `checkout: { fetchDepth, fetchTags }`) sets the clone:
 
-**Overlay (test runs only).** For `kici run remote` runs, the sandbox downloads, decrypts, and applies the developer's uncommitted changes on top of the clone. See [Test run architecture](test-runs.md).
+- `fetchDepth` sets `--depth`. It defaults to 1, and `0` clones the full history without `--depth`.
+- `fetchTags: false` adds `--no-tags`. `fetchTags: true` on a shallow clone adds a `git fetch --depth <n> --tags`. Unset, git's default applies: the tags that point at a fetched commit.
+
+For a global workflow, these options apply to the source repository clone. The workflow repository clone stays at depth 1. For a private repository, the sandbox uses the credential in `job.dispatch.sourceAuth`, and `workflowAuth` when a cross-provider global workflow's repository needs its own. Basic auth goes through `http.extraHeader` git config, which keeps the token out of the clone URL. SSH auth goes through `GIT_SSH_COMMAND` with a temporary key. After the clone, the sandbox verifies `HEAD` against the expected SHA. When the branch moved past that SHA, a shallow clone fetches the SHA at a depth of at least 50. A full clone checks it out without a depth.
+
+**`checkout: false`.** The sandbox clones nothing. It needs only `.kici/` to load the workflow: the cached source tarball restores it, or, when the orchestrator caches no workflow source, the agent copies `.kici/` out of a temporary depth-1 clone. The job's setup log names which one happened.
+
+**Overlay (test runs only).** A `kici run remote` run clones nothing either: the sandbox downloads, decrypts and extracts the developer's working tree and its checkout-style `.git` into an empty workspace. A `checkout: false` job takes only `.kici/` from the overlay. See [Test run architecture](test-runs.md).
 
 > See `packages/agent/src/checkout/git-clone.ts` for the implementation.
 
@@ -148,7 +155,7 @@ The lock file's `source.file` and `source.exportName` identify the exact workflo
 
 ### Workflow and step extraction
 
-After loading the module, the sandbox extracts the target workflow by export name and resolves its steps, normalizing bare functions and `step()` calls into a uniform structure. Step names are assigned at **compile time** during lock file generation — unnamed steps receive counter IDs (`step-1`, `step-2`, etc.) in the compiler, not at runtime. Concurrency group evaluation also happens at this stage.
+After loading the module, the sandbox extracts the target workflow by export name and resolves its steps, normalizing bare functions and `step()` calls into a uniform structure. The compiler assigns step names at **compile time**, during lock file generation — unnamed steps receive counter IDs (`step-1`, `step-2`, etc.) in the compiler, not at runtime. Concurrency group evaluation also happens at this stage.
 
 ### Rule evaluation
 
@@ -175,11 +182,11 @@ For each init spec, in declaration order:
 3. **Apply the env / PATH delta** — after the command succeeds, the agent reads the `KEY=value` lines from `$KICI_ENV` and the directory lines from `$KICI_PATH`, applies the delta (PATH entries prepended), and the result becomes visible to every subsequent init and step.
 4. **Cache save** — if the spec set `cache` and the key missed on restore, the agent saves the cached paths after the command.
 
-If any init exits non-zero or exceeds its timeout, the job **fails before any step runs**: the `init:<n>` pseudo-step is marked failed with its logs attached, the remaining inits and the entire step loop are skipped, and the job reports a terminal failure (a timeout is reported with the distinct timeout reason). This makes a broken toolchain an early, attributable failure rather than a confusing mid-step error.
+If any init exits non-zero or exceeds its timeout, the job **fails before any step runs**. The `init:<n>` pseudo-step is marked failed with its logs attached, the remaining inits and the entire step loop are skipped, and the job reports a terminal failure (a timeout reports the distinct timeout reason). This makes a broken toolchain an early, attributable failure rather than a confusing mid-step error.
 
 ### Step execution
 
-Steps execute sequentially within a job. Each step receives a full `StepContext` with:
+Steps execute in declaration order within a job. The children of a `parallel()` group run concurrently, behind the group's `maxParallel` window. Each step receives a full `StepContext` with:
 
 - `$` -- zx shell (runs natively inside the sandbox process, regardless of sandbox type)
 - `log` -- step-scoped logger that streams via IPC to the agent, then to the orchestrator
@@ -187,11 +194,11 @@ Steps execute sequentially within a job. Each step receives a full `StepContext`
 - `ctx` -- workflow and job metadata (names, runsOn label)
 - `matrix` -- optional matrix values for the current combination
 
-Each step runs inside a `Promise.race` against a timeout. The timeout is configured per-step (`step.timeout`) or falls back to the agent's default (`KICI_DEFAULT_STEP_TIMEOUT_MS`, default 30 minutes).
+Each step runs inside a `Promise.race` against a timeout. The timeout is configured per-step (`step.timeout`) or falls back to the agent's default (`KICI_DEFAULT_STEP_TIMEOUT_MS`, default 30 minutes). The same race watches the job's own timeout and, in a `parallel()` group, the fail-fast abort of a failed sibling.
 
 A run carries a **check mode** (`apply` | `check` | `check-fail-on-drift`) that threads from the CLI through dispatch to the step loop. For a step that declares a `check` facet, the loop reuses the shared check / apply primitive: in apply mode it converges (drift ⇒ apply ⇒ `applied`; null ⇒ in-sync skip), and in check mode it previews drift without applying (`would change`). A plain step under check mode is skipped (`no_check`). Under `check-fail-on-drift`, any previewed drift makes the run terminal status `failed`. See [Idempotent steps and check mode](../../user/idempotent-steps.md).
 
-> See `packages/agent/src/execution/sandbox/workflow-runner.ts` for the implementation.
+> See `packages/agent/src/execution/sandbox/step-loop.ts` and `packages/agent/src/execution/sandbox/parallel-scheduler.ts` for the implementation.
 
 **Step lifecycle:**
 
@@ -204,6 +211,7 @@ A run carries a **check mode** (`apply` | `check` | `check-fail-on-drift`) that 
 
 - If `continueOnError` is `false` (default): job execution stops immediately
 - If `continueOnError` is `true`: execution continues to the next step, but the final job status still reflects the failure
+- If the step declares `retry`: a failed attempt runs again with backoff while attempts remain and `retryIf` returns true. Each attempt has its own timeout, and `continueOnError` applies after the last attempt
 
 **Timeout behavior:**
 
@@ -219,14 +227,14 @@ Logs flow from the sandbox child process via IPC to the agent, where the `LogStr
 **What gets captured inside a sandbox step:** the sandbox runs a three-layer capture so that everything a step writes ends up in the step log stream:
 
 1. **Subprocess output** — the step-local zx `$` is configured with a `log` callback (`createSandboxStepContext` in `workflow-runner.ts`) that intercepts every `{ kind: 'stdout' | 'stderr' }` entry zx emits for child processes and forwards each completed line as `log.line`. zx pipes child stdio to an internal `VoidStream`, so without this override subprocess output would be invisible.
-2. **Direct console output from step TS/JS code** — `installOutputCapture()` monkey-patches `process.stdout.write` and `process.stderr.write` while a step is active (`captureStepIndex >= 0`). Calls to `console.log`, `console.error`, `console.warn`, or any library that writes directly to `process.stdout`/`stderr` are split into lines and forwarded as `log.line`. The patch is also active during the pre-step `prepare` phase (module load, concurrency-group evaluation, rule evaluation) under `capturePrepareActive = true`, routing output to the workflow-level log bucket (`stepIndex: -1`).
+2. **Direct console output from step TS/JS code** — `installOutputCapture()` monkey-patches `process.stdout.write` and `process.stderr.write` while a step is active (`currentCaptureStepIndex() >= 0`). The step index comes from an `AsyncLocalStorage` scope, so concurrent `parallel()` children each log to their own step. Calls to `console.log`, `console.error`, `console.warn`, or any library that writes directly to `process.stdout`/`stderr` are split into lines and forwarded as `log.line`. The patch is also active during the pre-step `prepare` phase (module load, concurrency-group evaluation, rule evaluation) under `capturePrepareActive = true`, routing output to the workflow-level log bucket (`stepIndex: -1`).
 3. **Structured logger** — the step context's `log` object (`log.info` / `log.warn` / `log.error` / `log.debug`) sends `log.line` directly over IPC, bypassing the stdio hooks.
 
 Every captured line carries the stream it came from (`stdout` or `stderr`) from the zx callback through the IPC message and the chunk batcher, out on the `log.chunk` message, and into the persisted log record's level. The batcher closes the pending chunk whenever the stream flips, so stdout/stderr interleaving survives batching. A peer that does not send the field is read as `stdout`.
 
 **A failing step's error lands in its own log.** When a step body throws, the error message is emitted into that step's log stream — tagged `stderr` and ordered ahead of the terminal status — instead of only riding `step.complete`. This matters because subprocess wrappers pack the real diagnosis (captured stderr, exit code, kill signal) into the thrown error's message. The logged copy is bounded to 100 lines / 8192 characters and states what it dropped; the full untruncated message still travels on `step.complete`. It goes through the same send path as every other log line, so secret masking applies unchanged.
 
-All three paths converge in the agent's per-step `LogStreamer`. Hooks (`beforeStep`, `afterStep`, `onSuccess`, `onFailure`, `onCancel`, `cleanup`) also run under `captureStepIndex` — per-step hooks reuse the step index and land in the step's log; post-loop and cancel-path hooks allocate their own indices above `steps.length` and appear as dedicated step rows in the dashboard.
+All three paths converge in the agent's per-step `LogStreamer`. Hooks (`beforeStep`, `afterStep`, `onSuccess`, `onFailure`, `onCancel`, `cleanup`) also run inside a capture scope (`runInStepCapture`). Per-step hooks reuse the step index and land in the step's log. Post-loop and cancel-path hooks allocate their own indices above `steps.length` and appear as dedicated step rows in the dashboard.
 
 **What gets captured inside an evaluation job (`__init__` / `__build__` / `__dynamic__`, and a global eval round):** these jobs don't use the step sandbox. Their module load and evaluation run in the eval child. A second capture primitive — `AsyncLocalStorage`-scoped `console.*` patching in `packages/agent/src/execution/console-capture.ts` — routes user-supplied output over IPC to a per-job synthetic step-0 `LogStreamer` in the agent.
 
@@ -297,12 +305,13 @@ Cleanup runs in a `.finally()` block to ensure it executes even if the job throw
 
 ## Container execution mode
 
-The execution mode is determined at the **job level** (not per-step) by the `JobRunner` using the following priority:
+The `JobRunner` determines the execution mode at the **job level** (not per-step), using the following priority:
 
-1. Container config in job dispatch → `container`
-2. `KICI_EXECUTION_MODE` env var → explicit override
-3. `KICI_SCALER_MANAGED=1` with Firecracker detection → `firecracker`
-4. Default → `bare-metal`
+1. `KICI_JOB_IMAGE_AGENT=1` → `bare-metal` (the agent already runs inside the job's own image, so it runs the steps directly)
+2. Container config in job dispatch → `container`
+3. `KICI_EXECUTION_MODE` env var → explicit override
+4. `KICI_SCALER_MANAGED=1` → `firecracker`
+5. Default → `bare-metal`
 
 When running in container mode, the agent uses the `ContainerSandbox`. The workflow runner is bind-mounted read-only into the container as a **self-contained bundle** (its runtime dependencies inlined, plus a pure-JS TypeScript loader-hook bundle mounted alongside it) so the single-file runner loads inside a bare job container with no access to the agent's `node_modules`. IPC uses stdin/stdout JSON-lines over the container runtime's exec API.
 

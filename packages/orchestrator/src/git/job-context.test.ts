@@ -9,9 +9,13 @@ type RunRow = {
   trust_tier: string | null;
   workflow_repo_identifier?: string | null;
   workflow_branch?: string | null;
+  provider_context?: unknown;
+  routing_key?: string | null;
+  dispatch_routing_key?: string | null;
 };
 type JobRow = { git_credentials: Record<string, Record<string, string>> | null };
-type DispatchRow = { job_config: string; repo_url?: string };
+type DispatchRow = { job_config: string; repo_url?: string; routing_key?: string };
+type SourceRow = { github_url: string | null };
 
 /** A dispatch-queue id is a uuid column, so the fixture uses a real one. */
 const JOB_ID = '3f9b6c02-3a1f-4c19-9a2f-6b0d1e7c4a55';
@@ -20,15 +24,26 @@ const JOB_ID = '3f9b6c02-3a1f-4c19-9a2f-6b0d1e7c4a55';
  * A db that answers by table name, so a reader that adds, drops or reorders a
  * query keeps getting the row it asked for rather than the next one in a list.
  */
-function fakeDb(rows: {
-  execution_runs?: RunRow | undefined;
-  execution_jobs?: JobRow | undefined;
-  dispatch_queue?: DispatchRow | undefined;
-}) {
+function fakeDb(
+  rows: {
+    execution_runs?: RunRow | undefined;
+    execution_jobs?: JobRow | undefined;
+    dispatch_queue?: DispatchRow | undefined;
+    sources?: SourceRow | undefined;
+  },
+  selected: Record<string, unknown> = {},
+  wheres: Record<string, unknown[][]> = {},
+) {
   const selectFrom = vi.fn((table: keyof typeof rows) => {
     const chain = {
-      select: () => chain,
-      where: () => chain,
+      select: (columns: unknown) => {
+        selected[table] = columns;
+        return chain;
+      },
+      where: (...args: unknown[]) => {
+        (wheres[table] ??= []).push(args);
+        return chain;
+      },
       executeTakeFirst: vi.fn(async () => rows[table]),
     };
     return chain;
@@ -131,6 +146,77 @@ describe('createJobCredentialContextReader', () => {
     });
   });
 
+  /** A provider context a routing-key-scoped token wrote through a manual registration. */
+  const INJECTED = { installationId: 7, githubUrl: 'https://evil.example' };
+
+  it("mints at the server the job's source stores, never at one its provider context names", async () => {
+    const wheres: Record<string, unknown[][]> = {};
+    const read = createJobCredentialContextReader(
+      fakeDb(
+        {
+          execution_runs: { ...RUN, routing_key: 'github:1', provider_context: INJECTED },
+          dispatch_queue: { ...dispatchRow(undefined), routing_key: 'github:7' },
+          sources: { github_url: 'https://ghe.corp.example' },
+        },
+        {},
+        wheres,
+      ),
+    );
+    const ctx = await read('run-1', JOB_ID);
+    // fails-when: the injected host wins and the App JWT is sent to https://evil.example
+    expect(ctx?.githubUrl).toBe('https://ghe.corp.example');
+    // The job's own source (the bundle that dispatched it) is the one read.
+    expect(wheres.sources).toContainEqual(['routing_key', '=', 'github:7']);
+  });
+
+  it('a github.com source ignores a server its provider context names', async () => {
+    const read = createJobCredentialContextReader(
+      fakeDb({
+        execution_runs: { ...RUN, routing_key: 'github:1', provider_context: INJECTED },
+        sources: { github_url: null },
+      }),
+    );
+    // breaks-if-wrong: a github.com job keeps minting at github.com
+    const ctx = await read('run-1', JOB_ID);
+    expect(ctx).not.toHaveProperty('githubUrl');
+    expect(ctx).not.toHaveProperty('githubAppMintRefusal');
+  });
+
+  it('a job of a removed GitHub source has its App mint refused', async () => {
+    const read = createJobCredentialContextReader(
+      fakeDb({ execution_runs: { ...RUN, routing_key: 'github:1', provider_context: INJECTED } }),
+    );
+    const ctx = await read('run-1', JOB_ID);
+    // fails-when: the mint falls back to the stamp or to api.github.com for a source that is gone
+    expect(ctx?.githubAppMintRefusal).toMatch(/GitHub source github:1 .* no longer configured/);
+    expect(ctx).not.toHaveProperty('githubUrl');
+  });
+
+  it('a job whose source stores a server that is not a GitHub web URL has its App mint refused', async () => {
+    const read = createJobCredentialContextReader(
+      fakeDb({
+        execution_runs: { ...RUN, routing_key: 'github:1', provider_context: INJECTED },
+        sources: { github_url: 'http://evil.example/x' },
+      }),
+    );
+    const ctx = await read('run-1', JOB_ID);
+    // fails-when: the planted value becomes the mint's server, or the mint falls back to github.com
+    expect(ctx?.githubAppMintRefusal).toMatch(/GitHub source github:1 .*stored GitHub server URL/);
+    expect(ctx).not.toHaveProperty('githubUrl');
+  });
+
+  it("a job of another provider's source mints at github.com", async () => {
+    const read = createJobCredentialContextReader(
+      fakeDb({
+        execution_runs: { ...RUN, routing_key: 'generic:org-1:src', provider_context: INJECTED },
+      }),
+    );
+    // breaks-if-wrong: a generic source's job may still mint its own github.com App token
+    const ctx = await read('run-1', JOB_ID);
+    expect(ctx).not.toHaveProperty('githubUrl');
+    expect(ctx).not.toHaveProperty('githubAppMintRefusal');
+  });
+
   it('returns null for an unknown run rather than a default org', async () => {
     const read = createJobCredentialContextReader(fakeDb({}));
     await expect(read('nope', JOB_ID)).resolves.toBeNull();
@@ -219,7 +305,7 @@ describe('createJobCredentialContextReader', () => {
     });
     const tables = (db as unknown as { selectFrom: { mock: { calls: string[][] } } }).selectFrom
       .mock.calls;
-    expect(tables.map((c) => c[0])).toEqual(['execution_runs', 'execution_jobs']);
+    expect(tables.map((c) => c[0])).toEqual(['execution_runs', 'execution_jobs', 'sources']);
   });
 
   it("names the job's checkout from the dispatch record's clone URL", async () => {

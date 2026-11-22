@@ -15,6 +15,7 @@
 
 import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
+import { githubOctokitOptions } from '../providers/github/github-host.js';
 
 /** A freshly minted installation token and what it can actually do. */
 export interface MintedToken {
@@ -35,12 +36,21 @@ export interface MintInstallationTokenArgs {
    * half of each reaches the API. At least one. */
   repositories: readonly string[];
   permissions?: Readonly<Record<string, string>>;
+  /**
+   * Web URL of the GitHub Enterprise Server the App lives on; unset mints at
+   * github.com.
+   */
+  githubUrl?: string;
   /** Seam for tests; production callers omit it. */
-  octokitFactory?: (appId: string, privateKey: string) => Octokit;
+  octokitFactory?: (appId: string, privateKey: string, githubUrl?: string) => Octokit;
 }
 
-function defaultOctokit(appId: string, privateKey: string): Octokit {
-  return new Octokit({ authStrategy: createAppAuth, auth: { appId, privateKey } });
+function defaultOctokit(appId: string, privateKey: string, githubUrl?: string): Octokit {
+  return new Octokit({
+    ...githubOctokitOptions(githubUrl),
+    authStrategy: createAppAuth,
+    auth: { appId, privateKey },
+  });
 }
 
 export async function mintInstallationToken(args: MintInstallationTokenArgs): Promise<MintedToken> {
@@ -56,7 +66,11 @@ export async function mintInstallationToken(args: MintInstallationTokenArgs): Pr
     r.includes('/') ? r.slice(r.indexOf('/') + 1) : r,
   );
 
-  const octokit = (args.octokitFactory ?? defaultOctokit)(args.appId, args.privateKey);
+  const octokit = (args.octokitFactory ?? defaultOctokit)(
+    args.appId,
+    args.privateKey,
+    args.githubUrl,
+  );
   const data = await createToken(octokit, {
     installationId,
     repoNames,

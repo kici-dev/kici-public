@@ -1,6 +1,6 @@
 ---
 title: 'kici: notifications & diagnostics'
-description: 'Notification channels, attestation verification, and diagnostics'
+description: 'Notification channels, attestation verification, diagnostics, and reporting a discrepancy'
 ---
 
 ## Guide

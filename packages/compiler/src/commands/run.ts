@@ -2,6 +2,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import pc from 'picocolors';
 import { formatBytes, logger, toErrorMessage } from '@kici-dev/core';
+import type { TempHandle } from '@kici-dev/core/tmp';
 import { normalizeRunsOnToMatchers } from '@kici-dev/engine/labels/compile';
 import {
   parseInputPairs,
@@ -18,6 +19,7 @@ import {
   AuthenticationError,
   AccessDeniedError,
   ConnectionError,
+  type PlatformTriggerInput,
   type PlatformTriggerResponse,
 } from '../remote/platform-client.js';
 import { DirectRunClient } from '../remote/direct-client.js';
@@ -33,11 +35,22 @@ import {
   buildFixtureEvent,
   currentBranchFallback,
   FALLBACK_BRANCH,
+  type FixtureEvent,
   type GitHead,
 } from '../fixtures/event.js';
+import type { FixtureOptions } from '@kici-dev/sdk';
 import { detectCurrentBranch } from '../test-runner/git-detector.js';
 import { runFixturePicker, FixturePickerCancelledError } from '../fixtures/picker.js';
-import { createOverlayTarball, getSizeWarning } from '../remote/uploader.js';
+import { createOverlayTarball, gcStaleOverlayDirs, getSizeWarning } from '../remote/uploader.js';
+import type { ShippedGit } from '../remote/shipped-git/git-ship-types.js';
+import { validateSyntheticTagName } from '../remote/shipped-git/synthetic-commit.js';
+import { buildOverlayReport } from '../remote/overlay-report.js';
+import { computeRemoteChangedFiles } from '../remote/remote-changed-files.js';
+import {
+  describeGitShipment,
+  resolveGitShipRequirement,
+  type GitShipRequirement,
+} from '../remote/git-ship-requirement.js';
 import { formatMultiFixtureSummary, type RunResult } from '../remote/output/summary.js';
 import { formatJsonResult } from '../remote/output/json.js';
 import { formatJunitResult } from '../remote/output/junit.js';
@@ -46,12 +59,10 @@ import { buildEncryptedSecrets } from '../remote/secret-upload.js';
 import { buildLocalRepoIdentity } from '../remote/local-repo-identity.js';
 import { compileCommand } from './compile.js';
 import { followRuns, type FollowedRun } from './run-remote-follow.js';
-import type { RemoteRunOptions, RemoteRunResult } from './preview.js';
+import type { OverlayReport, RemoteRunOptions, RemoteRunResult } from './preview.js';
+import type { RemoteGitCliFlags } from './remote-git-flags.js';
 
-/**
- * The runs a trigger created: one per matched workflow, or the single `runId`
- * of an orchestrator that predates `runs`.
- */
+/** One run per matched workflow, or the single `runId` of an orchestrator that predates `runs`. */
 function triggeredRuns(response: PlatformTriggerResponse): FollowedRun[] {
   if (response.runs?.length) {
     return response.runs.map((r) => ({ runId: r.runId, workflowName: r.workflowName }));
@@ -85,9 +96,8 @@ export function buildTargetSelector(
 }
 
 /**
- * Without `workflowName`, merges the dispatch `inputs` descriptors of every
- * workflow: a best-effort fast-fail, since the orchestrator re-validates against
- * the matched workflow authoritatively.
+ * Without `workflowName`, merges every workflow's dispatch `inputs` descriptors: a best-effort
+ * fast-fail, since the orchestrator re-validates against the matched workflow.
  */
 export function lookupDispatchInputsDescriptor(
   inlineLockFile: string | undefined,
@@ -115,9 +125,8 @@ export function lookupDispatchInputsDescriptor(
 }
 
 /**
- * Names the problem when `workflowName` is not a workflow of the compiled lock
- * file, listing the workflows it does have; undefined when it is. An unparsable
- * lock returns undefined and leaves the verdict to the orchestrator.
+ * The problem when `workflowName` is not in the compiled lock, listing those it has. Undefined
+ * when it is, or when the lock does not parse (the orchestrator decides).
  */
 export function describeMissingWorkflow(
   inlineLockFile: string,
@@ -137,10 +146,7 @@ export function describeMissingWorkflow(
   return `Workflow '${workflowName}' is not in the compiled lock file. ${available}.`;
 }
 
-/**
- * Checks `--workflow` against the lock file the compile just wrote, so an
- * unknown name stops before anything is uploaded. Returns false after logging.
- */
+/** Checks `--workflow` against the fresh lock before any upload; false after logging. */
 async function checkWorkflowInLock(
   workflowName: string | undefined,
   options: RemoteRunOptions,
@@ -171,9 +177,8 @@ export function buildDispatchInputs(
 }
 
 /**
- * Compiling evaluates every user workflow and fixture module, and a top-level
- * `console.log` writes straight to stdout. A `--json` stdout MUST carry only the
- * final JSON result, so compile phases run with stdout redirected to stderr.
+ * Compiling evaluates user modules, whose top-level `console.log` writes to stdout. A `--json`
+ * stdout carries only the final JSON, so compile phases redirect stdout to stderr.
  */
 export async function withStdoutOnStderr<T>(fn: () => Promise<T>): Promise<T> {
   const realWrite = process.stdout.write.bind(process.stdout);
@@ -186,13 +191,11 @@ export async function withStdoutOnStderr<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * The orchestrator matches triggers against the inline lock, so a stale lock
- * would route an edited or new workflow incorrectly. Returns false on a compile
- * error so the caller aborts before any upload or dispatch.
+ * The orchestrator matches triggers against the inline lock, so a stale one misroutes an
+ * edited workflow. False on a compile error, before any upload or dispatch.
  */
 async function compileBeforeRemoteRun(options: RemoteRunOptions): Promise<boolean> {
-  // --json and --quiet stdout carries neither compile success lines nor user
-  // module-top-level console.log output.
+  // --json and --quiet stdout carries no compile lines and no module-level console.log.
   const pureStdout = Boolean(options.json || options.quiet);
   const compile = () =>
     compileCommand({
@@ -207,9 +210,7 @@ async function compileBeforeRemoteRun(options: RemoteRunOptions): Promise<boolea
   return pureStdout ? withStdoutOnStderr(compile) : compile();
 }
 
-/**
- * Run fixtures remotely, through the Platform or straight to an orchestrator.
- */
+/** Run fixtures remotely, through the Platform or straight to an orchestrator. */
 export async function runRemoteCommand(
   fixture: string | undefined,
   options: RemoteRunOptions,
@@ -220,9 +221,10 @@ export async function runRemoteCommand(
   }
 
   try {
-    // Fail fast on an invalid selector (or unsafe regex / invalid glob) before
-    // any compile or dispatch work.
+    // Fail fast on an invalid selector, unsafe regex or glob, before any compile or dispatch.
     buildTargetSelector(options.targets, options.targetAllowEmpty ?? false);
+    // The CLI already checked each --tag; this covers a programmatic caller.
+    for (const tag of options.git?.tags ?? []) validateSyntheticTagName(tag);
 
     // --history only reads local history, so it wins over every run selector.
     if (options.history) {
@@ -336,10 +338,7 @@ function warnIgnoredForDirect(options: RemoteRunOptions): void {
   );
 }
 
-/**
- * A direct target is verified with `whoami` first, so a token that cannot start
- * runs stops here, before anything is uploaded.
- */
+/** A direct target runs `whoami` first: a token that cannot start runs stops before any upload. */
 async function resolveRunContext(
   config: GlobalConfig,
   options: RemoteRunOptions,
@@ -367,8 +366,7 @@ async function resolveRunContext(
 
 /**
  * Org: `--org` → `config.activeOrgId` → error. Cluster: `--orchestrator` →
- * `config.defaultClusters[orgId]` → omitted, so the Platform sole-selects (or
- * returns a 422 the CLI surfaces).
+ * `config.defaultClusters[orgId]` → omitted (the Platform sole-selects, or returns a 422).
  */
 function resolvePlatformTransport(
   config: GlobalConfig,
@@ -459,8 +457,7 @@ async function runFixturesRemotely(
     for (const f of fixtures) {
       const result = await runSingleFixture(f, ctx, options, history);
       results.push(result);
-      // Fail fast, and stop after a cancel: Ctrl-C ends the whole batch, not
-      // only the fixture that was running.
+      // Fail fast, and stop after a cancel: Ctrl-C ends the whole batch.
       if (
         result.status === 'failed' ||
         result.status === 'error' ||
@@ -487,6 +484,7 @@ async function renderResults(
       totalDurationMs: r.durationMs ?? 0,
       jobs: r.jobs ?? [],
       ...(r.runs && { runs: r.runs }),
+      ...(r.overlay && { overlay: r.overlay }),
     }));
 
   if (options.json) {
@@ -511,45 +509,141 @@ async function renderResults(
   return results.every((r) => r.status === 'accepted' || r.status === 'success');
 }
 
+/** The repository the overlay ships: the parent of the `.kici` directory. */
+function overlayRepoRoot(options: RemoteRunOptions): string {
+  return path.resolve(resolveKiciDir(options.kiciDir), '..');
+}
+
+/** A programmatic caller without `git` gets what the CLI does without the flags; a fresh object per run. */
+function defaultGitFlags(): RemoteGitCliFlags {
+  return { commit: true, tags: [] };
+}
+
+/** The status, `Git:` and `Workspace commit:` lines, and one line per replaced tag. */
+function logShippedGit(
+  options: RemoteRunOptions,
+  requirement: GitShipRequirement,
+  git: ShippedGit | undefined,
+): void {
+  if (!options.quiet) {
+    // No `.git` when `.kici` is below the repository top level; a warning says so.
+    if (!git) {
+      logger.info(
+        pc.gray('Running your local working tree (no .git ships, so git steps see no repository)'),
+      );
+    } else {
+      logger.info(pc.gray('Running your local working tree over a checkout of your repository'));
+      logger.info(pc.gray(describeGitShipment(requirement)));
+      logger.info(
+        pc.gray(
+          git.synthetic
+            ? `Workspace commit: ${git.workspaceSha} (synthetic commit over HEAD ${git.baseSha})`
+            : `Workspace commit: ${git.workspaceSha} (HEAD)`,
+        ),
+      );
+    }
+  }
+  for (const name of git?.replacedTags ?? []) {
+    const line = `Tag '${name}' replaces the tag of that name from your repository in the remote workspace.`;
+    // Quiet and --json stdout carry no status lines, but a replaced tag changes what the job sees.
+    if (options.quiet) warnStderr(line);
+    else logger.info(pc.yellow(line));
+  }
+}
+
 /**
- * The overlay always carries the full local working tree, and the compiled lock
- * is inlined: the orchestrator never clones for a relayed run, and the
- * `remote:<orgId>` anchor has no webhook provider to fetch the lock or a base
- * tree from a git host.
+ * The full local working tree with the compiled lock inlined: a relayed run never clones, and
+ * the `remote:<orgId>` anchor has no provider to fetch a lock or base tree from. The shipped
+ * `.git` has the history and tags `scope`'s jobs ask for (each git flag overrides its
+ * dimension), the uncommitted changes as a synthetic commit unless `--no-commit`, and each `--tag`.
  */
-async function prepareOverlay(options: RemoteRunOptions): Promise<{
+async function prepareOverlay(
+  options: RemoteRunOptions,
+  scope: { workflowName?: string; event?: FixtureEvent },
+): Promise<{
   tarballPath: string;
   summary: Awaited<ReturnType<typeof createOverlayTarball>>['summary'];
   hasRemote: boolean;
-  inlineLockFile?: string;
+  inlineLockFile: string;
   kiciDir: string;
   repoRoot: string;
+  report: OverlayReport;
+  git?: ShippedGit;
+  /** Holds the tarball and the shipped repository: `thenRemoveOverlay` removes it. */
+  tempDir: TempHandle;
 }> {
   const kiciDir = resolveKiciDir(options.kiciDir);
-  const repoRoot = path.resolve(kiciDir, '..');
+  const repoRoot = overlayRepoRoot(options);
+
+  // The local compiled lock is the authority on either transport, and sizes the shipped history.
+  const inlineLockFile = await readFile(path.join(kiciDir, 'kici.lock.json'), 'utf-8');
+  const flags = options.git ?? defaultGitFlags();
+  const requirement = resolveGitShipRequirement({
+    inlineLockFile,
+    workflowName: scope.workflowName,
+    event: scope.event,
+    flags,
+  });
+
+  await gcStaleOverlayDirs().catch((err: unknown) =>
+    warnStderr(`Could not clean up old overlay temp dirs: ${toErrorMessage(err)}`),
+  );
 
   if (!options.quiet) {
     logger.info(pc.gray('Creating overlay tarball...'));
   }
 
-  // A diff-only overlay against a remote HEAD would leave the agent with no base
-  // tree, so the complete selection is forced whether or not a git remote exists.
-  const { tarballPath, summary, hasRemote, warnings } = await createOverlayTarball(repoRoot, {
-    fullWorkingTree: true,
-  });
-  // Warnings name paths the remote workspace lacks (submodules, dangling
-  // symlinks); stderr keeps a --json stdout parseable.
-  for (const warning of warnings) process.stderr.write(`${pc.yellow(`⚠ ${warning}`)}\n`);
-
-  if (!options.quiet) {
-    logger.info(
-      pc.gray('Running your local working tree (overlay includes .git, so git steps work)'),
-    );
+  // The agent has no base tree, so the full selection is forced even with a git remote. The
+  // commit message and author pass through raw: the builder applies the defaults.
+  const { tarballPath, summary, hasRemote, warnings, git, tempDir } = await createOverlayTarball(
+    repoRoot,
+    {
+      fullWorkingTree: true,
+      git: {
+        depth: requirement.depth,
+        tags: requirement.tags,
+        commit: flags.commit,
+        ...(flags.commitMessage !== undefined && { commitMessage: flags.commitMessage }),
+        ...(flags.commitAuthor && { commitAuthor: flags.commitAuthor }),
+        syntheticTags: flags.tags,
+      },
+    },
+  );
+  try {
+    reportOverlay(options, { summary, warnings, requirement, git });
+  } catch (err) {
+    await tempDir.cleanup();
+    throw err;
   }
 
-  // On either transport; the local compiled lock is the authority for a test
-  // run of the working tree.
-  const inlineLockFile = await readFile(path.join(kiciDir, 'kici.lock.json'), 'utf-8');
+  return {
+    tarballPath,
+    summary,
+    hasRemote,
+    inlineLockFile,
+    kiciDir,
+    repoRoot,
+    report: buildOverlayReport(summary, requirement, git),
+    ...(git && { git }),
+    tempDir,
+  };
+}
+
+/** Print what the overlay holds and ships. */
+function reportOverlay(
+  options: RemoteRunOptions,
+  overlay: {
+    summary: Awaited<ReturnType<typeof createOverlayTarball>>['summary'];
+    warnings: string[];
+    requirement: GitShipRequirement;
+    git: ShippedGit | undefined;
+  },
+): void {
+  const { summary, warnings, requirement, git } = overlay;
+  // Warnings name paths the remote workspace lacks; stderr keeps --json stdout parseable.
+  for (const warning of warnings) process.stderr.write(`${pc.yellow(`⚠ ${warning}`)}\n`);
+
+  logShippedGit(options, requirement, git);
 
   if (!options.quiet) {
     logger.info(
@@ -562,13 +656,45 @@ async function prepareOverlay(options: RemoteRunOptions): Promise<{
       logger.info(pc.yellow(sizeWarning));
     }
   }
-
-  return { tarballPath, summary, hasRemote, inlineLockFile, kiciDir, repoRoot };
 }
 
 /** The branch and commit the overlay was built from: the defaults for the run's event. */
 function localGitHead(overlay: { repoRoot: string; summary: { sha: string } }): GitHead {
   return { branch: detectCurrentBranch(overlay.repoRoot), sha: overlay.summary.sha };
+}
+
+/** The trigger fields of an uploaded overlay, shared by fixture runs and `--workflow` runs. */
+async function overlayTriggerFields(
+  overlay: Awaited<ReturnType<typeof prepareOverlay>>,
+  uploaded: { uploadId: string; publicKey: string; cliPublicKey: string },
+  workflowName: string | undefined,
+  options: RemoteRunOptions,
+): Promise<Omit<PlatformTriggerInput, 'fixtureId' | 'event'>> {
+  const encrypted = await buildEncryptedSecrets(
+    overlay.kiciDir,
+    options.envFlags,
+    options.context,
+    uploaded.publicKey,
+  );
+  const target = buildTargetSelector(options.targets, options.targetAllowEmpty ?? false);
+  const descriptor = lookupDispatchInputsDescriptor(overlay.inlineLockFile, workflowName);
+  const dispatchInputs = buildDispatchInputs(options.inputs ?? [], descriptor);
+  return {
+    uploadId: uploaded.uploadId,
+    // Overlay-tarball key, required to decrypt the overlay (independent of secrets).
+    cliPublicKey: uploaded.cliPublicKey,
+    ...(encrypted && {
+      encryptedSecrets: encrypted.encryptedSecrets,
+      encryptedSecretsKey: encrypted.cliPublicKey,
+    }),
+    workflowName,
+    inlineLockFile: overlay.inlineLockFile,
+    // The overlay carries the complete working tree; a relayed run never clones.
+    fullRepo: true,
+    ...(options.checkMode && { checkMode: options.checkMode }),
+    ...(target && { target }),
+    ...(Object.keys(dispatchInputs).length > 0 && { dispatchInputs }),
+  };
 }
 
 /** Inits the upload (control plane), then PUTs the encrypted tarball straight to the object store (data plane). */
@@ -604,6 +730,79 @@ async function initAndUpload(
   };
 }
 
+/**
+ * A fixture's event: branch and commit default to `head`; the repository is the origin
+ * `owner/repo` and provider, else a synthetic `local/<repo>`, so no external link breaks.
+ */
+function buildRemoteFixtureEvent(
+  fixtureId: string,
+  opts: FixtureOptions,
+  head: GitHead,
+  repoRoot: string,
+): FixtureEvent {
+  const fallback = head.branch ? undefined : currentBranchFallback(opts);
+  if (fallback) {
+    warnStderr(
+      `HEAD is detached, so fixture ${fixtureId} uses branch '${fallback}' in place of the current branch.`,
+    );
+  }
+  const event = buildFixtureEvent(opts, head);
+  const identity = buildLocalRepoIdentity(repoRoot);
+  const repo = event.payload.repository as Record<string, unknown> | undefined;
+  event.payload.repository = {
+    ...(repo ?? {}),
+    full_name: identity.repoIdentifier,
+    provider: identity.provider,
+  };
+  return event;
+}
+
+/**
+ * A fixture's remote-run event: the workspace commit (synthetic when dirty), a push's `before`
+ * its parent, and changed files from local history when a `.git` ships (with the uncommitted
+ * changes under `--no-commit`); without one, no list and the agent decides.
+ */
+function buildRemoteRunEvent(
+  fixtureId: string,
+  opts: FixtureOptions,
+  branch: string | undefined,
+  overlay: Awaited<ReturnType<typeof prepareOverlay>>,
+): FixtureEvent {
+  const { git } = overlay;
+  const parent = git?.parentSha ? { parentSha: git.parentSha } : {};
+  const event = buildRemoteFixtureEvent(
+    fixtureId,
+    opts,
+    { branch, sha: git?.workspaceSha ?? overlay.summary.sha, ...parent },
+    overlay.repoRoot,
+  );
+  if (git) {
+    const { files, warning } = computeRemoteChangedFiles({
+      repoRoot: overlay.repoRoot,
+      shipRoot: git.root,
+      event,
+      workspaceSha: git.workspaceSha,
+      ...parent,
+      ...(git.uncommittedPaths && { uncommittedPaths: git.uncommittedPaths }),
+    });
+    if (files) event.changedFiles = files;
+    if (warning) warnStderr(warning);
+  }
+  return event;
+}
+
+/** Run `fn`, then always remove the overlay temp dir (tarball, and a full history at depth 0). */
+async function thenRemoveOverlay<T>(
+  overlay: { tempDir: TempHandle },
+  fn: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await fn();
+  } finally {
+    await overlay.tempDir.cleanup();
+  }
+}
+
 async function runSingleFixture(
   fixture: CompiledFixture,
   ctx: RunRemoteTransport,
@@ -619,8 +818,7 @@ async function runSingleFixture(
     logger.info(pc.cyan(`\n--- ${fixture.id} ---`));
   }
 
-  // `--workflow` is the explicit choice for this invocation, so it wins over a
-  // workflow the fixture names itself.
+  // `--workflow` wins over a workflow the fixture names.
   if (options.workflow && opts.workflowName && opts.workflowName !== options.workflow) {
     warnStderr(
       `fixture ${fixture.id} names workflow '${opts.workflowName}'; running '${options.workflow}' as --workflow asks.`,
@@ -628,67 +826,33 @@ async function runSingleFixture(
   }
   const workflowName = options.workflow ?? opts.workflowName;
 
-  try {
-    const overlay = await prepareOverlay(options);
-    const uploaded = await initAndUpload(ctx, overlay, options);
+  // Every result returned once the overlay exists carries its report.
+  let report: OverlayReport | undefined;
+  const withOverlay = (result: RemoteRunResult): RemoteRunResult =>
+    report ? { ...result, overlay: report } : result;
 
-    const head = localGitHead(overlay);
-    const fallback = head.branch ? undefined : currentBranchFallback(opts);
-    if (fallback) {
-      warnStderr(
-        `HEAD is detached, so fixture ${fixture.id} uses branch '${fallback}' in place of the current branch.`,
-      );
-    }
-    const event = buildFixtureEvent(opts, head);
-    // Stamp the real origin `owner/repo` and provider when the tree has a
-    // recognized git remote, else a synthetic `local/<repo>` identity, so the
-    // dashboard never builds a broken external link.
-    {
-      const identity = buildLocalRepoIdentity(overlay.repoRoot);
-      const repo = event.payload.repository as Record<string, unknown> | undefined;
-      event.payload.repository = {
-        ...(repo ?? {}),
-        full_name: identity.repoIdentifier,
-        provider: identity.provider,
-      };
-    }
+  try {
+    const branch = detectCurrentBranch(overlayRepoRoot(options));
+    // The named workflow's jobs, else every matched workflow's, size the shipped .git.
+    const overlay = await prepareOverlay(options, {
+      workflowName,
+      event: buildFixtureEvent(opts, { branch }),
+    });
+    report = overlay.report;
+    const { event, uploaded } = await thenRemoveOverlay(overlay, async () => ({
+      event: buildRemoteRunEvent(fixture.id, opts, branch, overlay),
+      uploaded: await initAndUpload(ctx, overlay, options),
+    }));
 
     if (!options.quiet) {
       logger.info(pc.gray('Triggering test run...'));
     }
 
-    const encrypted = await buildEncryptedSecrets(
-      overlay.kiciDir,
-      options.envFlags,
-      options.context,
-      uploaded.publicKey,
-    );
-
     const triggerResult = await ctx.trigger({
       fixtureId: fixture.id,
       event,
-      uploadId: uploaded.uploadId,
-      // Overlay-tarball key, required to decrypt the overlay (independent of secrets).
-      cliPublicKey: uploaded.cliPublicKey,
       secrets: opts.secrets,
-      ...(encrypted && {
-        encryptedSecrets: encrypted.encryptedSecrets,
-        encryptedSecretsKey: encrypted.cliPublicKey,
-      }),
-      workflowName,
-      inlineLockFile: overlay.inlineLockFile,
-      // The overlay carries the complete working tree; a relayed run never clones.
-      fullRepo: true,
-      ...(options.checkMode && { checkMode: options.checkMode }),
-      ...(() => {
-        const target = buildTargetSelector(options.targets, options.targetAllowEmpty ?? false);
-        return target ? { target } : {};
-      })(),
-      ...(() => {
-        const descriptor = lookupDispatchInputsDescriptor(overlay.inlineLockFile, workflowName);
-        const dispatchInputs = buildDispatchInputs(options.inputs ?? [], descriptor);
-        return Object.keys(dispatchInputs).length ? { dispatchInputs } : {};
-      })(),
+      ...(await overlayTriggerFields(overlay, uploaded, workflowName, options)),
       // This CLI follows every run, so each matched workflow gets its own.
       acceptsMultipleRuns: true,
     });
@@ -697,12 +861,12 @@ async function runSingleFixture(
       if (!options.quiet) {
         logger.info(pc.red(`Rejected: ${triggerResult.reason ?? 'unknown reason'}`));
       }
-      return {
+      return withOverlay({
         fixtureId: fixture.id,
         runId: triggerResult.runId,
         status: 'rejected',
         reason: triggerResult.reason,
-      };
+      });
     }
 
     const runs = triggeredRuns(triggerResult);
@@ -727,12 +891,12 @@ async function runSingleFixture(
     }
 
     if (options.wait === false) {
-      return {
+      return withOverlay({
         fixtureId: fixture.id,
         runId: triggerResult.runId,
         status: 'accepted',
         runs: runs.map((r) => ({ ...r, status: 'accepted', jobs: [] })),
-      };
+      });
     }
 
     const result = await followRuns(ctx, runs, fixture.id, options);
@@ -752,9 +916,9 @@ async function runSingleFixture(
       });
     }
 
-    return result;
+    return withOverlay(result);
   } catch (error) {
-    return handleRunError(fixture.id, error, options, ctx.kind);
+    return withOverlay(handleRunError(fixture.id, error, options, ctx.kind));
   }
 }
 
@@ -793,6 +957,15 @@ function handleRunError(
   return { fixtureId, runId: '', status: 'error', reason: toErrorMessage(error) };
 }
 
+/** A direct run's verdict, rendered like a fixture's under `--json` or `--junit`. */
+async function finishDirectRun(
+  result: RemoteRunResult,
+  options: RemoteRunOptions,
+): Promise<boolean> {
+  if (options.json || options.junit) return renderResults([result], options);
+  return result.status === 'success' || result.status === 'accepted';
+}
+
 /** Runs a workflow directly, bypassing trigger matching. */
 async function runDirectWorkflow(
   workflowName: string,
@@ -818,12 +991,16 @@ async function runDirectWorkflow(
   await history.load();
 
   const fixtureId = `direct:${workflowName}`;
+  let report: OverlayReport | undefined;
+  const withOverlay = (result: RemoteRunResult): RemoteRunResult =>
+    report ? { ...result, overlay: report } : result;
 
   try {
-    const overlay = await prepareOverlay(options);
-    const uploaded = await initAndUpload(ctx, overlay, options);
+    const overlay = await prepareOverlay(options, { workflowName });
+    report = overlay.report;
+    const uploaded = await thenRemoveOverlay(overlay, () => initAndUpload(ctx, overlay, options));
 
-    // Real origin identity, else synthetic `local/<repo>` (see runSingleFixture).
+    // Real origin identity, else synthetic `local/<repo>` (see buildRemoteFixtureEvent).
     const identity = buildLocalRepoIdentity(overlay.repoRoot);
     const head = localGitHead(overlay);
     if (!head.branch) {
@@ -836,13 +1013,6 @@ async function runDirectWorkflow(
       ...(head.sha && { after: head.sha }),
     };
 
-    const encrypted = await buildEncryptedSecrets(
-      overlay.kiciDir,
-      options.envFlags,
-      options.context,
-      uploaded.publicKey,
-    );
-
     const triggerResult = await ctx.trigger({
       fixtureId,
       event: {
@@ -850,30 +1020,20 @@ async function runDirectWorkflow(
         targetBranch: head.branch ?? FALLBACK_BRANCH,
         payload,
       },
-      uploadId: uploaded.uploadId,
-      cliPublicKey: uploaded.cliPublicKey,
-      ...(encrypted && {
-        encryptedSecrets: encrypted.encryptedSecrets,
-        encryptedSecretsKey: encrypted.cliPublicKey,
-      }),
-      workflowName,
-      inlineLockFile: overlay.inlineLockFile,
-      fullRepo: true,
-      ...(options.checkMode && { checkMode: options.checkMode }),
-      ...(() => {
-        const target = buildTargetSelector(options.targets, options.targetAllowEmpty ?? false);
-        return target ? { target } : {};
-      })(),
-      ...(() => {
-        const descriptor = lookupDispatchInputsDescriptor(overlay.inlineLockFile, workflowName);
-        const dispatchInputs = buildDispatchInputs(options.inputs ?? [], descriptor);
-        return Object.keys(dispatchInputs).length ? { dispatchInputs } : {};
-      })(),
+      ...(await overlayTriggerFields(overlay, uploaded, workflowName, options)),
     });
 
     if (triggerResult.status === 'rejected') {
       logger.error(pc.red(`Rejected: ${triggerResult.reason ?? 'unknown reason'}`));
-      return false;
+      return finishDirectRun(
+        withOverlay({
+          fixtureId,
+          runId: triggerResult.runId,
+          status: 'rejected',
+          reason: triggerResult.reason,
+        }),
+        options,
+      );
     }
 
     // `--workflow` names one workflow, so the trigger creates one run.
@@ -882,13 +1042,25 @@ async function runDirectWorkflow(
       for (const run of runs) logger.info(pc.green(runStartedLine(run)));
     }
 
-    if (options.wait === false) return true;
+    if (options.wait === false) {
+      return finishDirectRun(
+        withOverlay({
+          fixtureId,
+          runId: triggerResult.runId,
+          status: 'accepted',
+          runs: runs.map((r) => ({ ...r, status: 'accepted', jobs: [] })),
+        }),
+        options,
+      );
+    }
 
     const result = await followRuns(ctx, runs, fixtureId, options);
-    return result.status === 'success';
+    return finishDirectRun(withOverlay(result), options);
   } catch (error) {
-    const result = handleRunError(fixtureId, error, options, ctx.kind);
-    return result.status === 'success';
+    return finishDirectRun(
+      withOverlay(handleRunError(fixtureId, error, options, ctx.kind)),
+      options,
+    );
   }
 }
 

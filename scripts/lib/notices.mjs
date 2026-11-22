@@ -12,7 +12,7 @@
  * - `NODE-LICENSE`: in full packages only, the `LICENSE` file of the official
  *   Node.js archive the package embeds, which also covers the npm it bundles.
  */
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { overrideLicenseText } from './license-texts.mjs';
 
@@ -245,6 +245,42 @@ export function collectInstalledPackages(nodeModulesDir, workspaceDirs) {
   return found;
 }
 
+/**
+ * Every package a pnpm install put under `appDir`: each package directory in
+ * `node_modules/.pnpm/<id>/node_modules/` (a real directory, not the links pnpm
+ * places beside it to its dependencies), and each workspace package in
+ * `workspaceDirs`, described from its workspace. pnpm puts every installed
+ * package in that store, so the set is complete however the dependencies nest.
+ *
+ * @param {string} appDir the install root, which holds `node_modules/.pnpm`
+ * @param {string[]} workspaceDirs the workspace packages the install links
+ * @returns {Map<string, NoticePackage>}
+ */
+export function collectPnpmInstalledPackages(appDir, workspaceDirs) {
+  const found = new Map();
+  const add = (dir) => {
+    const { key, pkg } = describePackage(dir);
+    if (!found.has(key)) found.set(key, pkg);
+  };
+  const store = path.join(appDir, 'node_modules', '.pnpm');
+  if (!existsSync(store)) throw new Error(`${store} does not exist: not a pnpm install`);
+  for (const id of readdirSync(store).sort()) {
+    const nm = path.join(store, id, 'node_modules');
+    if (!existsSync(nm) || !lstatSync(nm).isDirectory()) continue;
+    for (const entry of readdirSync(nm).sort()) {
+      const dirs = entry.startsWith('@')
+        ? readdirSync(path.join(nm, entry)).map((n) => path.join(nm, entry, n))
+        : [path.join(nm, entry)];
+      for (const dir of dirs) {
+        if (lstatSync(dir).isSymbolicLink()) continue;
+        if (existsSync(path.join(dir, 'package.json'))) add(dir);
+      }
+    }
+  }
+  for (const dir of workspaceDirs) add(dir);
+  return found;
+}
+
 // ─── Rendering ───────────────────────────────────────────────────────────────
 
 const RULE = '='.repeat(80);
@@ -263,16 +299,19 @@ function normalizeText(text) {
 /**
  * THIRD-PARTY-NOTICES for a package: one entry per package, sorted by name
  * and version. A text already printed, or equal to the package's own LICENSE,
- * is referred to instead of repeated.
+ * is referred to instead of repeated. With no `licenseText` (a package that
+ * carries no LICENSE file), the header does not point at one.
  *
  * @param {{ component: string, version: string,
  *   packages: Map<string, NoticePackage>, licenseText: string }} opts
  */
 export function renderNotices({ component, version, packages, licenseText }) {
   /** Normalized text → the sentence that refers to where it was printed. */
-  const seen = new Map([
-    [normalizeText(licenseText), 'The same text as the LICENSE file of this package.'],
-  ]);
+  const seen = new Map(
+    licenseText
+      ? [[normalizeText(licenseText), 'The same text as the LICENSE file of this package.']]
+      : [],
+  );
   const out = [
     'THIRD-PARTY NOTICES',
     '',
@@ -280,8 +319,12 @@ export function renderNotices({ component, version, packages, licenseText }) {
     'a package, its version, the license the package declares, and the license text the',
     'package carries. The build writes this file from the files it puts into this package.',
     '',
-    'LICENSE gives the license of this package. LICENSES.md explains how the KiCI packages are',
-    'licensed.',
+    ...(licenseText
+      ? [
+          'LICENSE gives the license of this package. LICENSES.md explains how the KiCI packages are',
+          'licensed.',
+        ]
+      : ['LICENSES.md explains how the KiCI packages are licensed.']),
   ];
   const keys = [...packages.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   for (const key of keys) {
@@ -333,25 +376,46 @@ export function parseNoticesPackages(text) {
 }
 
 /**
- * SOURCE: where the source code of the release is.
+ * SOURCE: where the source code of the release is. A package that no release
+ * built (`release: false`) names no tag, because none exists for it. With
+ * `license: false` (a package that carries no LICENSE file), it does not point
+ * at one.
  *
- * @param {{ component: string, version: string, type: 'full' | 'light' }} opts
+ * @param {{ component: string, version: string, type: 'full' | 'light',
+ *   release?: boolean, license?: boolean }} opts
  */
-export function renderSource({ component, version, type }) {
+export function renderSource({ component, version, type, release = true, license = true }) {
+  const where = release
+    ? [
+        `The source code of this package is the kici-dev/kici-public repository at tag v${version}:`,
+        '',
+        `  ${PUBLIC_REPO_URL}/tree/v${version}`,
+        '',
+        'To download it as an archive:',
+        '',
+        `  ${PUBLIC_REPO_URL}/archive/refs/tags/v${version}.tar.gz`,
+      ]
+    : [
+        'No release built this package, so no release tag names its source code. The source',
+        'code of each release is the kici-dev/kici-public repository at the tag of the release:',
+        '',
+        `  ${PUBLIC_REPO_URL}/tags`,
+      ];
   const lines = [
     `${component} ${version}`,
     '',
-    `The source code of this package is the kici-dev/kici-public repository at tag v${version}:`,
+    ...where,
     '',
-    `  ${PUBLIC_REPO_URL}/tree/v${version}`,
-    '',
-    'To download it as an archive:',
-    '',
-    `  ${PUBLIC_REPO_URL}/archive/refs/tags/v${version}.tar.gz`,
-    '',
-    'LICENSE gives the license of this package. LICENSES.md explains how the KiCI packages are',
-    'licensed. THIRD-PARTY-NOTICES names the other software in this package and gives its',
-    'licenses.',
+    ...(license
+      ? [
+          'LICENSE gives the license of this package. LICENSES.md explains how the KiCI packages are',
+          'licensed. THIRD-PARTY-NOTICES names the other software in this package and gives its',
+          'licenses.',
+        ]
+      : [
+          'LICENSES.md explains how the KiCI packages are licensed. THIRD-PARTY-NOTICES names the',
+          'other software in this package and gives its licenses.',
+        ]),
   ];
   if (type === 'full') {
     lines.push(
@@ -360,6 +424,22 @@ export function renderSource({ component, version, type }) {
     );
   }
   return `${lines.join('\n')}\n`;
+}
+
+/**
+ * Runs a notices script's `main`: an error prints one `[label] message` line and exits 1, so an
+ * image build shows the reason (a package with no license text) instead of a stack trace.
+ *
+ * @param {string} label
+ * @param {() => void} main
+ */
+export function runReportingErrors(label, main) {
+  try {
+    main();
+  } catch (err) {
+    console.error(`[${label}] ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
 }
 
 // ─── The archive check ───────────────────────────────────────────────────────

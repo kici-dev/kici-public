@@ -132,7 +132,7 @@ scalers:
             cpus: 4
 ```
 
-Memory values use container-style suffixes: `k` (kilobytes), `m` (megabytes), `g` (gigabytes). Case-insensitive.
+Memory values use binary suffixes: `k` (KiB), `m` (MiB), `g` (GiB), so `2g` is 2 × 1024³ bytes. The suffix is case-insensitive, and the number can have a decimal part (`1.5g`).
 
 See each backend page for how `limits` are enforced: [Container](./container.md), [Bare-metal](./bare-metal.md#cgroup-enforcement), [Firecracker](./firecracker.md).
 
@@ -191,6 +191,18 @@ kici-admin org-settings scaler-spawn-timeout reset --org <customerId>
 ```
 
 Lower it for a tenant whose registry is fast and local (so a genuine hang is caught sooner); leave it at the default when large cold pulls are expected.
+
+## Spawn failures
+
+A spawn can fail before its agent connects: the agent image is missing, the container runtime returns an error, or the spawn deadline passes. The orchestrator then does these things:
+
+- **Reports it.** `kici-admin diagnose` shows the failure on the `scaler:<name>` row. While the scaler is deferred, the row starts with `failing (<n> in a row, next try in <s>s)`, also after the failures leave the five-minute window.
+- **Revokes the agent token.** The ephemeral token minted for the agent is revoked at once, so a failed spawn leaves no token that can register an agent.
+- **Defers the scaler.** The first failure is retried at once. Each further consecutive failure defers the next spawn for that scaler: first `scaler-provision-backoff-base-ms`, then double each time, up to `scaler-provision-backoff-max-ms`. A warm pool on that scaler waits too. An agent that registers clears it. These are the cluster settings described in [Retry backoff](../event-scaler.md#retry-backoff).
+- **Counts spawns that fail together once.** A consecutive failure is a failed round of spawns, not each spawn. When eight spawns are in progress and the container runtime is unavailable for a short time, all eight fail, and the count goes up by one. A spawn that started after the last count went up starts a new round.
+- **Frees the capacity.** The deferral is per scaler name. Other scalers, and jobs that wait for them, are not held back.
+
+A host that refuses the launch outright is deferred from the first failure. See [Launch failures](./bare-metal.md#launch-failures).
 
 ## At-capacity queueing and re-dispatch
 
@@ -485,8 +497,8 @@ beside it, an object store, a metrics sink.
 The two are separate because the operating system delivers the two kinds of
 traffic on different hooks. A packet addressed to one of the host's own
 addresses never traverses the forwarding path the other two fields filter. So
-before `hostAccess` existed, an agent reached every port on every address of its
-orchestrator host.
+`allowlist` and `denyAll` never decide which host ports an agent reaches; only
+`hostAccess` does.
 
 Each entry is `<cidr|address|*>` with an optional `:<port|*>`, and a bare number
 is a port:
@@ -541,13 +553,11 @@ Bare-metal **process** mode has no network isolation. Agents run as child proces
 ### Where a policy sits in the rule order
 
 A per-agent rule is always evaluated before the host baseline, which the chain
-reaches through a `jump` as its last rule. Two consequences worth stating,
-because both were false in earlier releases:
+reaches through a `jump` as its last rule. Two consequences follow:
 
 - **`denyAll: true` denies.** The per-agent drop is reached before the
-  baseline's blanket internet accept. An operator upgrading from a release
-  where `denyAll` silently granted full egress will see previously-working
-  outbound calls start to fail — which is the configured policy taking effect.
+  baseline's blanket internet accept, so a label set with `denyAll: true`
+  loses every outbound connection its `allowlist` does not name.
 - **An `allowlist` entry inside a denied range is reachable.** The accept
   precedes the RFC1918 drops, so allowlisting a `10.x` registry works.
 
@@ -572,4 +582,4 @@ KICI_BACKPRESSURE_MODE=pause
 | `pause` | Yes     | Pauses child process stdout when WS buffer exceeds 1 MB. Resumes on drain. Guarantees complete logs. | Most workloads -- complete log output is more important than speed         |
 | `drop`  | No      | Drops log lines when WS buffer is full. Inserts `[N lines dropped due to backpressure]` markers.     | Extremely verbose workloads where speed matters more than log completeness |
 
-**Safety timeout (pause mode):** If stdout remains paused for more than 30 seconds, the agent temporarily switches to drop mode to prevent deadlocks. This can happen if the WebSocket connection is completely stalled.
+**Safety timeout (pause mode):** If stdout remains paused for more than 30 seconds, the agent drops the buffered log lines and resumes stdout, to prevent a deadlock. The next log chunk the agent sends starts with a `[N lines dropped due to backpressure]` marker for them. This can happen if the WebSocket connection is completely stalled.

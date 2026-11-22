@@ -6,7 +6,7 @@ import { $ } from 'zx';
 
 /** The container-pin tooling rewrites this pin in place when the image is bumped. */
 export const DB_TEST_PG_IMAGE =
-  'dhi.io/postgres:18.6-debian13@sha256:876afc8de37548fa24114cf3f4dcdbf4d540229673f5667ca6db9b140d5eb56b';
+  'dhi.io/postgres:18.7-debian13@sha256:aa7646c92c4e2bc16339f22e2ff560acbd72d122c80b637894b5b23b8d611cf8';
 
 /** Env var the gated suites read at module scope to decide whether to run. */
 export const DB_GATE_ENV = 'KICI_TEST_ADMIN_DATABASE_URL';

@@ -1,36 +1,33 @@
-/** Disk space check on the root partition via `df`: warn < 1GB, fail < 100MB. */
+/**
+ * Disk space check on the root filesystem: warn < 1GB, fail < 100MB.
+ *
+ * Read with `statfs(2)` in-process, not `df`: the orchestrator image ships no `df`, so a check
+ * that spawned it failed on every containerized orchestrator.
+ */
 
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { statfs } from 'node:fs/promises';
 import type { DiagnosticDeps, DiagnosticResult } from '../types.js';
 import { toErrorMessage } from '@kici-dev/shared';
-
-const execFileAsync = promisify(execFile);
 
 const WARN_THRESHOLD_BYTES = 1024 * 1024 * 1024; // 1GB
 const FAIL_THRESHOLD_BYTES = 100 * 1024 * 1024; // 100MB
 
-export async function checkDiskSpace(_deps: DiagnosticDeps): Promise<DiagnosticResult> {
+/** The bytes an unprivileged process can still write to the filesystem holding `path`. */
+export type AvailableBytesReader = (path: string) => Promise<number>;
+
+const readAvailableBytes: AvailableBytesReader = async (path) => {
+  const stats = await statfs(path);
+  return Number(stats.bavail) * Number(stats.bsize);
+};
+
+export async function checkDiskSpace(
+  _deps: DiagnosticDeps,
+  availableBytesOf: AvailableBytesReader = readAvailableBytes,
+): Promise<DiagnosticResult> {
   const start = Date.now();
 
   try {
-    // POSIX output, 1K blocks
-    const { stdout } = await execFileAsync('df', ['-Pk', '/']);
-    const lines = stdout.trim().split('\n');
-
-    if (lines.length < 2) {
-      return {
-        name: 'Disk space',
-        status: 'fail',
-        message: 'Unable to parse df output',
-        durationMs: Date.now() - start,
-      };
-    }
-
-    // filesystem 1K-blocks used available capacity mountpoint
-    const parts = lines[1].split(/\s+/);
-    const availableKb = parseInt(parts[3], 10);
-    const availableBytes = availableKb * 1024;
+    const availableBytes = await availableBytesOf('/');
     const durationMs = Date.now() - start;
     const availableGb = (availableBytes / (1024 * 1024 * 1024)).toFixed(1);
 

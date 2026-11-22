@@ -43,6 +43,26 @@ describe('buildSanitizedEnv', () => {
     expect(env).not.toHaveProperty('WEBHOOK_SECRET');
   });
 
+  it('passes the TLS trust settings an operator sets for a private CA', () => {
+    process.env.GIT_SSL_CAINFO = '/etc/kici/ghes-ca.pem';
+    process.env.NODE_EXTRA_CA_CERTS = '/etc/kici/ghes-ca.pem';
+    process.env.SSL_CERT_FILE = '/etc/ssl/bundle.pem';
+    process.env.SSL_CERT_DIR = '/etc/ssl/certs';
+    process.env.GIT_SSL_CAPATH = '/etc/ssl/certs';
+
+    const env = buildSanitizedEnv({});
+
+    // fails-when: a job's clone from a server under a private CA fails with
+    //   "unable to get local issuer certificate" although the agent trusts the CA
+    expect(env).toMatchObject({
+      GIT_SSL_CAINFO: '/etc/kici/ghes-ca.pem',
+      NODE_EXTRA_CA_CERTS: '/etc/kici/ghes-ca.pem',
+      SSL_CERT_FILE: '/etc/ssl/bundle.pem',
+      SSL_CERT_DIR: '/etc/ssl/certs',
+      GIT_SSL_CAPATH: '/etc/ssl/certs',
+    });
+  });
+
   it('includes user env vars', () => {
     const env = buildSanitizedEnv({ MY_VAR: 'hello', API_KEY: 'user-key' });
 

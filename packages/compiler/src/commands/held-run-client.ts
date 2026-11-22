@@ -5,6 +5,7 @@
  */
 
 import pc from 'picocolors';
+import { platformFetch } from '../remote/platform-fetch.js';
 import { logger } from '@kici-dev/core';
 import { loadGlobalConfig } from '../remote/config.js';
 import type { HeldRunSummary } from '@kici-dev/engine';
@@ -78,7 +79,7 @@ export async function listHeldRunsForRun(
   runId: string,
 ): Promise<HeldRunSummary[]> {
   const url = `${ctx.endpoint}/api/v1/orgs/${ctx.orgId}/held-runs?runId=${encodeURIComponent(runId)}`;
-  const response = await fetch(url, { method: 'GET', headers: authHeaders(ctx.token) });
+  const response = await platformFetch(url, { method: 'GET', headers: authHeaders(ctx.token) });
   if (!response.ok) {
     throw new HeldRunRequestError(await describeError(response), response.status);
   }
@@ -97,7 +98,7 @@ export async function postApprove(
 ): Promise<boolean> {
   const query = autoApprove ? '?auto=1' : '';
   const url = `${ctx.endpoint}/api/v1/orgs/${ctx.orgId}/held-runs/${heldRunId}/approve${query}`;
-  const response = await fetch(url, { method: 'POST', headers: authHeaders(ctx.token) });
+  const response = await platformFetch(url, { method: 'POST', headers: authHeaders(ctx.token) });
   if (!response.ok) {
     logger.error(pc.red(await describeError(response)));
     return false;
@@ -112,7 +113,7 @@ export async function postReject(
   reason: string,
 ): Promise<boolean> {
   const url = `${ctx.endpoint}/api/v1/orgs/${ctx.orgId}/held-runs/${heldRunId}/reject`;
-  const response = await fetch(url, {
+  const response = await platformFetch(url, {
     method: 'POST',
     headers: authHeaders(ctx.token),
     body: JSON.stringify({ reason }),

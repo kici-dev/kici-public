@@ -5,6 +5,7 @@
  */
 
 import pc from 'picocolors';
+import { platformFetch } from '../remote/platform-fetch.js';
 import { loadGlobalConfig, mergeGlobalConfig, type GlobalConfig } from '../remote/config.js';
 
 export interface OrchestratorsOptions {
@@ -49,7 +50,7 @@ async function fetchOrchestrators(
   orgId: string,
 ): Promise<OrchestratorEntry[] | null> {
   const url = `${config.platformEndpoint}/api/v1/orgs/${orgId}/orchestrators`;
-  const response = await fetch(url, {
+  const response = await platformFetch(url, {
     headers: { Authorization: `Bearer ${config.pat}`, 'Content-Type': 'application/json' },
   });
 

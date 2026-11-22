@@ -26,6 +26,31 @@ function defaultExecFileSync(cmd: unknown, args: unknown[], opts: unknown) {
 
 const { execFileSync } = await import('node:child_process');
 
+/** First rev-parse mismatches, later ones match; `failFirstCheckout` throws on the first checkout. */
+function mismatchOnce(failFirstCheckout = false): void {
+  let revParseCount = 0;
+  let checkoutCount = 0;
+  vi.mocked(execFileSync).mockImplementation(((cmd: unknown, args: unknown[], opts: unknown) => {
+    const argsArr = (args ?? []) as string[];
+    execFileSyncCalls.push({
+      cmd: cmd as string,
+      args: argsArr,
+      opts: (opts ?? {}) as Record<string, unknown>,
+    });
+    if (argsArr.includes('rev-parse')) {
+      revParseCount++;
+      return revParseCount === 1 ? 'deadbeef12345\n' : 'abc123def456789\n';
+    }
+    if (argsArr.includes('checkout')) {
+      checkoutCount++;
+      if (failFirstCheckout && checkoutCount === 1) {
+        throw new Error('fatal: reference is not a tree: abc123');
+      }
+    }
+    return Buffer.from('');
+  }) as any);
+}
+
 describe('gitClone', () => {
   beforeEach(() => {
     execFileSyncCalls = [];
@@ -208,21 +233,7 @@ describe('gitClone', () => {
   });
 
   it('deepens and checks out on SHA mismatch then succeeds', async () => {
-    let revParseCount = 0;
-    vi.mocked(execFileSync).mockImplementation(((cmd: unknown, args: unknown[], opts: unknown) => {
-      const argsArr = (args ?? []) as string[];
-      execFileSyncCalls.push({
-        cmd: cmd as string,
-        args: argsArr,
-        opts: (opts ?? {}) as Record<string, unknown>,
-      });
-      if (argsArr.includes('rev-parse')) {
-        revParseCount++;
-        // First rev-parse: mismatch; second: match
-        return revParseCount === 1 ? 'deadbeef12345\n' : 'abc123def456789\n';
-      }
-      return Buffer.from('');
-    }) as any);
+    mismatchOnce();
 
     await expect(
       gitClone({
@@ -240,21 +251,7 @@ describe('gitClone', () => {
   });
 
   it('passes safe.directory env override to all git commands for file:// URLs', async () => {
-    let revParseCount = 0;
-    vi.mocked(execFileSync).mockImplementation(((cmd: unknown, args: unknown[], opts: unknown) => {
-      const argsArr = (args ?? []) as string[];
-      execFileSyncCalls.push({
-        cmd: cmd as string,
-        args: argsArr,
-        opts: (opts ?? {}) as Record<string, unknown>,
-      });
-      if (argsArr.includes('rev-parse')) {
-        revParseCount++;
-        // First rev-parse: mismatch; second: match
-        return revParseCount === 1 ? 'deadbeef12345\n' : 'abc123def456789\n';
-      }
-      return Buffer.from('');
-    }) as any);
+    mismatchOnce();
 
     await gitClone({
       repoUrl: 'file:///home/user/repo',
@@ -455,6 +452,119 @@ describe('gitClone', () => {
         }),
       ).rejects.toThrow();
       expect(deferred).toHaveLength(1);
+    });
+  });
+  describe('checkout depth and tags', () => {
+    const base = {
+      repoUrl: 'https://github.com/org/repo.git',
+      ref: 'main',
+      sha: '',
+      workDir: '/tmp/work',
+    };
+
+    it('no options ⇒ the exact argv used today', async () => {
+      await gitClone(base);
+      // breaks-if-wrong: every real-run job without options must see exactly what it sees now
+      expect(execFileSyncCalls[0].args).toEqual([
+        'clone',
+        '--depth',
+        '1',
+        '--branch',
+        'main',
+        'https://github.com/org/repo.git',
+        '/tmp/work',
+      ]);
+    });
+
+    it('depth 0 clones with no --depth', async () => {
+      // fails-when: depth 0 is passed through as `--depth 0`, which git rejects
+      await gitClone({ ...base, depth: 0 });
+      expect(execFileSyncCalls[0].args).toEqual([
+        'clone',
+        '--branch',
+        'main',
+        'https://github.com/org/repo.git',
+        '/tmp/work',
+      ]);
+    });
+
+    it('fetchTags false adds --no-tags', async () => {
+      await gitClone({ ...base, fetchTags: false });
+      expect(execFileSyncCalls[0].args).toEqual([
+        'clone',
+        '--depth',
+        '1',
+        '--no-tags',
+        '--branch',
+        'main',
+        'https://github.com/org/repo.git',
+        '/tmp/work',
+      ]);
+    });
+
+    it('fetchTags true at depth 3 fetches every tag after the clone', async () => {
+      await gitClone({
+        ...base,
+        sha: 'abc123',
+        depth: 3,
+        fetchTags: true,
+        gitAuth: { kind: 'basic', user: 'x-access-token', secret: 'ghs_tags' },
+      });
+      const basicB64 = Buffer.from('x-access-token:ghs_tags').toString('base64');
+      // fails-when: a shallow clone with fetchTags: true never fetches the tags
+      expect(execFileSyncCalls[1].args).toEqual([
+        '-C',
+        '/tmp/work',
+        '-c',
+        `http.extraHeader=Authorization: Basic ${basicB64}`,
+        'fetch',
+        '--depth',
+        '3',
+        '--tags',
+        'origin',
+      ]);
+      expect(execFileSyncCalls[2].args).toContain('rev-parse');
+    });
+
+    it('fetchTags true at depth 0 needs no extra fetch', async () => {
+      await gitClone({ ...base, sha: 'abc123', depth: 0, fetchTags: true });
+      expect(execFileSyncCalls.some((c) => c.args.includes('fetch'))).toBe(false);
+    });
+
+    it('depth 0 skips the depth-50 deepen on a SHA mismatch', async () => {
+      mismatchOnce();
+      await gitClone({ ...base, sha: 'abc123', depth: 0 });
+      // fails-when: the full clone runs fetch --depth 50 and turns into a shallow repository
+      expect(execFileSyncCalls.some((c) => c.args.includes('--depth'))).toBe(false);
+      expect(execFileSyncCalls.some((c) => c.args.includes('fetch'))).toBe(false);
+      expect(
+        execFileSyncCalls.some((c) => c.args.includes('checkout') && c.args.includes('abc123')),
+      ).toBe(true);
+    });
+
+    it('depth 0 fetches the missing sha without --depth when checkout fails', async () => {
+      mismatchOnce(true);
+      await expect(gitClone({ ...base, sha: 'abc123', depth: 0 })).resolves.toBeUndefined();
+      const fetchCall = execFileSyncCalls.find((c) => c.args.includes('fetch'));
+      expect(fetchCall!.args).toEqual(['-C', '/tmp/work', 'fetch', 'origin', 'abc123']);
+      const checkouts = execFileSyncCalls.filter((c) => c.args.includes('checkout'));
+      expect(checkouts).toHaveLength(2);
+    });
+
+    it('depth 80 deepens by 80, not 50, on a SHA mismatch', async () => {
+      mismatchOnce();
+      await gitClone({ ...base, sha: 'abc123', depth: 80 });
+      const fetchCall = execFileSyncCalls.find((c) => c.args.includes('fetch'));
+      // fails-when: the deepen stays at 50 and returns less history than the job asked for
+      expect(fetchCall!.args).toEqual([
+        '-C',
+        '/tmp/work',
+        'fetch',
+        '--depth',
+        '80',
+        'origin',
+        'abc123',
+      ]);
     });
   });
 });

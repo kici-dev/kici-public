@@ -78,6 +78,42 @@ describeWithTestDb<Database>(
       );
     });
 
+    it('forwards the server of a run from a GitHub Enterprise Server source', async () => {
+      const onExecutionStatusChange = vi.fn();
+      const tracker = new ExecutionTracker({
+        db,
+        onExecutionStatusChange,
+        githubSourceOf: (rk) =>
+          rk === 'github:7' ? { githubUrl: 'https://ghe.corp.example' } : {},
+      });
+      const ghesRun = randomUUID();
+      const dotcomRun = randomUUID();
+      await startRun(tracker, {
+        runId: ghesRun,
+        workflowName: 'build',
+        repoIdentifier: 'acme/app',
+        ref: 'main',
+        sha: 'headsha',
+        deliveryId: null,
+        jobs: [],
+        routingKey: 'github:7',
+        providerContext: { installationId: 7 },
+      });
+      await start(tracker, dotcomRun, []);
+
+      expect(await tracker.cancelJoblessRun(ghesRun, REASON)).toBe(true);
+      expect(await tracker.cancelJoblessRun(dotcomRun, REASON)).toBe(true);
+
+      const cancelledCtx = (runId: string) =>
+        onExecutionStatusChange.mock.calls.find(
+          (call) => call[0] === runId && call[1] === ExecutionRunStatus.enum.cancelled,
+        )![2];
+      // fails-when: a frame built from the run row drops the server of the run's source
+      expect(cancelledCtx(ghesRun)).toMatchObject({ githubUrl: 'https://ghe.corp.example' });
+      // breaks-if-wrong: a github.com run's frame context gains no key
+      expect(cancelledCtx(dotcomRun)).not.toHaveProperty('githubUrl');
+    });
+
     it('leaves a pending run that has a job row untouched', async () => {
       const onExecutionStatusChange = vi.fn();
       const tracker = new ExecutionTracker({ db, onExecutionStatusChange });

@@ -88,14 +88,14 @@ scalers: []
 
 ## Metrics
 
-The orchestrator exposes four counters and gauges for an event scaler, labeled by `scaler`:
+The orchestrator exposes these counters and gauges for an event scaler, labeled by `scaler`:
 
 - `kici_orch_scaler_scale_up_emitted_total{scaler}` — Cumulative scale-up events emitted.
 - `kici_orch_scaler_scale_down_emitted_total{scaler,reason}` — Cumulative scale-down events emitted, labeled also by teardown `reason`.
 - `kici_orch_scaler_external_provisioning_active{scaler}` — Current in-flight provisions (provisioning plus active). A value that stays non-zero with no matching agent registration points at a stuck provisioning workflow.
 - `kici_orch_scaler_external_provision_timeout_total{scaler}` — Cumulative provisions torn down because the agent never registered in time.
 
-`maxAgents` is counted across the whole cluster for an event scaler, so two more series cover that check:
+`maxAgents` is counted across the whole cluster for an event scaler, so these series cover that check:
 
 - `kici_orch_scaler_spawn_refusals_total` — Cumulative spawn requests refused by a cap, the cluster-wide `maxAgents` included. A rising rate means the cap is doing its job; raise it, or let jobs queue.
 - `kici_orch_scaler_cap_lock_failures_total{reason}` — Cumulative cap checks that failed, so the spawn was refused without the cap being evaluated. This is never a capacity signal. `reason="unreachable"` means the orchestrator database is stalled and event autoscaling is stopped until it recovers. `reason="contended"` means the database is healthy but several coordinators are scaling this scaler at once and one gave up waiting; the job is re-offered on the next dispatch pass. The `ScalerCapCheckUnreachable` rule in the [monitoring pack](../observability/monitoring-pack.md) alerts on the `unreachable` half only, because contention resolves itself on the next dispatch pass.
@@ -104,7 +104,7 @@ A scale-up or scale-down that reaches no workflow has its own counter:
 
 - `kici_orch_event_unmatched_total{event_name,reason}` — Cumulative reserved `kici.scaler.*` events that matched no subscribing workflow. `reason` is the match outcome (`no-registration`, `no-target-repo`, `trust-blocked`, `no-trigger-match`, `buffered`). Any increment is a misconfiguration: a scale-up that no workflow provisions, or a scale-down that no workflow runs.
 
-The reaper described under [Teardown](#teardown) adds two unlabeled gauges:
+The reaper described under [Teardown](#teardown) adds these unlabeled gauges:
 
 - `kici_orch_scaler_reap_unseen_provisions` — Provisions whose agent has been registered on no coordinator for at least the flap grace, being timed before teardown. An agent that reads as absent only briefly — its own reconnect, or a peer flap that empties a coordinator's advertised agent list — never reaches this gauge.
 - `kici_orch_scaler_reap_blocked` — `1` while the reaper is standing down because this coordinator is connected to none of the coordinator peers it knows.
@@ -150,9 +150,11 @@ Without a deferral, a scaler whose provider is down is asked for a new provision
 
 Consecutive failures therefore arm a growing deferral. The first failure defers the next request by the base delay; each further consecutive failure doubles it, up to a ceiling. Any successful registration clears the count, including an agent another coordinator adopted — that provision worked, whichever coordinator the agent reached.
 
+The count is per round of provisions, not per provision. A provision requested before the count last went up belongs to that round, so its failure does not add to the count. For example, eight provisions requested together that all fail move the deferral one step, not eight.
+
 The state is per scaler **name**, so one failing scaler never defers another. Two event scalers usually drive two different providers, and an outage at one says nothing about the other.
 
-A bare-metal or Firecracker scaler uses the same state and the same settings when an agent never starts: the host refuses the launch, or the agent stops before it connects. See [Launch failures](./auto-scaler/bare-metal.md#launch-failures).
+A container, bare-metal or Firecracker scaler uses the same state and settings when an agent never starts. The host refuses the launch, the agent stops before it connects, or the spawn itself fails. See [Launch failures](./auto-scaler/bare-metal.md#launch-failures) and [Spawn failures](./auto-scaler/common-config.md#spawn-failures).
 
 Each coordinator reports the provisions it asked for itself, so on a cluster every coordinator backs off — and answers `kici-admin diagnose` — from its own experience rather than waiting for the leader. The leader also reports the provisions its reaper condemns, whoever asked for them. A provision that another coordinator adopted is not a failure, so nobody reports it. The coordinator that asked for it is never told that the agent arrived, so it checks the durable record of what became of the provision before it reports. That record outlives the provision itself, so a provision that was adopted and has since been torn down is still recognised as one that worked. A coordinator that has not yet asked for a provision from a failing scaler has nothing to go on and makes one attempt, then defers like the rest. Inside one coordinator, a dead provision is reported once, however many of that coordinator's own observers see it. The count is per coordinator, so two coordinators that both see the same dead provision each count it once.
 

@@ -18,6 +18,11 @@ import {
   type RunLogPosition,
 } from '../remote/platform-client.js';
 import { HoldsUnavailableError } from '../remote/direct-client.js';
+import {
+  ReadRetryExhaustedError,
+  readWithRetry,
+  type ReadRetryOptions,
+} from '../remote/read-retry.js';
 import type { RunRemoteTransport } from '../remote/run-transport.js';
 import {
   formatErrorHighlight,
@@ -47,6 +52,12 @@ const CANCEL_REQUEST_TIMEOUT_MS = 15_000;
 
 /** 128 + SIGINT, the shell convention. */
 const SIGINT_EXIT_CODE = 130;
+
+export interface FollowRunsOptions {
+  /** Retry for the status and log reads; a refusal (4xx) still fails at once. */
+  readRetry?: ReadRetryOptions;
+  pollIntervalMs?: number;
+}
 
 export interface FollowedRun {
   runId: string;
@@ -118,18 +129,23 @@ function consumeLogs(
   watch.position = nextLogPosition(logs);
 }
 
+/** Both reads are idempotent (the log read resumes from the same position), so both retry. */
 async function pollRun(
   ctx: RunRemoteTransport,
   watch: RunWatch,
   startTime: number,
   prefix: string,
   options: RemoteRunOptions,
+  retry: ReadRetryOptions,
 ): Promise<void> {
+  const { runId } = watch.run;
+  const read = { signal: retry.signal };
   let logs: PlatformRunLogsResponse;
   try {
-    logs = await ctx.logs(watch.run.runId, watch.position);
-    watch.lastStatus = await ctx.status(watch.run.runId);
+    logs = await readWithRetry(() => ctx.logs(runId, watch.position, read), retry);
+    watch.lastStatus = await readWithRetry(() => ctx.status(runId, read), retry);
   } catch (err) {
+    if (err instanceof ReadRetryExhaustedError) throw lostContact(ctx, watch, err);
     if (
       err instanceof NotFoundError &&
       !watch.seen &&
@@ -151,14 +167,48 @@ async function pollRun(
   if (!terminal) await watchRunHolds(watch.run.runId, watch.holdState, ctx, options);
 }
 
+/** The status reads kept failing; the message names the run and says it was left running. */
+class LostContactError extends Error {}
+
+function lostContact(
+  ctx: RunRemoteTransport,
+  watch: RunWatch,
+  err: ReadRetryExhaustedError,
+): LostContactError {
+  const server = ctx.kind === 'platform' ? 'the Platform' : 'the orchestrator';
+  const seen = watch.lastStatus
+    ? `It was last seen as "${watch.lastStatus.status}".`
+    : 'Its status was never read.';
+  return new LostContactError(
+    `Stopped following run ${watch.run.runId}: its status reads to ${server} ${err.message}. ` +
+      `${seen} The run continues on the orchestrator; it was not cancelled.`,
+    { cause: err },
+  );
+}
+
 /** A run is done only when its status is terminal and its log stream has drained. */
 export async function followRuns(
   ctx: RunRemoteTransport,
   runs: FollowedRun[],
   fixtureId: string,
   options: RemoteRunOptions,
+  follow: FollowRunsOptions = {},
 ): Promise<RemoteRunResult> {
   const startTime = Date.now();
+  const stopRetrying = new AbortController();
+  const retryFor = (runId: string): ReadRetryOptions => ({
+    ...follow.readRetry,
+    signal: stopRetrying.signal,
+    onTransientFailure: (err, attempt) => {
+      follow.readRetry?.onTransientFailure?.(err, attempt);
+      if (attempt !== 1) return;
+      const line = pc.yellow(
+        `Could not read the status of run ${runId} (${toErrorMessage(err)}); retrying.`,
+      );
+      if (options.quiet) process.stderr.write(`${line}\n`);
+      else logger.warn(line);
+    },
+  });
   const watches: RunWatch[] = runs.map((run) => ({
     run,
     position: FIRST_LOG_POSITION,
@@ -179,6 +229,7 @@ export async function followRuns(
   const cancelHandler = () => {
     const live = watches.filter((w) => !w.done).map((w) => w.run.runId);
     if (!cancelRequest) {
+      stopRetrying.abort();
       cancelRequest = Promise.all(live.map((id) => requestRunCancel(ctx, id, options))).then(
         () => undefined,
       );
@@ -195,15 +246,32 @@ export async function followRuns(
       for (const watch of watches) {
         if (watch.done || cancelRequest) continue;
         try {
-          await pollRun(ctx, watch, startTime, prefixOf(watch.run), options);
+          await pollRun(
+            ctx,
+            watch,
+            startTime,
+            prefixOf(watch.run),
+            options,
+            retryFor(watch.run.runId),
+          );
         } catch (err) {
+          if (cancelRequest) break;
           // One unreadable run must not leave the others unwatched and uncancelled.
           Object.assign(watch, { done: true, doneAt: Date.now(), error: err });
-          logger.error(pc.red(`Stopped following run ${watch.run.runId}: ${toErrorMessage(err)}`));
+          const message = toErrorMessage(err);
+          logger.error(
+            pc.red(
+              err instanceof LostContactError
+                ? message
+                : `Stopped following run ${watch.run.runId}: ${message}`,
+            ),
+          );
         }
       }
       if (cancelRequest || watches.every((w) => w.done)) break;
-      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+      await new Promise((resolve) =>
+        setTimeout(resolve, follow.pollIntervalMs ?? POLL_INTERVAL_MS),
+      );
     }
 
     if (cancelRequest) {

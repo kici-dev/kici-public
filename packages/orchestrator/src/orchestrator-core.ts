@@ -102,7 +102,7 @@ import {
 import { IngestOverflowBuffer } from './webhook/ingest-overflow-buffer.js';
 import { IngestOverflowReplayer } from './webhook/ingest-overflow-replayer.js';
 import { AgentMetricsAggregator } from './metrics/agent-metrics-aggregator.js';
-import { createApp, SourceLocationStore } from './app.js';
+import { createApp, SourceLocationStore, type AppDependencies } from './app.js';
 import { LocalDevSigner, KICI_LOCAL_ISSUER, type LocalSigner } from './oidc/local-dev-signer.js';
 import { FleetAgentCollector } from './ws/fleet-agent-collector.js';
 import { FLEET_NODE_TIMEOUT_MS } from './diagnostics/fleet-constants.js';
@@ -119,6 +119,7 @@ import {
   VariantKind,
   ExecutionJobStatus,
   reservedEventNamePrefix,
+  repoIdentifierFromUrl,
   type PeerHeartbeat,
   type CacheRefScope,
   type PeerLogsCollectRequest,
@@ -218,6 +219,7 @@ import {
   type InternalEventDispatchContext,
 } from './pipeline/internal-event-pipeline.js';
 import { restorePendingWorkflowContexts } from './pipeline/pending-workflow-context.js';
+import { jobConfigForAgent } from './pipeline/checkout-job-config.js';
 import { SummonRefusedError } from './pipeline/invoke-gate.js';
 import type { InvokeGateDeps, SummonArgs, SummonedRun } from './pipeline/invoke-gate.js';
 import { recomputeNeedsSatisfied } from './pipeline/needs-scheduler.js';
@@ -246,8 +248,6 @@ import { StaleRunDetector } from './stale-detector/stale-run-detector.js';
 import { PendingPrecursorDbWatcher } from './cache/pending-precursor-db-watcher.js';
 import { WorkflowDeadlineDetector } from './stale-detector/workflow-deadline-detector.js';
 import { GateDeadlineDetector } from './stale-detector/gate-deadline-detector.js';
-import type { HeldRunStore, ReleaseSignal } from './contexts/held-runs.js';
-import type { StepApprovalBridge } from './approvals/step-approval-bridge.js';
 import { cancelRunWithReason } from './cancel/cancel-run.js';
 import { sweepStuckCancelling } from './cancel/sweep-stuck-cancelling.js';
 import {
@@ -261,7 +261,7 @@ import {
   PlanHeadroomStore,
   createClusterHealthRoutes,
 } from './cluster/index.js';
-import { extractRepoIdentifier } from './entry-helpers.js';
+import { dispatchLockFileUrl } from './entry-helpers.js';
 import { runMigrations, withMigrationPool } from './db/migrator.js';
 import { buildDeferredIndexes } from './db/deferred-index-build.js';
 import { SourceStore, SourceManager } from './sources/index.js';
@@ -555,6 +555,17 @@ export interface OrchestratorSubsystems {
 }
 
 /**
+ * The dependencies a mode hook adds to `createApp()`. Typed against
+ * `AppDependencies`, so a misspelled or mistyped key fails the build instead
+ * of reaching `createApp` unread. `matchContext` is not an app dependency:
+ * it arms the ready-dispatch re-gate and the stale detector's
+ * queued-concurrency sweep.
+ */
+export type ModeAppDepsExtras = Partial<AppDependencies> & {
+  matchContext?: ReadyDispatchGateDeps['matchContext'];
+};
+
+/**
  * Mode-specific hooks injected by each entry point.
  */
 export interface OrchestratorHooks {
@@ -600,7 +611,7 @@ export interface OrchestratorHooks {
    */
   onSubsystemsReady: (subsystems: OrchestratorSubsystems) => Promise<{
     /** Extra dependencies to merge into createApp() */
-    appDepsExtras?: Record<string, unknown>;
+    appDepsExtras?: ModeAppDepsExtras;
     /** Extra ConfigReloader deps beyond shared ones */
     configReloaderExtras?: {
       onProviderChange?: (
@@ -761,6 +772,7 @@ async function initializeScaler(
     },
     onScalerEvent,
     isDraining,
+    revokeAgentTokens: (agentId) => tokenStore.revokeEphemeralForAgent(agentId),
     spawnTimeoutMs: config.scalerSpawnTimeoutMs,
     resolveSpawnTimeoutMs: makeOrgTimeoutReaderById(
       db,
@@ -1653,10 +1665,8 @@ function buildOnDispatch(
       });
       return;
     }
-    const repoIdentifier = extractRepoIdentifier(job.repoUrl);
-    const lockFileUrl = bundle?.repoUrlBuilder
-      ? bundle.repoUrlBuilder.buildRawFileUrl(repoIdentifier, job.sha, '.kici/kici.lock.json')
-      : `${job.repoUrl.replace('.git', '')}/raw/${job.sha}/.kici/kici.lock.json`;
+    const repoIdentifier = repoIdentifierFromUrl(job.repoUrl);
+    const lockFileUrl = dispatchLockFileUrl(bundle?.repoUrlBuilder, job.repoUrl, job.sha);
 
     const ctx = getRequestContext();
 
@@ -1671,18 +1681,22 @@ function buildOnDispatch(
     const dispatchContainerRegistryAuth = job.jobConfig.containerRegistryAuth as
       { username: string; password: string; serveraddress: string } | undefined;
     // Strip secrets/runPublicKey/internal-auth-context — agent never sees these.
-    const cleanJobConfig = Object.fromEntries(
-      Object.entries(job.jobConfig).filter(
-        ([k]) =>
-          k !== 'secrets' &&
-          k !== 'namespacedSecrets' &&
-          k !== 'runPublicKey' &&
-          k !== 'npmRegistries' &&
-          k !== 'installEnvSecrets' &&
-          k !== 'containerRegistryAuth' &&
-          k !== 'workflowRoutingKey' &&
-          k !== 'workflowProviderContext',
+    const cleanJobConfig = jobConfigForAgent(
+      Object.fromEntries(
+        Object.entries(job.jobConfig).filter(
+          ([k]) =>
+            k !== 'secrets' &&
+            k !== 'namespacedSecrets' &&
+            k !== 'runPublicKey' &&
+            k !== 'npmRegistries' &&
+            k !== 'installEnvSecrets' &&
+            k !== 'containerRegistryAuth' &&
+            k !== 'workflowRoutingKey' &&
+            k !== 'workflowProviderContext',
+        ),
       ),
+      entry,
+      job.id,
     );
 
     const dispatchProvenanceContext = await loadProvenanceContext(db, job.runId, job.id, {
@@ -2689,7 +2703,7 @@ export async function bootstrapOrchestrator(
   // 3. Track shared config version for cluster heartbeats
   const localConfigVersionRef = { value: 0 };
 
-  // 4. Provider registry will be built by SourceManager after secrets init
+  // 4. SourceManager builds the provider registry after secrets init
   // Using an empty placeholder that gets replaced by sourceManager.start()
   let providerRegistry = new ProviderRegistry();
 
@@ -2929,6 +2943,7 @@ export async function bootstrapOrchestrator(
     observerRegistry,
     jobQueue: queue,
     resolveOrgId: (rk: string) => resolveOrgId(db, rk),
+    githubSourceOf: (rk: string) => providerRegistryRef.current.githubSourceOf(rk),
     // The registration window this coordinator opens on a run it dispatches is
     // recorded under its instance id, and a sibling's window is read against
     // the same liveness grace the queue's ownership predicates use.
@@ -4372,9 +4387,8 @@ export async function bootstrapOrchestrator(
   // null, which is the correct degraded behaviour for a deployment with no
   // context store rather than a silent misbehaviour.
   {
-    const gateMatchContext = modeResult.appDepsExtras?.matchContext as
-      ReadyDispatchGateDeps['matchContext'] | undefined;
-    const gateHeldRunStore = modeResult.appDepsExtras?.heldRunStore as HeldRunStore | undefined;
+    const gateMatchContext = modeResult.appDepsExtras?.matchContext;
+    const gateHeldRunStore = modeResult.appDepsExtras?.heldRunStore;
     if (gateMatchContext && gateHeldRunStore) {
       readyGateDepsRef.current = {
         matchContext: gateMatchContext,
@@ -4943,9 +4957,8 @@ export async function bootstrapOrchestrator(
     // Approval-hold expiry: the held-run store (so overdue holds are expired)
     // and the step-approval bridge (so a step-scoped expiry notifies the
     // waiting agent). Both are supplied by the platform/hybrid mode hook.
-    heldRunStore: modeResult.appDepsExtras?.heldRunStore as HeldRunStore | undefined,
-    stepApprovalBridge: modeResult.appDepsExtras?.stepApprovalBridge as
-      StepApprovalBridge | undefined,
+    heldRunStore: modeResult.appDepsExtras?.heldRunStore,
+    stepApprovalBridge: modeResult.appDepsExtras?.stepApprovalBridge,
     // Job/workflow approval-hold expiry fails the run (terminal `failed`), not
     // cancels it: a lapsed reviewer hold is a failure outcome, distinct from a
     // user-initiated cancel. The gated job was held (never dispatched), so
@@ -4954,20 +4967,16 @@ export async function bootstrapOrchestrator(
     failRun: (runId, reason) => executionTracker.failRun(runId, reason).then(() => undefined),
     // Resume a workflow whose install-gate wait-timer hold elapsed (workflow
     // scope). Supplied by the platform/hybrid mode hook alongside heldRunStore.
-    onWorkflowRelease: modeResult.appDepsExtras?.onWorkflowRelease as
-      ((signal: ReleaseSignal) => Promise<void>) | undefined,
+    onWorkflowRelease: modeResult.appDepsExtras?.onWorkflowRelease,
     // Resume a JOB-scoped wait-timer hold by re-dispatching the one job it held.
     // Threaded from the same extras object — without it a job-scoped release
     // flips the hold row and then strands the job, which the detector logs
     // loudly rather than swallowing.
-    onJobRelease: modeResult.appDepsExtras?.onJobRelease as
-      ((signal: ReleaseSignal) => Promise<void>) | undefined,
+    onJobRelease: modeResult.appDepsExtras?.onJobRelease,
     // Lets the queued-concurrency sweep read each group's configured limit.
     // Without it the sweep is inert — which is the correct degraded behaviour
     // for a deployment with no context store, not a silent misbehaviour.
-    matchContext: modeResult.appDepsExtras?.matchContext as
-      | ((orgId: string, name: string) => Promise<{ concurrency_limit: number | null } | null>)
-      | undefined,
+    matchContext: modeResult.appDepsExtras?.matchContext,
     // Audit each approval-hold expiry to the orchestrator access-log stream.
     accessLogWriter,
     // Lets an expiring security hold complete the `KiCI Security` check it

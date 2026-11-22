@@ -55,18 +55,21 @@ describe('createPlatformTransport', () => {
     const body = { fixtureId: 'f', event: { type: 'push', targetBranch: 'main', payload: {} } };
     await t.trigger(body);
     await t.initUpload({ sha: 'x' });
-    await t.status('r');
-    await t.logs('r', { cursor: 4, logCursor: 'e30' });
+    const read = { signal: new AbortController().signal };
+    await t.status('r', read);
+    await t.logs('r', { cursor: 4, logCursor: 'e30' }, read);
     await t.cancel('r');
     // breaks-if-wrong: the Platform path stays identical
     expect(client.trigger).toHaveBeenCalledWith('org_1', target, body);
     expect(client.initUpload).toHaveBeenCalledWith('org_1', target, { sha: 'x' });
-    expect(client.runStatus).toHaveBeenCalledWith('org_1', 'r', target);
+    // fails-when: the Ctrl-C signal is dropped, so a read in flight runs to its deadline
+    expect(client.runStatus).toHaveBeenCalledWith('org_1', 'r', target, read);
     expect(client.runLogs).toHaveBeenCalledWith(
       'org_1',
       'r',
       { cursor: 4, logCursor: 'e30' },
       target,
+      read,
     );
     expect(client.cancel).toHaveBeenCalledWith('org_1', 'r', target);
     expect(t.holds.answerHint(HOLD)).toBe('kici approve r1 --hold h1');

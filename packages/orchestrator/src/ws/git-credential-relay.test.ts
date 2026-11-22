@@ -63,6 +63,28 @@ describe('git credential relay handler', () => {
     expect(result).toMatchObject({ kind: 'basic' });
   });
 
+  it("passes the job's githubUrl to the broker", async () => {
+    const broker = { resolve: vi.fn().mockResolvedValue(okResult) };
+    await handlerWith(broker, jobFacts({ githubUrl: 'https://ghe.corp.example' }))('agent-1', {
+      jobId: 'job-1',
+      repositories: ['acme/main'],
+      ref: { ...DECLARED_APP_REF },
+    });
+    // fails-when: the relay drops the server, so a workflow-supplied App mints at github.com
+    expect(broker.resolve.mock.calls[0]![0]).toMatchObject({
+      githubUrl: 'https://ghe.corp.example',
+    });
+
+    const dotcom = { resolve: vi.fn().mockResolvedValue(okResult) };
+    await handlerWith(dotcom)('agent-1', {
+      jobId: 'job-1',
+      repositories: ['acme/main'],
+      ref: { ...DECLARED_APP_REF },
+    });
+    // breaks-if-wrong: a github.com job's broker call gains no key
+    expect(dotcom.resolve.mock.calls[0]![0]).not.toHaveProperty('githubUrl');
+  });
+
   it('allows a source-supplied READ of a sibling repo — the shortest path', async () => {
     const broker = { resolve: vi.fn().mockResolvedValue(okResult) };
     // No ref, no permissions => a read with the source credential. Cloning a
@@ -300,6 +322,33 @@ describe('git credential relay handler', () => {
         permissions: { contents: 'write' },
       }),
     ).resolves.toMatchObject({ kind: 'basic' });
+  });
+
+  it('refuses an App credential of a job whose GitHub source is gone', async () => {
+    const refusal = 'The GitHub source github:1 that ran this job is no longer configured';
+    const tokenRef = { kind: 'token', tokenSecret: 'ci:T' } as const;
+    const facts = jobFacts({
+      githubAppMintRefusal: refusal,
+      declaredCredentials: { default: { ...DECLARED_APP_REF }, pat: { ...tokenRef } },
+    });
+    const broker = { resolve: vi.fn().mockResolvedValue(okResult) };
+    // fails-when: the App JWT is still minted (at github.com) for a removed source's job
+    await expect(
+      handlerWith(broker, facts)('agent-1', {
+        jobId: 'job-1',
+        repositories: ['acme/main'],
+        ref: { ...DECLARED_APP_REF },
+      }),
+    ).rejects.toThrow(refusal);
+    expect(broker.resolve).not.toHaveBeenCalled();
+
+    // breaks-if-wrong: a token ref of the same job sends no App JWT and still resolves
+    await handlerWith(broker, facts)('agent-1', {
+      jobId: 'job-1',
+      repositories: ['acme/main'],
+      ref: { ...tokenRef },
+    });
+    expect(broker.resolve).toHaveBeenCalledTimes(1);
   });
 
   describe('the lock declaration is the authorization', () => {

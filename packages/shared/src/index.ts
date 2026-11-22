@@ -40,7 +40,7 @@ export {
   type PgPoolErrorSource,
   type PoolAcquireOutcome,
 } from './db.js';
-export { isPgUniqueViolation } from './pg-errors.js';
+export { isPgUndefinedTable, isPgUniqueViolation } from './pg-errors.js';
 export {
   parseDatabaseUrl,
   maskDatabaseUrl,
@@ -49,6 +49,7 @@ export {
   type EnsureDatabaseOpts,
   createDbRole,
   createReadOnlyDbUser,
+  QUIET_STATEMENT_SETTINGS,
   computeMigrationsHash,
   storeMigrationContentHash,
   readStoredMigrationContentHash,
@@ -67,7 +68,6 @@ export {
   listContextsDirect,
   showContextDirect,
   createContextTemplateDirect,
-  setContextSecretDirect,
   listQueueDirect,
   showQueueEntryDirect,
   listExecutionRunsDirect,
@@ -96,7 +96,6 @@ export {
   type ContextBindingRow,
   type ShowContextResult,
   type CreateContextTemplateOpts,
-  type SetContextSecretOpts,
   type DispatchQueueRow,
   type ListQueueOpts,
   type ExecutionRunRow,

@@ -774,8 +774,11 @@ than failing the whole listing.
 By default, the PG backend is available for both internal/operational secrets and dashboard-created customer secrets. To restrict the PG backend to internal use only (forcing customer secrets into external backends):
 
 ```bash
-kici-admin config set pgCustomerSecrets false
+# In the orchestrator env file, then restart the orchestrator:
+KICI_PG_CUSTOMER_SECRETS=false
 ```
+
+The orchestrator reads this setting at startup. A `kici-admin config set pgCustomerSecrets false` is stored, but no running orchestrator reads it back.
 
 When disabled:
 
@@ -862,6 +865,16 @@ The orchestrator cannot find `KICI_SECRET_KEY` or `KICI_SECRET_KEY_FILE`. Verify
 - The environment variable is set and non-empty
 - The key file exists and is readable
 - The key is exactly 64 hex characters or valid base64-encoded 32 bytes
+
+### "Failed to decrypt secret"
+
+A stored secret does not decrypt with the master key. `rotate-key` then fails for the whole install, and a scope rename and the jobs that resolve the scope fail. Find every such secret:
+
+```bash
+kici-admin secret verify
+```
+
+It prints the org, scope and key name of each one, never a value, and exits 1. Re-set each listed secret with `kici-admin secret set`, then run `verify` again until it exits 0.
 
 ### "Invalid or expired token"
 

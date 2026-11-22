@@ -45,6 +45,15 @@ vi.mock('../local-plane/run-follow.js', () => ({
     jobs: [{ name: 'build', status: 'success' }],
   }),
 }));
+const cancelAbandonedRun = vi.fn().mockResolvedValue(true);
+const signalHandlers: Array<() => Promise<unknown>> = [];
+vi.mock('../local-plane/run-abandon.js', () => ({
+  cancelAbandonedRun: (...a: unknown[]) => cancelAbandonedRun(...a),
+  cancelOnSignal: (onSignal: () => Promise<unknown>) => {
+    signalHandlers.push(onSignal);
+    return () => undefined;
+  },
+}));
 
 describe('readDispatchPayload', () => {
   it('returns empty when no payload path is given', async () => {
@@ -261,5 +270,38 @@ describe('runRoutedCommand', () => {
     });
     expect(ok).toBe(false);
     expect(restoreLock).toHaveBeenCalledTimes(1);
+  });
+
+  // fails-when: Ctrl-C leaves the follow waiting on a stalled read (no signal reaches it)
+  // breaks-if-wrong: the command returns, and the CLI exits, before the run's cancel lands
+  it('ends the follow on Ctrl-C and returns only after the run is cancelled', async () => {
+    const { followRun } = await import('../local-plane/run-follow.js');
+    vi.mocked(followRun).mockImplementationOnce(
+      (_url, _tok, runId, opts) =>
+        new Promise((resolve) =>
+          opts?.signal?.addEventListener('abort', () =>
+            resolve({ runId, status: 'cancelled', jobs: [] }),
+          ),
+        ),
+    );
+    let cancelled = false;
+    cancelAbandonedRun.mockImplementationOnce(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+      cancelled = true;
+      return true;
+    });
+    signalHandlers.length = 0;
+    const { runRoutedCommand } = await import('./run-routed.js');
+    const running = runRoutedCommand({ local: true, offline: true, event: 'push', quiet: true });
+    await vi.waitFor(() => expect(signalHandlers).toHaveLength(1));
+    void signalHandlers[0]!();
+    expect(await running).toBe(false);
+    expect(cancelled).toBe(true);
+    expect(cancelAbandonedRun).toHaveBeenCalledWith(
+      'http://127.0.0.1:4319',
+      'kici-local-tok',
+      'run-42',
+      { quiet: true },
+    );
   });
 });

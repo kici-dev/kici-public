@@ -19,11 +19,14 @@ import {
   InitFailureCategory,
   CacheStepType,
   CacheRunEventType,
+  parseLockCheckoutOptions,
+  describeHistoryGap,
 } from '@kici-dev/engine';
 import type { LockJob, LogStream } from '@kici-dev/engine';
 import type { AppConfig } from '../config.js';
 import { gitClone } from '../checkout/git-clone.js';
 import { cloneJobRepos } from '../checkout/clone-job-repos.js';
+import { HostWorkspace, hostWorkspaceFor } from './host-workspace.js';
 import { GIT_CREDENTIAL_REQUEST_METHOD } from '@kici-dev/engine/protocol/messages/git-credential-relay';
 import { startJobGitCredentials, type JobGitCredentials } from '../checkout/job-git-credentials.js';
 import { packKiciSource } from './source-packer.js';
@@ -107,6 +110,7 @@ import {
   buildSanitizedEnv,
   fileCloneSourceBinds,
 } from './sandbox/index.js';
+import { hostSuppliedTrustPaths } from './sandbox/host-trust-paths.js';
 import { stepsTotal, stepDurationSeconds, cloneDurationSeconds } from '../metrics/prometheus.js';
 import { BetweenJobsController, type AfterJobContext } from './between-jobs-controller.js';
 import { resolveLockOrigin } from './lock-origin.js';
@@ -134,6 +138,72 @@ async function fileExists(p: string): Promise<boolean> {
  */
 function agentInstallBaseEnv(trustedEnv: boolean | undefined): NodeJS.ProcessEnv {
   return buildSanitizedEnv({}, { trustedEnv });
+}
+
+/**
+ * A test run's overlay tarball, applied to `repoDir`, the checkout that holds
+ * `.kici/`. A dispatch that carries no overlay is left as it is.
+ */
+async function applyTestRunOverlay(
+  dispatch: JobDispatch,
+  repoDir: string,
+  log: (msg: string) => void,
+  jobKind: string,
+): Promise<void> {
+  const overlay = dispatch.jobConfig as {
+    tarballUrl?: string;
+    cliPublicKey?: string;
+    orchestratorPrivateKey?: string;
+  };
+  if (!overlay.tarballUrl || !overlay.cliPublicKey || !overlay.orchestratorPrivateKey) return;
+  log('Applying overlay tarball for test run');
+  const result = await applyOverlay({
+    tarballUrl: overlay.tarballUrl,
+    cliPublicKey: overlay.cliPublicKey,
+    orchestratorPrivateKey: overlay.orchestratorPrivateKey,
+    repoDir,
+  });
+  logger.info(`${jobKind}: overlay applied`, {
+    jobId: dispatch.jobId,
+    filesApplied: result.filesApplied,
+    filesDeleted: result.filesDeleted,
+  });
+}
+
+/**
+ * The workflow source of an init or dynamic-eval job in `workDir`. A `fullRepo`
+ * test run (`kici run remote`) names no repository to clone, so it skips the
+ * clone: its overlay is the workspace. Otherwise the cached source tarball when
+ * the orchestrator dispatched one, else a clone. An attached overlay applies
+ * afterwards in every case, so the job reads the developer's working tree.
+ */
+async function materializeWorkflowSource(
+  dispatch: JobDispatch,
+  workDir: string,
+  log: (msg: string) => void,
+  jobKind: string,
+): Promise<void> {
+  // fails-when: a remote run's generator evaluation clones the empty repoUrl
+  // breaks-if-wrong: a webhook run's generator evaluation still clones its repository
+  if ((dispatch.jobConfig as { fullRepo?: boolean }).fullRepo) {
+    log('Test run: materializing workspace from overlay (no clone)');
+    await fs.mkdir(workDir, { recursive: true });
+  } else if (dispatch.sourceTarUrl) {
+    log('Restoring workflow source from cached tarball');
+    await restoreSource(workDir, dispatch.sourceTarUrl, dispatch.sourceTarDigest);
+  } else {
+    log(`Cloning ${dispatch.repoUrl} (ref: ${dispatch.ref})`);
+    const cloneStart = Date.now();
+    await gitClone({
+      repoUrl: dispatch.repoUrl,
+      ref: dispatch.ref,
+      sha: dispatch.sha,
+      workDir,
+      gitAuth: dispatch.sourceAuth,
+    });
+    cloneDurationSeconds.record((Date.now() - cloneStart) / 1000);
+  }
+  await applyTestRunOverlay(dispatch, workDir, log, jobKind);
 }
 
 /**
@@ -171,21 +241,7 @@ async function materializeEvalWorkspace(
     });
   }
 
-  if (dispatch.sourceTarUrl) {
-    log('Restoring workflow source from cached tarball');
-    await restoreSource(workDir, dispatch.sourceTarUrl, dispatch.sourceTarDigest);
-  } else {
-    log(`Cloning ${dispatch.repoUrl} ref=${dispatch.ref}`);
-    const cloneStart = Date.now();
-    await gitClone({
-      repoUrl: dispatch.repoUrl,
-      ref: dispatch.ref,
-      sha: dispatch.sha,
-      workDir,
-      gitAuth: dispatch.sourceAuth,
-    });
-    cloneDurationSeconds.record((Date.now() - cloneStart) / 1000);
-  }
+  await materializeWorkflowSource(dispatch, workDir, log, 'Dynamic eval job');
 
   // @kici-dev/sdk must resolve under .kici/node_modules/ at import time.
   const kiciDir = join(workDir, '.kici');
@@ -940,13 +996,25 @@ export class JobRunner {
     const runnerPath = resolveRunnerPath();
     // Secrets are NOT injected into env vars -- they flow through IPC to ctx.secrets.
     const typedConfig = jobConfig as Record<string, unknown>;
-    const sanitizedEnv = buildSanitizedEnv((typedConfig.env as Record<string, string>) ?? {}, {
-      contextVars: (typedConfig.contextVars as Record<string, string>) ?? undefined,
-      jobEnv: (typedConfig.jobEnv as Record<string, string>) ?? undefined,
+    const userEnv = (typedConfig.env as Record<string, string>) ?? {};
+    const contextVars = (typedConfig.contextVars as Record<string, string>) ?? undefined;
+    const jobEnv = (typedConfig.jobEnv as Record<string, string>) ?? undefined;
+    const sanitizedEnv = buildSanitizedEnv(userEnv, {
+      contextVars,
+      jobEnv,
       // Read only from agent config, never the dispatch, so a workflow cannot
       // self-elevate.
       trustedEnv: this.config.trustedEnv,
     });
+    // The host's TLS trust paths, which a sandbox with its own filesystem binds in.
+    const hostTrustPaths = hostSuppliedTrustPaths(
+      sanitizedEnv,
+      new Set([
+        ...Object.keys(userEnv),
+        ...Object.keys(contextVars ?? {}),
+        ...Object.keys(jobEnv ?? {}),
+      ]),
+    );
 
     // Resolved before the clone, so a host without a container runtime fails at
     // once with a message naming it, not on a bare ENOENT later.
@@ -964,8 +1032,16 @@ export class JobRunner {
     // credential helper. A route into the `CapDrop: ALL` container would hand
     // anything in /workspace a direct line to the credential broker. The runner
     // is told the checkout is done, so it does not re-clone over the copied tree.
-    const hostCheckout =
-      executionMode === 'container' && (jobConfig as Record<string, unknown>).checkout !== false;
+    // A `checkout: false` container job with no other `.kici/` source gets only
+    // `.kici/` from the host; the runner then finds it and fetches nothing.
+    const hostWorkspace = hostWorkspaceFor({
+      container: executionMode === 'container',
+      checkout: typedConfig.checkout,
+      sourceCached: Boolean(dispatch.sourceTarUrl),
+      fullRepo: typedConfig.fullRepo === true,
+      kiciPresent: existsSync(join(jobWorkspaceLayout(typedConfig, workDir).workflowDir, '.kici')),
+    });
+    const workspaceFromHost = hostWorkspace !== HostWorkspace.enum.none;
     // Redacts the dispatch's registry tokens and install secrets.
     const secrets = hostInstallSecrets(dispatch);
     const setupLog = (line: string): void => {
@@ -973,8 +1049,10 @@ export class JobRunner {
         redactNpmOutput(line, secrets),
       );
     };
-    if (hostCheckout) {
+    if (hostWorkspace === HostWorkspace.enum.clone) {
       await this.checkoutOnHost(dispatch, workDir, setupLog);
+    } else if (hostWorkspace === HostWorkspace.enum['kici-only']) {
+      await this.cloneOnHost(dispatch, workDir, setupLog);
     }
 
     // A declared Dockerfile builds after the clone, whose tree is the build
@@ -992,6 +1070,7 @@ export class JobRunner {
     const sandbox = this.createSandbox(executionMode, {
       runnerPath,
       env: sanitizedEnv,
+      hostTrustPaths,
       jobId,
       jobConfig: jobConfig as Record<string, unknown>,
       registryAuth: dispatch.containerRegistryAuth,
@@ -1006,7 +1085,7 @@ export class JobRunner {
     // `.kici/` deps install into the host checkout, so the copied tree carries
     // them: after the image build, so its context never holds
     // `.kici/node_modules`, and before the setup, which copies the workspace in.
-    if (hostCheckout) {
+    if (workspaceFromHost) {
       try {
         await this.installDepsOnHost(dispatch, workDir, setupLog, abortController.signal);
       } catch (err) {
@@ -1028,7 +1107,7 @@ export class JobRunner {
       workDir,
       env: sanitizedEnv,
       extraReadOnlyBinds: fileCloneSourceBinds(dispatch.repoUrl),
-      ...(hostCheckout ? { workspaceFromHost: true } : {}),
+      ...(workspaceFromHost ? { workspaceFromHost: true } : {}),
     });
 
     if (abortController.signal.aborted) {
@@ -1470,59 +1549,7 @@ export class JobRunner {
     workDir: string,
     initLog: (msg: string) => void,
   ): Promise<void> {
-    const initJobConfig = dispatch.jobConfig as { fullRepo?: boolean };
-    if (initJobConfig.fullRepo) {
-      initLog('Test run: materializing workspace from overlay (no clone)');
-      await fs.mkdir(workDir, { recursive: true });
-    } else if (dispatch.sourceTarUrl) {
-      initLog('Restoring workflow source from cached tarball');
-      await restoreSource(workDir, dispatch.sourceTarUrl, dispatch.sourceTarDigest);
-    } else {
-      initLog(`Cloning ${dispatch.repoUrl} (ref: ${dispatch.ref})`);
-      const cloneStart = Date.now();
-      await gitClone({
-        repoUrl: dispatch.repoUrl,
-        ref: dispatch.ref,
-        sha: dispatch.sha,
-        workDir,
-        gitAuth: dispatch.sourceAuth,
-      });
-      cloneDurationSeconds.record((Date.now() - cloneStart) / 1000);
-    }
-
-    await this.applyInitJobOverlay(dispatch, workDir, initLog);
-  }
-
-  /** Applies to the checkout that holds `.kici/`. */
-  private async applyInitJobOverlay(
-    dispatch: JobDispatch,
-    repoDir: string,
-    initLog: (msg: string) => void,
-  ): Promise<void> {
-    const initJobConfig = dispatch.jobConfig as {
-      tarballUrl?: string;
-      cliPublicKey?: string;
-      orchestratorPrivateKey?: string;
-    };
-    if (
-      !initJobConfig.tarballUrl ||
-      !initJobConfig.cliPublicKey ||
-      !initJobConfig.orchestratorPrivateKey
-    ) {
-      return;
-    }
-    initLog('Applying overlay tarball for test run');
-    const overlayResult = await applyOverlay({
-      tarballUrl: initJobConfig.tarballUrl,
-      cliPublicKey: initJobConfig.cliPublicKey,
-      orchestratorPrivateKey: initJobConfig.orchestratorPrivateKey,
-      repoDir,
-    });
-    logger.info('Init job: overlay applied', {
-      jobId: dispatch.jobId,
-      filesApplied: overlayResult.filesApplied,
-      filesDeleted: overlayResult.filesDeleted,
-    });
+    await materializeWorkflowSource(dispatch, workDir, initLog, 'Init job');
   }
 
   /**
@@ -1548,7 +1575,8 @@ export class JobRunner {
         workDir,
         log: initLog,
         install,
-        afterClone: (workflowDir) => this.applyInitJobOverlay(dispatch, workflowDir, initLog),
+        afterClone: (workflowDir) =>
+          applyTestRunOverlay(dispatch, workflowDir, initLog, 'Init job'),
         onDepsCheck: (kiciDir, hasPackageJson) =>
           logger.info('Init job: checking deps', { kiciDir, hasPackageJson, source }),
       });
@@ -2217,6 +2245,33 @@ export class JobRunner {
   }
 
   /**
+   * Run `cloneJobRepos` on the host, logging to the step -1 log, where a
+   * bare-metal job's runner narrates the same clone. For a `checkout: false`
+   * container job with no other `.kici/` source, it copies only `.kici/` out
+   * of a throwaway clone; `checkout` stays false, so the runner fetches nothing.
+   * The workflow repo and the checkout switches ride in `jobConfig`, which the
+   * runner reads through the same builder.
+   */
+  private async cloneOnHost(
+    dispatch: JobDispatch,
+    workDir: string,
+    setupLog: (line: string) => void,
+  ): Promise<{ workflowDir: string; log: (line: string) => void }> {
+    const jobConfig = dispatch.jobConfig as Record<string, unknown>;
+    const { isGlobal, workflowDir, sourceDir } = jobWorkspaceLayout(jobConfig, workDir);
+    const log = (line: string) => {
+      logger.info(`[host-checkout] ${line}`, { jobId: dispatch.jobId });
+      setupLog(`[host-checkout] ${line}`);
+    };
+    await cloneJobRepos(
+      buildCloneRequest(dispatch),
+      { workDir, workflowDir, sourceDir },
+      { isGlobal, log, excludeScratchFromGit },
+    );
+    return { workflowDir, log };
+  }
+
+  /**
    * Clones (a full-repo run only creates the directory), then applies the
    * run's overlay tarball. Both precede the image build: the workspace is the
    * Dockerfile's build context, which a full-repo run without its overlay
@@ -2233,20 +2288,7 @@ export class JobRunner {
     setupLog: (line: string) => void,
   ): Promise<void> {
     const jobConfig = dispatch.jobConfig as Record<string, unknown>;
-    const { isGlobal, workflowDir, sourceDir } = jobWorkspaceLayout(jobConfig, workDir);
-    // Also to the step -1 log, where a bare-metal job's runner narrates the
-    // same clone.
-    const log = (line: string) => {
-      logger.info(`[host-checkout] ${line}`, { jobId: dispatch.jobId });
-      setupLog(`[host-checkout] ${line}`);
-    };
-    // The workflow repo and the checkout switches ride in `jobConfig`, not on
-    // the dispatch envelope; the runner reads them through the same builder.
-    await cloneJobRepos(
-      buildCloneRequest(dispatch),
-      { workDir, workflowDir, sourceDir },
-      { isGlobal, log, excludeScratchFromGit },
-    );
+    const { workflowDir, log } = await this.cloneOnHost(dispatch, workDir, setupLog);
 
     const tarballUrl = jobConfig.tarballUrl as string | undefined;
     const cliPublicKey = jobConfig.cliPublicKey as string | undefined;
@@ -2263,6 +2305,14 @@ export class JobRunner {
         `Overlay applied: ${overlayResult.filesApplied} files changed, ` +
           `${overlayResult.filesDeleted} files deleted`,
       );
+      // This path runs only for a job whose checkout is not disabled.
+      if (jobConfig.fullRepo === true) {
+        const gap = describeHistoryGap(
+          parseLockCheckoutOptions(jobConfig.checkoutOptions),
+          overlayResult.git,
+        );
+        if (gap) setupLog(gap);
+      }
       delete jobConfig.tarballUrl;
       delete jobConfig.cliPublicKey;
       delete jobConfig.orchestratorPrivateKey;
@@ -2366,6 +2416,8 @@ export class JobRunner {
     opts: {
       runnerPath: string;
       env: Record<string, string>;
+      /** The TLS trust settings in `env` that the agent host supplied. */
+      hostTrustPaths: Record<string, string>;
       jobId: string;
       jobConfig: Record<string, unknown>;
       registryAuth?: { username: string; password: string; serveraddress: string } | undefined;
@@ -2391,6 +2443,7 @@ export class JobRunner {
           // The self-contained bundle; see resolveRunnerBundlePath.
           runnerPath: resolveRunnerBundlePath(opts.runnerPath),
           env: opts.env,
+          hostTrustPaths: opts.hostTrustPaths,
           keepFailed: this.config.dockerKeepFailed,
           jobId: opts.jobId,
           // Secure by default. KICI_SANDBOX_NETWORK=`host` shares the host
@@ -2437,6 +2490,7 @@ export class JobRunner {
         return new BareMetalSandbox({
           runnerPath: opts.runnerPath,
           env: opts.env,
+          hostTrustPaths: opts.hostTrustPaths,
           sandbox: this.config.sandbox,
           sandboxNetwork: this.config.sandboxNetwork,
           // Reaps a finished job's leaked process tree. bwrap's PID namespace

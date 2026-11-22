@@ -8,11 +8,9 @@ import {
   type GlobalConfig,
 } from '../remote/config.js';
 import { pkceFlow, deviceFlow, exchangeTokenForPat } from '../remote/oauth.js';
-import {
-  PROD_PLATFORM_URL,
-  PROD_OIDC_ISSUER,
-  PROD_OIDC_CLIENT_ID,
-} from '../remote/prod-defaults.js';
+import { LoginTargetSource, resolveLoginTarget } from '../remote/login-target.js';
+import { parseScopeList } from '../remote/oidc-scopes.js';
+import { OidcScopeToken } from '@kici-dev/engine';
 import { isHeadless } from '../auth/headless-detect.js';
 import { toErrorMessage } from '@kici-dev/core';
 import { planeStatus, attachPlane } from '../local-plane/plane-manager.js';
@@ -28,6 +26,8 @@ export interface LoginOptions {
   routingKey?: string;
   /** Force the device flow regardless of environment. */
   device?: boolean;
+  /** `--oidc-scope` values: extra scopes requested after `KICI_OIDC_EXTRA_SCOPES`. */
+  oidcScopes?: string[];
   /** Skip the post-login "attach the local dev plane?" prompt (scripted logins). */
   noAttachPrompt?: boolean;
 }
@@ -63,18 +63,44 @@ function checkPatExpiry(expiresAt: string): void {
   }
 }
 
+/** The user's extra scopes (env, then flags); throws on a value that is not one scope token. */
+function userExtraScopes(oidcScopes: readonly string[] | undefined): string[] {
+  const sources: Array<[string, string[]]> = [
+    ['KICI_OIDC_EXTRA_SCOPES', parseScopeList(process.env.KICI_OIDC_EXTRA_SCOPES)],
+    ['--oidc-scope', (oidcScopes ?? []).flatMap((value) => parseScopeList(value))],
+  ];
+  for (const [source, scopes] of sources) {
+    // fails-when: a scope with a quote or a backslash reaches the identity provider's scope parameter
+    const invalid = scopes.find((scope) => !OidcScopeToken.safeParse(scope).success);
+    if (invalid !== undefined) {
+      throw new Error(
+        `${source}: "${invalid}" is not an OIDC scope (a scope has no quotes, backslashes or control characters)`,
+      );
+    }
+  }
+  return sources.flatMap(([, scopes]) => scopes);
+}
+
 /** PKCE or device flow → OIDC access token → PAT saved to the global config. */
 async function oauthLogin(options: LoginOptions): Promise<boolean> {
-  // Defaults to the hosted Platform; flags and KICI_* env vars override.
-  // Resolution never writes process.env, so the orchestrator's WS reading of
-  // KICI_PLATFORM_URL is untouched.
+  const userScopes = userExtraScopes(options.oidcScopes);
+  // Hosted defaults; flags, KICI_* env vars and a named Platform's login settings
+  // override. Resolution never writes process.env, so the orchestrator's WS
+  // reading of KICI_PLATFORM_URL is untouched.
   const existing = await loadGlobalConfig();
-  const platformUrl =
-    options.platformEndpoint || process.env.KICI_PLATFORM_URL || PROD_PLATFORM_URL;
-  const issuer = options.oidcIssuer || process.env.KICI_OIDC_ISSUER || PROD_OIDC_ISSUER;
-  const clientId = process.env.KICI_OIDC_CLIENT_ID || PROD_OIDC_CLIENT_ID;
+  const { platformUrl, issuer, clientId, source, extraScopes } = await resolveLoginTarget({
+    platformEndpoint: options.platformEndpoint,
+    oidcIssuer: options.oidcIssuer,
+    env: process.env,
+  });
 
   console.log(pc.cyan('\n  Step 1/4: Detecting environment...'));
+  if (source === LoginTargetSource.enum.platform_published) {
+    const published = extraScopes.length > 0 ? `, extra scopes: ${extraScopes.join(' ')}` : '';
+    console.log(
+      pc.gray(`  Using identity provider ${issuer} (published by ${platformUrl})${published}`),
+    );
+  }
   // A set KICI_BROWSER_CMD (even 'none') is explicit browser config: skip
   // headless detection and use PKCE. --device still forces the device flow.
   const browserCmdSet = !!process.env.KICI_BROWSER_CMD;
@@ -84,7 +110,8 @@ async function oauthLogin(options: LoginOptions): Promise<boolean> {
 
   console.log(pc.cyan(`\n  Step 2/4: Authenticating with IdP (${flowName})...`));
   let accessToken: string;
-  const oauthOpts = { issuer, clientId };
+  const scopes = [...new Set([...userScopes, ...extraScopes])];
+  const oauthOpts = { issuer, clientId, ...(scopes.length > 0 && { extraScopes: scopes }) };
   if (useDeviceFlow) {
     accessToken = await deviceFlow(oauthOpts);
   } else {

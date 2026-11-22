@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createSourceRoutes } from './admin-sources.js';
-import type { SourceStore } from '../sources/source-store.js';
+import { Hono } from 'hono';
+import { DuplicateSourceError, type SourceStore } from '../sources/source-store.js';
 import { validateGitHubSource } from '../sources/source-validator.js';
 
 vi.mock('../sources/source-validator.js', () => ({
@@ -134,6 +135,63 @@ describe('admin source routes', () => {
       const body = (await res.json()) as { webhookUrl: string | null; webhookNote?: string };
       expect(body.webhookUrl).toBeNull();
       expect(body.webhookNote).toBe('resolver-unavailable');
+    });
+
+    // fails-when: the pre-flight drops the Platform's page, so kici-admin prints the
+    //   default page for a Platform that serves its own
+    it('reports the Platform manifest page when the resolver returns one', async () => {
+      const app = createSourceRoutes({
+        sourceStore: createMockSourceStore(),
+        resolveGithubWebhookUrl: vi
+          .fn()
+          .mockResolvedValue({ webhookUrl: 'https://kici.corp.example/webhook/org_x/github' }),
+        resolveGithubManifestCallbackUrl: () =>
+          'https://kici.corp.example/github/manifest-callback',
+      });
+
+      const body = (await (await app.request('/sources/github-webhook-url')).json()) as Record<
+        string,
+        unknown
+      >;
+      expect(body).toEqual({
+        webhookUrl: 'https://kici.corp.example/webhook/org_x/github',
+        manifestCallbackUrl: 'https://kici.corp.example/github/manifest-callback',
+      });
+    });
+
+    it('reports the page even when the webhook URL cannot be resolved', async () => {
+      const app = createSourceRoutes({
+        sourceStore: createMockSourceStore(),
+        resolveGithubManifestCallbackUrl: () =>
+          'https://kici.corp.example/github/manifest-callback',
+      });
+
+      const body = (await (await app.request('/sources/github-webhook-url')).json()) as Record<
+        string,
+        unknown
+      >;
+      expect(body.webhookUrl).toBeNull();
+      expect(body.manifestCallbackUrl).toBe('https://kici.corp.example/github/manifest-callback');
+    });
+
+    // breaks-if-wrong: an independent orchestrator's pre-flight is unchanged
+    it.each([
+      ['returns null', () => null],
+      ['is absent', undefined],
+    ])('omits manifestCallbackUrl when the resolver %s', async (_label, resolver) => {
+      const app = createSourceRoutes({
+        sourceStore: createMockSourceStore(),
+        resolveGithubWebhookUrl: vi
+          .fn()
+          .mockResolvedValue({ webhookUrl: 'https://ci.example.com/webhook/org_x/github' }),
+        ...(resolver && { resolveGithubManifestCallbackUrl: resolver }),
+      });
+
+      const body = (await (await app.request('/sources/github-webhook-url')).json()) as Record<
+        string,
+        unknown
+      >;
+      expect(body).toEqual({ webhookUrl: 'https://ci.example.com/webhook/org_x/github' });
     });
   });
 
@@ -351,6 +409,44 @@ describe('GET /sources ingressUrl', () => {
   });
 });
 
+describe('GET /sources githubUrl', () => {
+  const row = {
+    id: 'src-1',
+    provider: 'github',
+    name: 'a',
+    routing_key: 'github:42',
+    customer_id: 'org_a',
+    config: { appId: '42' },
+    github_url: null as string | null,
+    created_at: new Date(0),
+    updated_at: new Date(0),
+  };
+  const listed = async (rows: unknown[]) => {
+    const listSources = vi.fn().mockResolvedValue(rows);
+    const app = createSourceRoutes({ sourceStore: createMockSourceStore({ listSources }) });
+    return ((await (await app.request('/sources')).json()) as { sources: object[] }).sources;
+  };
+
+  it('carries the server from the github_url column, never from config', async () => {
+    // fails-when: the listed server is missing for a GHES source
+    expect((await listed([{ ...row, github_url: 'https://ghe.corp.example' }]))[0]).toMatchObject({
+      githubUrl: 'https://ghe.corp.example',
+    });
+    // fails-when: a config.githubUrl an older peer stored lists as the server
+    const planted = { ...row, config: { appId: '42', githubUrl: 'https://evil.example' } };
+    expect((await listed([planted]))[0]).not.toHaveProperty('githubUrl');
+    // fails-when: the stale config copy shows beside the real top-level githubUrl
+    const both = { ...planted, github_url: 'https://ghe.corp.example' };
+    expect((await listed([both]))[0]).toMatchObject({
+      githubUrl: 'https://ghe.corp.example',
+      config: { appId: '42' },
+    });
+    expect((await listed([both]))[0]).not.toHaveProperty('config.githubUrl');
+    // breaks-if-wrong: a github.com source's entry gains no githubUrl key
+    expect((await listed([row]))[0]).not.toHaveProperty('githubUrl');
+  });
+});
+
 describe('source org on a Platform-attached orchestrator', () => {
   const validator = vi.mocked(validateGitHubSource);
   const addedRow = (customerId: string) => ({
@@ -478,5 +574,326 @@ describe('source org on a Platform-attached orchestrator', () => {
     it('carries no warning on an independent orchestrator', async () => {
       expect((await patch(undefined, 'org_B')).warning).toBeUndefined();
     });
+  });
+});
+
+describe('the GitHub server of a source', () => {
+  const validator = vi.mocked(validateGitHubSource);
+  const GHES = 'https://ghe.corp.example';
+  const stored = {
+    id: 's1',
+    provider: 'github',
+    name: 'App',
+    routing_key: 'github:1',
+    customer_id: '__default__',
+    config: JSON.stringify({ appId: '1' }),
+    github_url: GHES,
+  };
+
+  /** The routes behind a stand-in auth middleware that sets the token's routing-key scope. */
+  function routesAs(routingKey: string | null, store: SourceStore): Hono {
+    return new Hono()
+      .use('*', (c, next) => {
+        c.set('routingKey' as never, routingKey as never);
+        return next();
+      })
+      .route('/', createSourceRoutes({ sourceStore: store }) as never);
+  }
+
+  const send = (app: Hono, method: string, path: string, body: Record<string, unknown>) =>
+    app.request(path, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  const addBody = { provider: 'github', name: 'n', appId: '1', privateKey: 'pem' };
+
+  /** A store holding `stored` with its private key, recording updates in `updateSource`. */
+  const storeWithKey = (updateSource: SourceStore['updateSource']) =>
+    createMockSourceStore({
+      getSource: vi.fn().mockResolvedValue(stored),
+      getSourceWithSecrets: vi.fn().mockResolvedValue({ ...stored, privateKey: 'pem' }),
+      updateSource,
+    });
+
+  beforeEach(() => {
+    validator.mockReset();
+    validator.mockResolvedValue({ valid: true, appName: 'Test' });
+  });
+
+  it('POST with githubUrl validates at that server and stores it', async () => {
+    const addSource = vi.fn().mockResolvedValue(stored);
+    const app = routesAs(null, createMockSourceStore({ addSource }));
+
+    const res = await send(app, 'POST', '/sources', { ...addBody, githubUrl: `${GHES}/` });
+
+    expect(res.status).toBe(201);
+    expect(validator).toHaveBeenCalledWith({ appId: '1', privateKey: 'pem', githubUrl: GHES });
+    expect(addSource).toHaveBeenCalledWith(expect.objectContaining({ githubUrl: GHES }));
+  });
+
+  it('POST without githubUrl validates at github.com', async () => {
+    const addSource = vi.fn().mockResolvedValue(stored);
+    const app = routesAs(null, createMockSourceStore({ addSource }));
+
+    await send(app, 'POST', '/sources', addBody);
+
+    // breaks-if-wrong: the manual github.com add keeps working with no server field
+    expect(validator).toHaveBeenCalledWith({
+      appId: '1',
+      privateKey: 'pem',
+      githubUrl: undefined,
+    });
+  });
+
+  it('POST refuses an invalid githubUrl with 400 before any GitHub call', async () => {
+    const addSource = vi.fn();
+    const app = routesAs(null, createMockSourceStore({ addSource }));
+
+    const res = await send(app, 'POST', '/sources', {
+      ...addBody,
+      githubUrl: 'https://api.github.com',
+    });
+
+    // fails-when: an unvalidated githubUrl receives the App's JWT
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toMatch(/^githubUrl takes the web URL/);
+    expect(validator).not.toHaveBeenCalled();
+    expect(addSource).not.toHaveBeenCalled();
+  });
+
+  it('POST of an App id another source already uses names the App id and the one-source-per-App-id rule', async () => {
+    const addSource = vi
+      .fn()
+      .mockRejectedValue(new DuplicateSourceError('github', '1', 'github:1'));
+    const app = routesAs(null, createMockSourceStore({ addSource }));
+
+    const res = await send(app, 'POST', '/sources', addBody);
+
+    expect(res.status).toBe(409);
+    const { error } = (await res.json()) as { error: string };
+    expect(error).toContain('github:1');
+    expect(error).toContain('an orchestrator holds one source per GitHub App id');
+  });
+
+  it('PATCH githubUrl with a routing-key-scoped token is 403 and makes no GitHub call', async () => {
+    const updateSource = vi.fn();
+    const store = createMockSourceStore({
+      getSource: vi.fn().mockResolvedValue(stored),
+      updateSource,
+    });
+    const app = routesAs('github:1', store);
+
+    const res = await send(app, 'PATCH', '/sources/github%3A1', {
+      githubUrl: 'https://evil.example',
+    });
+
+    // fails-when: a scoped token can redirect the App's JWT
+    expect(res.status).toBe(403);
+    expect(validator).not.toHaveBeenCalled();
+    expect(updateSource).not.toHaveBeenCalled();
+  });
+
+  it('PATCH of another field with a routing-key-scoped token still works', async () => {
+    const updateSource = vi.fn().mockResolvedValue(stored);
+    const store = createMockSourceStore({
+      getSource: vi.fn().mockResolvedValue(stored),
+      updateSource,
+    });
+
+    const res = await send(routesAs('github:1', store), 'PATCH', '/sources/github%3A1', {
+      config: { githubUrl: 'https://evil.example' },
+    });
+
+    // breaks-if-wrong: a scoped token keeps managing its own source
+    expect(res.status).toBe(200);
+    // The store strips githubUrl from the generic config (source-store.test.ts).
+    expect(updateSource).toHaveBeenCalledWith(
+      'github:1',
+      expect.not.objectContaining({ githubUrl: expect.anything() }),
+    );
+    expect(validator).not.toHaveBeenCalled();
+  });
+
+  it('PATCH customerId needs an unscoped token: a scoped one is 403 and moves nothing', async () => {
+    /** PATCH a new customer as a token scoped to `scope` (unscoped when null). */
+    const patchCustomer = async (scope: string | null) => {
+      const updateSource = vi.fn().mockResolvedValue(stored);
+      const store = createMockSourceStore({
+        getSource: vi.fn().mockResolvedValue(stored),
+        updateSource,
+      });
+      const res = await send(routesAs(scope, store), 'PATCH', '/sources/github%3A1', {
+        customerId: 'org_Y',
+      });
+      return { status: res.status, updateSource };
+    };
+
+    const scoped = await patchCustomer('github:1');
+    // fails-when: a scoped token moves its source, and its registrations, into another org
+    expect(scoped.status).toBe(403);
+    expect(scoped.updateSource).not.toHaveBeenCalled();
+
+    const unscoped = await patchCustomer(null);
+    // breaks-if-wrong: the operator can still move a source between orgs
+    expect(unscoped.status).toBe(200);
+    expect(unscoped.updateSource).toHaveBeenCalledWith(
+      'github:1',
+      expect.objectContaining({ customerId: 'org_Y' }),
+    );
+  });
+
+  it('PATCH githubUrl with an unscoped token re-validates at the new server before storing', async () => {
+    const updateSource = vi.fn().mockResolvedValue(stored);
+    const store = storeWithKey(updateSource);
+    const app = routesAs(null, store);
+
+    const res = await send(app, 'PATCH', '/sources/github%3A1', {
+      githubUrl: 'https://ghe2.corp.example',
+    });
+
+    expect(res.status).toBe(200);
+    expect(validator).toHaveBeenCalledWith({
+      appId: '1',
+      privateKey: 'pem',
+      githubUrl: 'https://ghe2.corp.example',
+    });
+    expect(updateSource).toHaveBeenCalledWith(
+      'github:1',
+      expect.objectContaining({ githubUrl: 'https://ghe2.corp.example' }),
+    );
+
+    // The App does not answer at the new server: 400, nothing stored.
+    validator.mockResolvedValueOnce({ valid: false, error: 'GitHub API validation failed: 401' });
+    updateSource.mockClear();
+    const refused = await send(app, 'PATCH', '/sources/github%3A1', {
+      githubUrl: 'https://ghe3.corp.example',
+    });
+    expect(refused.status).toBe(400);
+    expect(updateSource).not.toHaveBeenCalled();
+  });
+
+  it('PATCH githubUrl null clears the server after validating at github.com', async () => {
+    const updateSource = vi.fn().mockResolvedValue(stored);
+    const store = storeWithKey(updateSource);
+
+    const res = await send(routesAs(null, store), 'PATCH', '/sources/github%3A1', {
+      githubUrl: null,
+    });
+
+    expect(res.status).toBe(200);
+    expect(validator).toHaveBeenCalledWith({ appId: '1', privateKey: 'pem', githubUrl: undefined });
+    expect(updateSource).toHaveBeenCalledWith(
+      'github:1',
+      expect.objectContaining({ githubUrl: null }),
+    );
+  });
+
+  describe('a stored server that is not a GitHub web URL', () => {
+    const planted = { ...stored, github_url: 'http://x/y' };
+    const plantedStore = (updateSource: SourceStore['updateSource']) =>
+      createMockSourceStore({
+        getSource: vi.fn().mockResolvedValue(planted),
+        getSourceWithSecrets: vi.fn().mockResolvedValue({ ...planted, privateKey: 'pem' }),
+        updateSource,
+      });
+
+    // breaks-if-wrong: the operator cannot repair the source, since every read refuses it
+    it('PATCH githubUrl replaces it, validating only at the new server', async () => {
+      const updateSource = vi.fn().mockResolvedValue(planted);
+      const res = await send(
+        routesAs(null, plantedStore(updateSource)),
+        'PATCH',
+        '/sources/github%3A1',
+        {
+          githubUrl: null,
+        },
+      );
+      expect(res.status).toBe(200);
+      expect(validator).toHaveBeenCalledWith({
+        appId: '1',
+        privateKey: 'pem',
+        githubUrl: undefined,
+      });
+      expect(updateSource).toHaveBeenCalledWith(
+        'github:1',
+        expect.objectContaining({ githubUrl: null }),
+      );
+    });
+
+    // fails-when: a key rotation validates at the planted server, or falls back to github.com
+    it('PATCH of a new private key alone is refused, naming the source', async () => {
+      const updateSource = vi.fn();
+      const res = await send(
+        routesAs(null, plantedStore(updateSource)),
+        'PATCH',
+        '/sources/github%3A1',
+        {
+          privateKey: 'new-pem',
+        },
+      );
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toMatch(
+        /^Source github:1 is refused: the stored GitHub server URL/,
+      );
+      expect(validator).not.toHaveBeenCalled();
+      expect(updateSource).not.toHaveBeenCalled();
+    });
+  });
+
+  it('PATCH of a new private key validates it at the stored server', async () => {
+    const store = createMockSourceStore({
+      getSource: vi.fn().mockResolvedValue(stored),
+      updateSource: vi.fn().mockResolvedValue(stored),
+    });
+
+    await send(routesAs('github:1', store), 'PATCH', '/sources/github%3A1', {
+      privateKey: 'new-pem',
+    });
+
+    // fails-when: a key rotation for a GHES source is validated at api.github.com and refused
+    expect(validator).toHaveBeenCalledWith({ appId: '1', privateKey: 'new-pem', githubUrl: GHES });
+  });
+
+  it('PATCH of a new private key for a source with no stored App id is 400', async () => {
+    const noAppId = { ...stored, config: JSON.stringify({}) };
+    const updateSource = vi.fn();
+    const store = createMockSourceStore({
+      getSource: vi.fn().mockResolvedValue(noAppId),
+      updateSource,
+    });
+
+    const res = await send(routesAs(null, store), 'PATCH', '/sources/github%3A1', {
+      privateKey: 'new-pem',
+    });
+
+    // fails-when: the missing App id surfaces as a 500 instead of a client error
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'Source github:1 has no stored GitHub App id' });
+    expect(validator).not.toHaveBeenCalled();
+    expect(updateSource).not.toHaveBeenCalled();
+  });
+
+  it('redeliver replays from the stored server', async () => {
+    // Only the arguments matter here; the answer's shape is pinned in admin-sources.redeliver.test.ts.
+    const redeliverDeliveries = vi.fn().mockResolvedValue({ results: [] } as never);
+    const app = createSourceRoutes({ sourceStore: storeWithKey(vi.fn()), redeliverDeliveries });
+
+    const res = await app.request('/sources/github%3A1/redeliver', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        since: '2026-11-01T00:00:00Z',
+        until: '2026-11-01T01:00:00Z',
+        dryRun: true,
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(redeliverDeliveries).toHaveBeenCalledWith(
+      { appId: '1', privateKey: 'pem', githubUrl: GHES },
+      expect.objectContaining({ dryRun: true }),
+    );
   });
 });

@@ -106,11 +106,11 @@ Bootstraps a new orchestrator into an existing cluster. Connects via Platform re
   kici-admin orchestrator install --env-file ./kici-orchestrator.env --mode independent
   ```
 
-  The bundle carries no operating mode and no Platform credentials. The file lists all four as comments.
+  The bundle carries no operating mode and no Platform credentials. The file lists all four as comments. After a join through `--platform`, the commented `KICI_PLATFORM_URL` names the Platform URL the join used.
 
   Choose the mode **at install time** — pass `--mode`, or add a `KICI_MODE` line to the env file before you install. The installer reads `KICI_MODE` to pick the service's entry point, so an orchestrator installed without it runs the Platform-connected server and refuses to start in `independent` mode. `--mode` overwrites a `KICI_MODE` already in the file; omit it and the file's own value stands.
 
-  `KICI_PLATFORM_URL`, `KICI_PLATFORM_TOKEN` and `KICI_BOOTSTRAP_ADMIN_TOKEN` are read at start, so set them any time before you start the service.
+  `KICI_PLATFORM_URL`, `KICI_PLATFORM_TOKEN` and `KICI_BOOTSTRAP_ADMIN_TOKEN` are read at start, so set them any time before you start the service. `orchestrator install --platform-url <url>` writes `KICI_PLATFORM_URL` into the copied file for you.
 
 ### host -- host roster (declared inventory)
 
@@ -145,21 +145,22 @@ Synopsis: `kici-admin agent install [options]`
 
 **Options**
 
-| Option                     | Default      | Description                                                                                                  |
-| -------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------ |
-| `--platform <type>`        |              | Force the service platform (systemd, launchd, windows, compose). Default: detected from the host             |
-| `--env-file <path>`        |              | Path to existing env/config file to use                                                                      |
-| `--binary <path>`          |              | Path to agent binary (default: current executable)                                                           |
-| `--name <name>`            | `kici-agent` | Service name                                                                                                 |
-| `--orchestrator-url <url>` |              | URL of the orchestrator to connect to                                                                        |
-| `--token <token>`          |              | Agent authentication token                                                                                   |
-| `--labels <labels>`        |              | Comma-separated agent labels for routing                                                                     |
-| `--port <port>`            |              | HTTP port for the agent's health and metrics endpoints; each agent on one host needs its own (default: 8080) |
-| `--wizard`                 |              | Interactive wizard for guided setup                                                                          |
-| `--system`                 |              | Install as system-level service (requires root)                                                              |
-| `--user-level`             |              | Install as user-level service (no root required)                                                             |
-| `--instance-dir <path>`    |              | Deploy folder; the instance manifest is written here (default: current working directory)                    |
-| `--force`                  |              | Overwrite an existing same-named foreign instance                                                            |
+| Option                      | Default                   | Description                                                                                                                                             |
+| --------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--platform <type>`         |                           | Force the service platform (systemd, launchd, windows, compose). Default: detected from the host                                                        |
+| `--env-file <path>`         |                           | Path to existing env/config file to use                                                                                                                 |
+| `--binary <path>`           |                           | Path to agent binary (default: current executable)                                                                                                      |
+| `--name <name>`             | `kici-agent`              | Service name                                                                                                                                            |
+| `--orchestrator-url <url>`  |                           | URL of the orchestrator to connect to                                                                                                                   |
+| `--token <token>`           |                           | Agent authentication token                                                                                                                              |
+| `--labels <labels>`         |                           | Comma-separated agent labels for routing                                                                                                                |
+| `--port <port>`             |                           | HTTP port for the agent's health and metrics endpoints; each agent on one host needs its own (default: 8080)                                            |
+| `--wizard`                  |                           | Interactive wizard for guided setup                                                                                                                     |
+| `--system`                  |                           | Install as system-level service (requires root)                                                                                                         |
+| `--user-level`              |                           | Install as user-level service (no root required)                                                                                                        |
+| `--instance-dir <path>`     |                           | Deploy folder; the instance manifest is written here (default: current working directory)                                                               |
+| `--force`                   |                           | Overwrite an existing same-named foreign instance                                                                                                       |
+| `--image-registry <prefix>` | env `KICI_IMAGE_REGISTRY` | Compose only: pull the image from this registry prefix instead of quay.io/kici-dev, pinned to the same digest (e.g. registry.internal.example/kici-dev) |
 
 ### `kici-admin agent list`
 

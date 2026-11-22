@@ -2240,6 +2240,10 @@ const registrationSourceSchema = z.object({
   name: z.string().nullable(),
   subtype: SourceSubtype.nullable(),
   provider: z.string(),
+  /** Web origin of a GitHub Enterprise Server source; absent for github.com. */
+  webUrl: z.string().optional(),
+  /** The orchestrator refuses the source: its web host is unknown, so build no link. */
+  refused: z.literal(true).optional(),
 });
 
 /** Single registration item in the list response. */
@@ -3058,6 +3062,8 @@ export const runListItemSchema = z.object({
    * which is derived from the routing key. Drives provider-aware repo links.
    */
   repoProvider: z.string().nullable(),
+  /** Web origin of the repository's server when not the provider's public host. */
+  repoWebUrl: z.string().nullable().optional(),
   /** True when the run executed a developer's local working tree (`kici run remote`). */
   localWorkingTree: z.boolean(),
   source: runListSourceSchema.nullable(),

@@ -186,6 +186,31 @@ describe('JoinClient through the Platform relay', () => {
     }
   });
 
+  // fails-when: the env file's Platform URL hint names the hosted relay after a
+  // join through another Platform
+  it('writes the relay it joined through into the env file hint', async () => {
+    const { token, tokenHash } = makeToken();
+    const relay = await fakeRelay((frame, socket) => {
+      if (frame.type === 'auth.request') socket.send(JSON.stringify({ type: 'auth.success' }));
+      if (frame.type === 'join.request') socket.send(JSON.stringify(answerFor(tokenHash, frame)));
+    });
+    const dir = await mkdtemp(join(tmpdir(), 'kici-join-relay-hint-'));
+    try {
+      await new JoinClient({
+        token,
+        platformUrl: relay.url,
+        apiKey: 'k',
+        envFilePath: join(dir, 'relay.env'),
+      }).join();
+      const content = await readFile(join(dir, 'relay.env'), 'utf-8');
+      expect(content).toContain(`#   KICI_PLATFORM_URL=${relay.url}`);
+      expect(content).not.toContain('api.kici.dev');
+    } finally {
+      await relay.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('names the close code and reason when the Platform closes before auth', async () => {
     const relay = await fakeRelay((frame, socket) => {
       if (frame.type === 'auth.request') socket.close(4008, 'Plan limit: maximum 5 orchestrators');
@@ -302,6 +327,19 @@ describe('JoinClient constructor validation', () => {
     expect(() => new JoinClient({ token: 'kici_join_v1.x.y' })).toThrow(
       'Either --platform or --peer must be specified',
     );
+  });
+
+  // fails-when: a --platform value with a line break reaches the join, which
+  //   spends the single-use token before the env file write refuses it
+  it('throws when --platform carries a line break', () => {
+    expect(
+      () =>
+        new JoinClient({
+          token: makeToken().token,
+          platformUrl: 'wss://a/ws\nKICI_MODE=independent',
+          apiKey: 'k',
+        }),
+    ).toThrow('--platform must not contain a line break');
   });
 
   it('throws when both --platform and --peer are specified', async () => {
@@ -452,6 +490,64 @@ describe('buildEnvFile', () => {
   });
 });
 
+describe('buildEnvFile Platform URL hint', () => {
+  const bundle = {
+    databaseUrl: 'postgresql://joiner:pw@db:5432/kici',
+    clusterId: 'cluster-1',
+    secretKey: 'a'.repeat(64),
+  };
+
+  // breaks-if-wrong: a join without a Platform URL (a --peer join) writes the
+  // hosted Platform URL hint, byte for byte. Literal snapshot.
+  it('is byte-identical without a Platform URL', () => {
+    expect(buildEnvFile(bundle)).toBe(
+      [
+        '# KiCI orchestrator configuration written by `kici-admin join`.',
+        '#',
+        '# Install the service from this file:',
+        '#   kici-admin orchestrator install --env-file <this file>',
+        '#',
+        '# The join bundle carries the cluster database, its object storage and the',
+        '# secrets encryption key. Set the rest yourself.',
+        '#',
+        '# Set the mode BEFORE you install -- add the line below, or pass',
+        '# `--mode <mode>` to `orchestrator install`. The installer bakes the service',
+        "# unit's entry point from it, and an independent orchestrator started from a",
+        '# unit built for platform/hybrid refuses to boot.',
+        '#   KICI_MODE=hybrid                          # platform | hybrid | observed | independent',
+        '#',
+        '# These are read at start, so they can be filled in any time before that:',
+        '#   KICI_PLATFORM_URL=wss://api.kici.dev/ws   # platform/hybrid/observed only',
+        '#   KICI_PLATFORM_TOKEN=                      # registration token (kici_ok_...)',
+        '#   KICI_BOOTSTRAP_ADMIN_TOKEN=               # openssl rand -hex 32',
+        '#',
+        'KICI_DATABASE_URL=postgresql://joiner:pw@db:5432/kici',
+        `KICI_SECRET_KEY=${'a'.repeat(64)}`,
+        '',
+      ].join('\n'),
+    );
+  });
+
+  it('names the Platform the join went through', () => {
+    const content = buildEnvFile(bundle, { platformUrl: 'wss://kici.corp.example/ws' });
+    // fails-when: the hint keeps the hosted URL after a join through another Platform
+    expect(content).toContain('#   KICI_PLATFORM_URL=wss://kici.corp.example/ws');
+    expect(content).not.toContain('api.kici.dev');
+    // The hint stays a comment: no uncommented assignment is added.
+    expect(parseEnvFile(content)).toEqual({
+      KICI_DATABASE_URL: bundle.databaseUrl,
+      KICI_SECRET_KEY: bundle.secretKey,
+    });
+  });
+
+  it('refuses a Platform URL carrying a line break', () => {
+    // fails-when: a newline in the URL ends the comment and injects an assignment
+    expect(() =>
+      buildEnvFile(bundle, { platformUrl: 'wss://a/ws\nKICI_MODE=independent' }),
+    ).toThrow(/KICI_PLATFORM_URL contains a line break/);
+  });
+});
+
 describe('writeEnvFile', () => {
   // fails-when: the file is written under the ambient umask (0644 by default)
   //   while carrying the cluster's master secret key and database URL.
@@ -530,9 +626,10 @@ describe('JoinClient artifact', () => {
     try {
       await runJoin({ envFilePath: join(dir, 'peer.env') });
       expect(existsSync(join(dir, 'peer.env'))).toBe(true);
-      expect(await readFile(join(dir, 'peer.env'), 'utf-8')).toContain(
-        'KICI_DATABASE_URL=postgresql://joiner:pw@db:5432/kici',
-      );
+      const content = await readFile(join(dir, 'peer.env'), 'utf-8');
+      expect(content).toContain('KICI_DATABASE_URL=postgresql://joiner:pw@db:5432/kici');
+      // breaks-if-wrong: a --peer join keeps the hosted Platform URL hint
+      expect(content).toContain('#   KICI_PLATFORM_URL=wss://api.kici.dev/ws   #');
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

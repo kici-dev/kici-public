@@ -27,6 +27,8 @@ import {
 } from '@kici-dev/engine';
 
 import { writeFileSecurely } from '../helpers/secure-write.js';
+import { containsLineBreak } from '../helpers/env-file-value.js';
+import { DEFAULT_PLATFORM_RELAY_URL } from '../helpers/platform-relay-url.js';
 import { parseToken, tokenHashOf } from './join-token.js';
 import {
   createJoinRequest,
@@ -106,8 +108,11 @@ export const STORAGE_ENV_VARS = {
   logBucket: 'KICI_STORAGE_LOG_BUCKET',
 } as const satisfies Record<keyof NonNullable<ConfigBundle['storage']>, string>;
 
-/** Header explaining the artifact and naming what the bundle cannot carry. */
-const ENV_FILE_HEADER = [
+/**
+ * Header explaining the artifact and naming what the bundle cannot carry.
+ * `platformUrlHint` fills the commented `KICI_PLATFORM_URL` line.
+ */
+const envFileHeader = (platformUrlHint: string): string[] => [
   '# KiCI orchestrator configuration written by `kici-admin join`.',
   '#',
   '# Install the service from this file:',
@@ -123,7 +128,7 @@ const ENV_FILE_HEADER = [
   '#   KICI_MODE=hybrid                          # platform | hybrid | observed | independent',
   '#',
   '# These are read at start, so they can be filled in any time before that:',
-  '#   KICI_PLATFORM_URL=wss://api.kici.dev/ws   # platform/hybrid/observed only',
+  `#   KICI_PLATFORM_URL=${platformUrlHint}   # platform/hybrid/observed only`,
   '#   KICI_PLATFORM_TOKEN=                      # registration token (kici_ok_...)',
   '#   KICI_BOOTSTRAP_ADMIN_TOKEN=               # openssl rand -hex 32',
   '#',
@@ -134,15 +139,23 @@ const ENV_FILE_HEADER = [
  * orchestrator boot path reads.
  *
  * A value carrying a newline would silently truncate the file, so it is
- * rejected by name rather than written.
+ * rejected by name rather than written. `opts.platformUrl`, the Platform the
+ * join went through, replaces the hosted URL in the header's commented hint.
  */
-export function buildEnvFile(bundle: ConfigBundle): string {
-  const lines = [...ENV_FILE_HEADER];
+export function buildEnvFile(bundle: ConfigBundle, opts: { platformUrl?: string } = {}): string {
+  const assertSingleLine = (label: string, value: string): void => {
+    if (containsLineBreak(value)) {
+      throw new Error(`${label} contains a line break and cannot be written`);
+    }
+  };
+
+  if (opts.platformUrl !== undefined) {
+    assertSingleLine('Platform URL for KICI_PLATFORM_URL', opts.platformUrl);
+  }
+  const lines = envFileHeader(opts.platformUrl ?? DEFAULT_PLATFORM_RELAY_URL);
 
   const push = (name: string, value: string): void => {
-    if (/[\r\n]/.test(value)) {
-      throw new Error(`Join bundle value for ${name} contains a line break and cannot be written`);
-    }
+    assertSingleLine(`Join bundle value for ${name}`, value);
     lines.push(`${name}=${value}`);
   };
 
@@ -171,8 +184,12 @@ async function writeSecretFile(path: string, content: string): Promise<void> {
 }
 
 /** Write the env file the orchestrator boots from. */
-export async function writeEnvFile(path: string, bundle: ConfigBundle): Promise<void> {
-  await writeSecretFile(path, buildEnvFile(bundle));
+export async function writeEnvFile(
+  path: string,
+  bundle: ConfigBundle,
+  opts: { platformUrl?: string } = {},
+): Promise<void> {
+  await writeSecretFile(path, buildEnvFile(bundle, opts));
 }
 
 export class JoinClient {
@@ -182,6 +199,11 @@ export class JoinClient {
     }
     if (options.platformUrl && options.peerUrl) {
       throw new Error('--platform and --peer are mutually exclusive');
+    }
+    // The URL lands in the env file's header hint. Refused before the join, so
+    // a bad value never spends the single-use token.
+    if (options.platformUrl && containsLineBreak(options.platformUrl)) {
+      throw new Error('--platform must not contain a line break');
     }
   }
 
@@ -213,7 +235,7 @@ export class JoinClient {
     logger.info('Join successful, writing config...', { clusterId: bundle.clusterId });
 
     const envFilePath = this.options.envFilePath ?? DEFAULT_JOIN_ENV_FILE;
-    await writeEnvFile(envFilePath, bundle);
+    await writeEnvFile(envFilePath, bundle, { platformUrl: this.options.platformUrl });
     logger.info(`Env file written to ${envFilePath}`);
     logger.info(
       `Install the orchestrator with: kici-admin orchestrator install --env-file ${envFilePath}`,

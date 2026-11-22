@@ -3839,6 +3839,11 @@ export const SCHEMA_SNAPSHOT: SchemaFingerprint = {
       nullable: false,
       default: "'__default__'::character varying",
     },
+    'sources.github_url': {
+      type: 'text',
+      nullable: true,
+      default: null,
+    },
     'sources.id': {
       type: 'uuid',
       nullable: false,

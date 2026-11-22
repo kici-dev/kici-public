@@ -8,6 +8,7 @@ import pc from 'picocolors';
 import { makeCliStdioBlocking } from '@kici-dev/core';
 import { shouldSuppressBanner } from './cli-banner.js';
 import { guardUnsettledExit } from './cli-unsettled-guard.js';
+import { ClientNewerThanPlatformError } from './remote/client-newer-error.js';
 
 declare const KICI_VERSION: string;
 const version = typeof KICI_VERSION !== 'undefined' ? KICI_VERSION : '0.0.1';
@@ -244,6 +245,32 @@ export function buildProgram(): Command {
       [] as string[],
     )
     .option(
+      '--git-depth <n>',
+      'Commits of history the remote workspace gets (0 = full history, every branch and tag); default: what the jobs ask for, else 1',
+    )
+    // Both forms declared: Commander leaves gitTags undefined when neither is
+    // passed, so the jobs' tag policy applies.
+    .option('--git-tags', 'Ship every tag in the remote workspace')
+    .option('--no-git-tags', 'Ship no tags in the remote workspace')
+    .option(
+      '--no-commit',
+      'Leave uncommitted changes uncommitted in the remote workspace instead of a synthetic commit',
+    )
+    .option(
+      '--commit-message <msg>',
+      'Message of the synthetic commit (default: "kici: working-tree snapshot")',
+    )
+    .option(
+      '--commit-author <author>',
+      'Author of the synthetic commit, as "Name <email>" (default: your git user)',
+    )
+    .option(
+      '--tag <name>',
+      'Create an annotated tag at the remote workspace commit (repeatable)',
+      (val: string, prev: string[]) => [...prev, val],
+      [] as string[],
+    )
+    .option(
       // Commander names the property after the last long flag
       // (`options.approveAll`); both flags are accepted.
       '--yes, --approve-all',
@@ -265,6 +292,18 @@ export function buildProgram(): Command {
         console.error('Error: --pick is mutually exclusive with --workflow.');
         process.exit(2);
       }
+      // Out of the spread: the run reads the parsed `git` flags only.
+      const { gitDepth, gitTags, commit, commitMessage, commitAuthor, tag, ...rest } = options;
+      const { parseRemoteGitFlags, RemoteGitFlagError } =
+        await import('./commands/remote-git-flags.js');
+      let git;
+      try {
+        git = parseRemoteGitFlags({ gitDepth, gitTags, commit, commitMessage, commitAuthor, tag });
+      } catch (err) {
+        if (!(err instanceof RemoteGitFlagError)) throw err;
+        console.error(`Error: ${err.message}`);
+        process.exit(2);
+      }
       const { runRemoteCommand } = await import('./commands/index.js');
       const { resolveCheckMode } = await import('./commands/check-mode.js');
       let checkMode;
@@ -275,7 +314,8 @@ export function buildProgram(): Command {
         process.exit(2);
       }
       const success = await runRemoteCommand(fixture, {
-        ...options,
+        ...rest,
+        git,
         checkMode,
         envFlags: options.env,
         targets: options.target,
@@ -377,10 +417,19 @@ export function buildProgram(): Command {
     .command('login')
     .description('Authenticate with KiCI via browser OAuth (default) or device flow (--device)')
     .option('--device', 'Force device authorization flow (for headless/SSH environments)')
-    .option('--platform-endpoint <url>', 'Platform relay URL')
+    .option(
+      '--platform-endpoint <url>',
+      'Platform API URL (http:// or https://, default https://api.kici.dev)',
+    )
     .option(
       '--oidc-issuer <url>',
-      'OIDC issuer URL (defaults to the hosted KiCI IdP unless a flag/env selects another)',
+      'OIDC issuer URL (default: the issuer the named Platform publishes, or the hosted KiCI IdP)',
+    )
+    .option(
+      '--oidc-scope <scope>',
+      'Extra OIDC scope to request, after KICI_OIDC_EXTRA_SCOPES (repeatable; a value may list several scopes separated by commas or spaces)',
+      (val: string, prev: string[]) => [...prev, val],
+      [] as string[],
     )
     .option('--routing-key <key>', 'Deprecated; saved to the config but never read')
     .option('--no-attach', 'Skip the post-login prompt to attach the local dev plane')
@@ -388,11 +437,13 @@ export function buildProgram(): Command {
       'after',
       `
 Environment variables:
-  KICI_BROWSER_CMD     Custom browser command (use {url} placeholder, or 'none' to suppress)
-  KICI_CALLBACK_PORT   Fixed port for OAuth PKCE callback server (default: random)
-  KICI_CONFIG_DIR      Override config directory (default: ~/.kici)
-  KICI_OIDC_ISSUER     Override OIDC issuer URL
-  KICI_OIDC_CLIENT_ID  Override OIDC client ID
+  KICI_BROWSER_CMD        Custom browser command (use {url} placeholder, or 'none' to suppress)
+  KICI_CALLBACK_PORT      Fixed port for OAuth PKCE callback server (default: random)
+  KICI_CONFIG_DIR         Override config directory (default: ~/.kici)
+  KICI_PLATFORM_URL       Platform API URL, used when --platform-endpoint is not passed
+  KICI_OIDC_ISSUER        Override OIDC issuer URL
+  KICI_OIDC_CLIENT_ID     Override OIDC client ID
+  KICI_OIDC_EXTRA_SCOPES  Extra OIDC scopes to request, separated by commas or spaces
 `,
     )
     .action(async (options) => {
@@ -401,6 +452,7 @@ Environment variables:
         device: options.device,
         platformEndpoint: options.platformEndpoint,
         oidcIssuer: options.oidcIssuer,
+        oidcScopes: options.oidcScope,
         routingKey: options.routingKey,
         // Commander sets options.attach=false for --no-attach (default true).
         noAttachPrompt: options.attach === false,
@@ -1150,6 +1202,12 @@ export function runCli(argv: string[] = process.argv): void {
   const run = program.parseAsync(argv);
   guardUnsettledExit(run);
   run.catch((err: unknown) => {
+    // A Platform older than this CLI refused the request; its message says to upgrade it.
+    if (err instanceof ClientNewerThanPlatformError) {
+      process.stderr.write(pc.red(`${err.message}\n`));
+      process.exit(1);
+      return;
+    }
     if (!(err instanceof CommanderError)) throw err;
     handleCliParseExit(err, argv, program);
   });

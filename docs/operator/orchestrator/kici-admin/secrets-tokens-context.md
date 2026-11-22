@@ -10,9 +10,10 @@ description: 'Scoped secrets, context variables, secret backends, API tokens, an
 ```bash
 kici-admin secret scopes <orgId>
 kici-admin secret list <orgId> <scope>
-kici-admin secret set [orgId] [scope] [key] [--value <v> | --prompt | --from-stdin | --from-file <p> | --from-env <var>] [--no-trim] [--confirm-fingerprint <sha256>] [--dry-run] [--database-url <url>]
+kici-admin secret set [orgId] [scope] [key] [--value <v> | --prompt | --from-stdin | --from-file <p> | --from-env <var>] [--no-trim] [--confirm-fingerprint <sha256>] [--dry-run] [--database-url <url>] [--env-file <path>]
 kici-admin secret set --org <orgId> --context <name> --key <k> [value-source flags as above]
 kici-admin secret delete <orgId> <scope> <key> [--yes]
+kici-admin secret verify [--database-url <url>] [--env-file <path>] [--json]
 kici-admin secret scope create <orgId> <scope> [--json]
 kici-admin secret scope rename <orgId> <oldScope> <newScope> [--json]
 kici-admin secret scope delete <orgId> <scope> [--yes] [--json]
@@ -26,7 +27,12 @@ kici-admin secret scope delete <orgId> <scope> [--yes] [--json]
 - Value sources (mutually exclusive; first matching wins): `--prompt` (interactive no-echo, default on TTY), `--from-stdin` (read piped stdin until EOF; default when stdin is a pipe), `--from-file <path>` (file body, trailing newline trimmed unless `--no-trim`), `--from-env <var>` (named env var), `--value <plaintext>` (visible in shell history — discouraged).
 - `--confirm-fingerprint <sha256hex>` refuses the write unless `SHA-256(value)` matches the supplied 64-hex string. Pair with a value source for unattended automation.
 - `--dry-run` parses + validates the value, prints fingerprint + length, and skips the write.
-- `--database-url` (on `set`) switches to direct-DB mode and writes the caller-supplied `encrypted_value` verbatim into `scoped_secrets` — for a test setup that seeds secrets before the orchestrator is up.
+- `--database-url` (on `set`), or `KICI_DATABASE_URL` without `--url`, switches to direct-DB mode: the value is encrypted under the orchestrator master key, as the admin API encrypts it, and the write is recorded in the secrets audit log. Use it to seed secrets before the orchestrator is up.
+  - It reads `KICI_SECRET_KEY` or `KICI_SECRET_KEY_FILE` (one is required), and `KICI_PG_CUSTOMER_SECRETS`, as the orchestrator reads them at startup: from the shell, or from the orchestrator env file that `--env-file <path>` names. `--env-file` without direct-DB mode is refused, because the admin API reads no env file.
+  - A `pg:` qualifier on the scope is accepted. Direct mode writes only to the PG backend, so a scope qualified with another backend (`vault:staging`) is refused with an error that names that backend.
+  - It refuses a master key that decrypts none of the encrypted secrets already stored in the database, because that key is not the orchestrator key. A row it wrote under a wrong key would make `rotate-key` fail for the whole install.
+  - When the database stores no encrypted secret yet, nothing can confirm the key: the store is empty, or it holds only values an older `kici-admin` stored as plaintext. The write goes through, and `secret set` prints a warning. Confirm the key after the orchestrator starts: run `kici-admin secret verify` against its admin API (`--url` and `--token`, without `--database-url`). It lists every secret the orchestrator's own key cannot decrypt.
+- `verify` lists every stored PG secret that the orchestrator master key cannot decrypt: its org, scope and key name, never a value. It exits 1 when it lists one, and 0 when every secret decrypts. A value stored as plaintext, or one encrypted under another key, is listed. Such a row makes `rotate-key` fail for the whole install, and makes a `scope rename` and the jobs that resolve its scope fail. Re-set each listed secret with `secret set`. It asks the admin API, or reads the database directly with `--database-url` (or `KICI_DATABASE_URL` without `--url`), with the same key settings as `set`.
 - `delete` asks for confirmation unless `--yes` is passed.
 - `scope create`, `scope rename` and `scope delete` act on a whole scope. They are the operator path for the dashboard's scope writes (`secrets.scope.*` in the [dashboard-write policy](../../security/dashboard-write-policy.md)). Only the PG backend supports them; a scope in another backend gets an error that names the backend.
   - `scope create` makes an empty scope. An existing scope stays unchanged.
@@ -115,6 +121,7 @@ kici-admin token revoke <id>
 - `--routing-key` optionally scopes the token to a specific routing key.
 - `--expires` optionally sets an expiry: a duration from now (`30d`, `12h`, `45m`) or an ISO-8601 datetime. Omit it for a non-expiring token; `token list` shows `never` in the `Expires` column and marks a past expiry with `[expired]`.
 - `--subject` optionally records who the token is for.
+- `token list` shows when each token was last used. The orchestrator updates this time at most once a minute for each token, so a token in active use can show a time up to a minute old.
 
 #### Recording the holder with `--subject`
 
@@ -326,10 +333,10 @@ Synopsis: `kici-admin backend purge-stale [options]`
 
 **Options**
 
-| Option                 | Default | Description                                               |
-| ---------------------- | ------- | --------------------------------------------------------- |
-| `--database-url <url>` |         | Orchestrator DB URL (or KICI_DATABASE_URL / DATABASE_URL) |
-| `--json`               |         | Emit JSON output                                          |
+| Option                 | Default | Description                                |
+| ---------------------- | ------- | ------------------------------------------ |
+| `--database-url <url>` |         | Orchestrator DB URL (or KICI_DATABASE_URL) |
+| `--json`               |         | Emit JSON output                           |
 
 ### `kici-admin backend remove`
 
@@ -746,20 +753,35 @@ Synopsis: `kici-admin secret set [orgId] [scope] [key] [options]`
 
 **Options**
 
-| Option                              | Default | Description                                                                                                          |
-| ----------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
-| `--value <value>`                   |         | Secret value via argv (visible in shell history; prefer --prompt)                                                    |
-| `--org <orgId>`                     |         | Org id (use with --context + --key; mutually exclusive with positional form; kici-admin org list prints the org ids) |
-| `--context <name>`                  |         | Context scope — sugar for positional <scope>. Requires --org and --key.                                              |
-| `--key <key>`                       |         | Secret key name (use with --org + --context)                                                                         |
-| `--prompt`                          |         | Interactive no-echo prompt (requires TTY)                                                                            |
-| `--from-stdin`                      |         | Read value from piped stdin until EOF                                                                                |
-| `--from-file <path>`                |         | Read value from a file (trailing newline trimmed)                                                                    |
-| `--from-env <var>`                  |         | Read value from a named environment variable                                                                         |
-| `--no-trim`                         |         | When reading --from-file, keep the trailing newline (default: trim once)                                             |
-| `--confirm-fingerprint <sha256hex>` |         | Refuse the write unless SHA-256(value) matches this 64-hex string                                                    |
-| `--dry-run`                         |         | Parse + validate the value, print fingerprint + length, do not write                                                 |
-| `--database-url <url>`              |         | Direct-DB mode: write encrypted_value verbatim to scoped_secrets (offline; skips HTTP + encryption)                  |
+| Option                              | Default | Description                                                                                                                                          |
+| ----------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--value <value>`                   |         | Secret value via argv (visible in shell history; prefer --prompt)                                                                                    |
+| `--org <orgId>`                     |         | Org id (use with --context + --key; mutually exclusive with positional form; kici-admin org list prints the org ids)                                 |
+| `--context <name>`                  |         | Context scope — sugar for positional <scope>. Requires --org and --key.                                                                              |
+| `--key <key>`                       |         | Secret key name (use with --org + --context)                                                                                                         |
+| `--prompt`                          |         | Interactive no-echo prompt (requires TTY)                                                                                                            |
+| `--from-stdin`                      |         | Read value from piped stdin until EOF                                                                                                                |
+| `--from-file <path>`                |         | Read value from a file (trailing newline trimmed)                                                                                                    |
+| `--from-env <var>`                  |         | Read value from a named environment variable                                                                                                         |
+| `--no-trim`                         |         | When reading --from-file, keep the trailing newline (default: trim once)                                                                             |
+| `--confirm-fingerprint <sha256hex>` |         | Refuse the write unless SHA-256(value) matches this 64-hex string                                                                                    |
+| `--dry-run`                         |         | Parse + validate the value, print fingerprint + length, do not write                                                                                 |
+| `--database-url <url>`              |         | Direct-DB mode: encrypt under the orchestrator master key (KICI_SECRET_KEY / KICI_SECRET_KEY_FILE) and write to scoped_secrets (offline; skips HTTP) |
+| `--env-file <path>`                 |         | Direct-DB mode: read KICI_SECRET_KEY* and KICI_PG_CUSTOMER_SECRETS from this orchestrator env file instead of the shell                              |
+
+### `kici-admin secret verify`
+
+List every stored secret the orchestrator master key cannot decrypt (org, scope and key name, never a value), and exit 1 when there is one. Re-set each listed secret with "secret set".
+
+Synopsis: `kici-admin secret verify [options]`
+
+**Options**
+
+| Option                 | Default | Description                                                                                                             |
+| ---------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `--database-url <url>` |         | Direct-DB mode: decrypt with the master key (KICI_SECRET_KEY / KICI_SECRET_KEY_FILE) instead of asking the admin API    |
+| `--env-file <path>`    |         | Direct-DB mode: read KICI_SECRET_KEY* and KICI_PG_CUSTOMER_SECRETS from this orchestrator env file instead of the shell |
+| `--json`               |         | Emit JSON output                                                                                                        |
 
 ### `kici-admin token`
 

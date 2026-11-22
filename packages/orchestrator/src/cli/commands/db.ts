@@ -16,7 +16,7 @@
  *
  * Direct-DB subcommands skip HTTP because the target database may not exist
  * yet or is about to be dropped; like `kici-admin peer create-token`, they open
- * a pool from KICI_DATABASE_URL / DATABASE_URL / --database-url.
+ * a pool from KICI_DATABASE_URL / --database-url.
  */
 
 import os from 'node:os';
@@ -293,7 +293,7 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
 
   db.command('fresh')
     .description('DROP + CREATE the orchestrator DB, run migrations, record content hash')
-    .option('--database-url <url>', 'Target database URL (else KICI_DATABASE_URL / DATABASE_URL)')
+    .option('--database-url <url>', 'Target database URL (else KICI_DATABASE_URL)')
     .requiredOption('--confirm', 'Explicit confirmation (destructive)')
     .option('--yes', 'Skip interactive confirmation (for scripted use)')
     .action(
@@ -339,7 +339,7 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
 
   db.command('backup')
     .description('Dump the orchestrator DB to a local file (pg_dump custom format)')
-    .option('--database-url <url>', 'Source DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
+    .option('--database-url <url>', 'Source DB URL (else KICI_DATABASE_URL)')
     .option('--output <path>', 'Dump output path (default ./kici-orchestrator-backup-<ts>.dump)')
     .option(
       '--output-dir <path>',
@@ -374,7 +374,7 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
   db.command('restore')
     .description('Restore the orchestrator DB from a pg_dump file (DESTRUCTIVE)')
     .requiredOption('--input <path>', 'Path to a .dump file produced by `db backup`')
-    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
+    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL)')
     .option('--yes', 'Skip interactive confirmation (for scripted use)')
     .action(
       cliAction(async (opts: { input: string; databaseUrl?: string; yes?: boolean }) => {
@@ -443,7 +443,7 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
 
   db.command('ensure <name>')
     .description('CREATE DATABASE IF NOT EXISTS (idempotent)')
-    .option('--database-url <url>', 'Admin DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
+    .option('--database-url <url>', 'Admin DB URL (else KICI_DATABASE_URL)')
     .option(
       '--owner <role>',
       'DB owner role (default: URL user). Pass when the admin connection is privileged but the new DB should be owned by a separate non-privileged role.',
@@ -498,7 +498,7 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
 
   db.command('create-role')
     .description('CREATE / ALTER ROLE with LOGIN [+ CREATEDB] (idempotent)')
-    .option('--database-url <url>', 'Admin DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
+    .option('--database-url <url>', 'Admin DB URL (else KICI_DATABASE_URL)')
     .requiredOption('--user <name>', 'Role name to create or update')
     .requiredOption('--password <password>', 'Role password (raw — quote as needed)')
     .option('--createdb', 'Grant CREATEDB to the new role', false)
@@ -560,7 +560,7 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
 
   db.command('check-schema')
     .description('Compare bundled migrations vs live schema. Exit 2 on drift.')
-    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
+    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL)')
     .option('--json', 'Emit JSON instead of a human-readable line', false)
     .action(
       cliAction(async (opts: { databaseUrl?: string; json?: boolean }) => {
@@ -614,7 +614,7 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
     .description(
       'Compare pg_database.datcollversion against the running libc collation version. Exit 2 on drift.',
     )
-    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
+    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL)')
     .option('--json', 'Emit JSON instead of a human-readable line', false)
     .action(
       cliAction(async (opts: { databaseUrl?: string; json?: boolean }) => {
@@ -655,7 +655,7 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
     .description(
       'REINDEX DATABASE CONCURRENTLY <db>. Rebuilds every index under the running libc collation rules. Non-blocking but takes minutes + ~2× temp disk.',
     )
-    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
+    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL)')
     .requiredOption('--confirm', 'Explicit confirmation (destructive — long-running)')
     .requiredOption('--reason <text>', 'Reason (recorded in stderr banner)')
     .action(
@@ -686,7 +686,7 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
     .description(
       'ALTER DATABASE <db> REFRESH COLLATION VERSION. Metadata-only bump; pair with db reindex after a libc-base image rebuild.',
     )
-    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
+    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL)')
     .requiredOption('--reason <text>', 'Reason (recorded in stderr banner)')
     .action(
       cliAction(async (opts: { databaseUrl?: string; reason: string }) => {
@@ -718,7 +718,7 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
     .description(
       'Report tables with a GIN index whose planner row estimate (pg_class.reltuples) is NaN, infinite or impossible. Exit 2 when a table needs ANALYZE.',
     )
-    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
+    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL)')
     .option('--json', 'Emit JSON instead of human-readable lines', false)
     .action(
       cliAction(async (opts: { databaseUrl?: string; json?: boolean }) => {
@@ -741,7 +741,7 @@ export function registerDbCommands(program: Command, getClient: () => AdminApiCl
     .description(
       'ANALYZE the named tables, refreshing their planner statistics and pg_class.reltuples. Every table must exist.',
     )
-    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL / DATABASE_URL)')
+    .option('--database-url <url>', 'Target DB URL (else KICI_DATABASE_URL)')
     .requiredOption(
       '--table <schema.table>',
       'Table to analyze, schema-qualified. Repeatable.',

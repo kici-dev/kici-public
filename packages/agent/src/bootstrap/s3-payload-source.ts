@@ -1,7 +1,8 @@
 /**
  * Object-storage agent payload source — the ops agent's primary source.
  *
- * Fetches the version-keyed agent+Node payload once into a local cache dir,
+ * Fetches the version-keyed agent+Node payload once into a local cache dir
+ * (stale versions are evicted on each resolve, see payload-cache-gc.ts),
  * through a presigned GET URL the orchestrator mints
  * (`kici.presignAgentPackage`) for its own cache bucket. No standing S3
  * credential reaches the ops agent, only a time-limited presigned URL. A
@@ -18,6 +19,7 @@ import { access, mkdir } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { kiciTmpBase, type AgentPlatform } from '@kici-dev/shared';
+import { evictStalePayloadVersions } from './payload-cache-gc.js';
 import type { AgentPayloadSource, StagedPayload } from './payload-source.js';
 
 /** What the orchestrator returns for a presign request. */
@@ -40,6 +42,9 @@ export interface S3PayloadSourceDeps {
   cacheDir: string;
   /** The cache-once short-circuit. Injectable. */
   exists?(filePath: string): Promise<boolean>;
+  /** Marks `version` used and evicts stale versions under `cacheDir`; never
+   *  throws. Injectable; defaults to `evictStalePayloadVersions`. */
+  evict?(cacheDir: string, version: string): Promise<unknown>;
 }
 
 /** The payload tarball name for a platform (matches the producer's layout). */
@@ -63,6 +68,7 @@ export class S3PayloadSource implements AgentPayloadSource {
     if (!already) {
       await this.deps.fetchToFile(presigned.url, tarballPath);
     }
+    await (this.deps.evict ?? evictStalePayloadVersions)(this.deps.cacheDir, version);
     return { tarballPath, sha256: presigned.sha256 };
   }
 }

@@ -447,6 +447,9 @@ export const executionStatusSchema = z.object({
    * dashboard's provider-aware repo links.
    */
   repoProvider: z.string().max(STATUS_ID_MAX).optional(),
+  /** Web origin of the repository's server when it is not the provider's public
+   * host; absent otherwise. */
+  repoWebUrl: z.string().max(STATUS_ID_MAX).optional(),
   /** True when the run executed a developer's uploaded local working tree (`kici run remote`). */
   localWorkingTree: z.boolean().optional(),
   sha: z.string().max(STATUS_ID_MAX).optional(),

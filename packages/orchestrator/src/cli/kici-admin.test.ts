@@ -1,9 +1,11 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { Command } from 'commander';
 import { canonicalize, buildProgram, CLI_VERSION } from './kici-admin.js';
+import { setAdminUrlOnCommandLine } from './commands/shared/cli-action.js';
+import { runKiciAdminProgram } from '../__test-helpers__/kici-admin-program.js';
 
 /**
  * The kici-admin.ts entry-point guard matches `process.argv[1]` against
@@ -349,5 +351,54 @@ describe('kici-admin command tree', () => {
     // breaks-if-wrong: the secret group and its other verbs must survive.
     expect(paths).toContain('secret set');
     expect(paths).toContain('secret scope rename');
+  });
+});
+
+/**
+ * A dual-mode command run on an orchestrator host, whose environment carries
+ * KICI_DATABASE_URL for the orchestrator: an explicit --url selects the admin API.
+ */
+describe('kici-admin mode selection with KICI_DATABASE_URL set', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    setAdminUrlOnCommandLine(false);
+  });
+
+  /** Run `source list --json` with `args` before it; return the admin API URLs it fetched. */
+  async function sourceList(
+    args: string[],
+  ): Promise<{ fetched: string[]; exitCode: number | null }> {
+    vi.stubEnv('KICI_DATABASE_URL', 'postgresql://127.0.0.1:1/unreachable');
+    vi.stubEnv('KICI_ADMIN_URL', undefined);
+    const fetched: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        fetched.push(String(url));
+        return new Response(JSON.stringify({ sources: [] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }),
+    );
+    // A failed direct-DB connection ends in process.exit.
+    const { exitCode } = await runKiciAdminProgram([...args, 'source', 'list', '--json']);
+    return { fetched, exitCode };
+  }
+
+  it('uses the admin API when --url is on the command line', async () => {
+    const r = await sourceList(['--url', 'http://127.0.0.1:4000', '--token', 't']);
+    // fails-when: the environment's KICI_DATABASE_URL wins and the command never calls the API
+    expect(r.fetched).toEqual(['http://127.0.0.1:4000/api/v1/admin/sources']);
+    expect(r.exitCode).toBeNull();
+  });
+
+  it('keeps the direct database without --url', async () => {
+    const r = await sourceList(['--token', 't']);
+    // breaks-if-wrong: an operator relying on KICI_DATABASE_URL alone keeps direct-DB mode
+    expect(r.fetched).toEqual([]);
+    expect(r.exitCode).toBe(1);
   });
 });

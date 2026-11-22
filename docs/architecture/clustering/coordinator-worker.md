@@ -164,9 +164,9 @@ Defined in `packages/engine/src/protocol/version.ts` as `PROTOCOL_VERSION` and `
 - **Coordinator-worker:** Peer handler rejects connections with `protocolVersion < MIN_PROTOCOL_VERSION` (`WS_CLOSE_PROTOCOL_ERROR`)
 - **Agent-orchestrator:** Agent handler rejects connections with `protocolVersion < MIN_PROTOCOL_VERSION` (`WS_CLOSE_PROTOCOL_ERROR`)
 
-Future protocol versions are always accepted (minimum-version semantics, not exact-match). The protocol version is incremented when a message schema gains something an older peer cannot parse. `PROTOCOL_VERSION` and `MIN_PROTOCOL_VERSION` are both `4`: a peer on protocol 3 (an orchestrator, agent or peer from 0.15.x or earlier) or older is refused at connect with `WS_CLOSE_PROTOCOL_ERROR` and the reason `Unsupported protocol version`. Version 4 exists because it requires message fields that a version-3 peer may omit.
+Future protocol versions are accepted (minimum-version semantics, not exact-match). A Platform older than a connecting orchestrator can instead refuse it and ask for the Platform to be upgraded first (see [`auth.failure`](../protocol/overview.md#authfailure)). The protocol version is incremented when a message schema gains something an older peer cannot parse. `PROTOCOL_VERSION` and `MIN_PROTOCOL_VERSION` are both `4`: a peer on protocol 3 (an orchestrator, agent or peer from 0.15.x or earlier) or older is refused at connect with `WS_CLOSE_PROTOCOL_ERROR` and the reason `Unsupported protocol version`. Version 4 exists because it requires message fields that a version-3 peer may omit.
 
-The minimum accepted version is pinned to the current version, so raising `PROTOCOL_VERSION` raises the floor: every node must be upgraded in the same window, and no down-convert path for an older peer exists.
+`MIN_PROTOCOL_VERSION` equals the `PROTOCOL_VERSION` of the previous release (the N-1 window). A release that raises `PROTOCOL_VERSION` keeps the previous release connecting, and every tier keeps parsing that version's messages for one release. The release process refuses a release whose minimum is above the previous release's protocol version. A node two or more protocol versions behind is refused.
 
 ### Capability schemas
 

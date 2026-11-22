@@ -11,6 +11,8 @@ type RunSummaryKey =
   | 'workflowRepoIdentifier'
   | 'sha'
   | 'installationId'
+  | 'githubUrl'
+  | 'githubSourceMissing'
   | 'requestId'
   | 'routingKey'
   | 'ref'
@@ -28,6 +30,16 @@ export type RunSummarySource = Pick<ExecutionContext, RunSummaryKey> & {
   statusEpoch?: number | null;
 };
 
+/** A run's server fields, each copied only when set (a github.com run carries neither). */
+export function githubServerFields(
+  run: Pick<ExecutionContext, 'githubUrl' | 'githubSourceMissing'>,
+): Pick<ExecutionContext, 'githubUrl' | 'githubSourceMissing'> {
+  return {
+    ...(run.githubUrl && { githubUrl: run.githubUrl }),
+    ...(run.githubSourceMissing && { githubSourceMissing: true }),
+  };
+}
+
 /** The `statusEpoch` context field for a run, omitted at 0 (its default). */
 export function statusEpochField(epoch: number | null | undefined): { statusEpoch?: number } {
   return epoch ? { statusEpoch: epoch } : {};
@@ -35,7 +47,8 @@ export function statusEpochField(epoch: number | null | undefined): { statusEpoc
 
 /**
  * `workflowRepoIdentifier` is copied only when set: its presence marks a cross-repository
- * global run downstream. `localWorkingTree` is left to the caller (only some transitions
+ * global run downstream. `githubUrl` is copied only when set, so a github.com run's
+ * context gains no key. `localWorkingTree` is left to the caller (only some transitions
  * forward it).
  */
 export function runSummaryFields(
@@ -49,6 +62,7 @@ export function runSummaryFields(
     ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
     sha: run.sha,
     installationId: run.installationId,
+    ...githubServerFields(run),
     requestId: run.requestId,
     routingKey: run.routingKey,
     ref: run.ref,

@@ -243,8 +243,18 @@ describe('peer CLI commands', () => {
   });
 
   describe('revoke', () => {
+    it('says so when the instance has no active credential', async () => {
+      // fails-when: a revoke that matched nothing reports a revoked credential
+      mockRevoke.mockResolvedValue(0);
+      const { stdout, exitCode } = await runCommand(['peer', 'revoke', '--instance-id', 'gone']);
+      expect(exitCode).toBeNull();
+      expect(stdout).toContain('Peer gone has no active credential; nothing was revoked.');
+      expect(stdout).not.toContain('credential revoked');
+    });
+
     it('revokes a peer by instance ID', async () => {
-      mockRevoke.mockResolvedValue(undefined);
+      // breaks-if-wrong: a revoke that matched a credential still reports it
+      mockRevoke.mockResolvedValue(1);
 
       const { stdout } = await runCommand(['peer', 'revoke', '--instance-id', 'inst-42']);
 

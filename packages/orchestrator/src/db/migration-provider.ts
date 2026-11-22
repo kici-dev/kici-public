@@ -163,6 +163,8 @@ import * as m157 from './migrations/157_host_roster_identity_source.js';
 import * as m158 from './migrations/158_normalize_legacy_values.js';
 import * as m159 from './migrations/159_org_id_widen_to_source_width.js';
 import * as m160 from './migrations/160_execution_jobs_workflow_name.js';
+import * as m161 from './migrations/161_sources_strip_unvalidated_github_url.js';
+import * as m162 from './migrations/162_sources_github_url.js';
 
 export function createMigrationProvider(): MigrationProvider {
   return {
@@ -328,6 +330,8 @@ export function createMigrationProvider(): MigrationProvider {
         '158_normalize_legacy_values': m158,
         '159_org_id_widen_to_source_width': m159,
         '160_execution_jobs_workflow_name': m160,
+        '161_sources_strip_unvalidated_github_url': m161,
+        '162_sources_github_url': m162,
       };
     },
   };

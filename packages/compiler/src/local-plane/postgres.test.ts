@@ -33,11 +33,16 @@ const spawnMock = vi.fn();
 vi.mock('node:child_process', () => ({ spawn: spawnMock, execFile: vi.fn() }));
 
 describe('startPlanePostgres', () => {
+  let dir: string;
   beforeEach(() => {
     vi.clearAllMocks();
     delete process.env.KICI_LOCAL_PG_MODE;
-    // No PG_VERSION yet, so the one-time cluster init path runs.
-    process.env.KICI_CONFIG_DIR = `/tmp/pgtest-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    // An empty config dir: no PG_VERSION yet, so the one-time cluster init path runs.
+    dir = mkdtempSync(join(tmpdir(), 'kici-pgtest-'));
+    process.env.KICI_CONFIG_DIR = dir;
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
   });
 
   it('uses embedded-postgres when it initialises', async () => {

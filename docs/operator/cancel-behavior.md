@@ -37,7 +37,7 @@ The maximum grace period depends on the scaler backend:
 | Fork-based (bare-metal, Firecracker) | 30s              | No           |
 | Container (Docker/Podman)            | 10s              | No           |
 
-Both values are hardcoded. The effective grace period for a job is `Math.min(jobGracePeriod, backendMaxGracePeriod)`.
+Both values are hardcoded. On a fork-based backend, the effective grace period for a job is `Math.min(jobGracePeriod, 30s)`. The container backend sends the abort, waits 10 seconds, and then stops the container. The job's `gracePeriod` does not change that window.
 
 ## Hook timeout
 

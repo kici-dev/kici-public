@@ -396,6 +396,33 @@ function makeDispatch(overrides: Partial<JobDispatch> = {}): JobDispatch {
   };
 }
 
+describe('buildCloneRequest - checkout options', () => {
+  it('reads checkoutOptions from the job config and the source cache from the dispatch', async () => {
+    const { buildCloneRequest } = await import('./fork-runner.js');
+    const request = buildCloneRequest(
+      makeDispatch({
+        sourceTarUrl: 'https://orch.example.com/source.tgz',
+        jobConfig: { workflowName: 'ci', name: 'build', checkoutOptions: { fetchDepth: 0 } },
+      }),
+    );
+    // fails-when: the runner never sees the job's options and clones at depth 1
+    expect(request.checkoutOptions).toEqual({ fetchDepth: 0 });
+    expect(request.sourceCached).toBe(true);
+  });
+
+  it('drops invalid options and reports no source cache without a tarball URL', async () => {
+    const { buildCloneRequest } = await import('./fork-runner.js');
+    const request = buildCloneRequest(
+      makeDispatch({
+        jobConfig: { workflowName: 'ci', name: 'build', checkoutOptions: { fetchDepth: -1 } },
+      }),
+    );
+    // breaks-if-wrong: an invalid value falls back to the default clone instead of reaching git
+    expect(request.checkoutOptions).toBeUndefined();
+    expect(request.sourceCached).toBe(false);
+  });
+});
+
 describe('buildRequest - ssh git credential names', () => {
   const sshJob = () =>
     makeDispatch({

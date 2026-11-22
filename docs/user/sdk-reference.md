@@ -29,6 +29,10 @@ import { workflow, job, step, pr, push, rule, defineEvent } from '@kici-dev/sdk'
 
 For the complete list of every named export (factory functions, triggers, rules, validation, hook factories, types), see the per-topic pages above.
 
+## `@kici-dev/sdk/testing` for unit tests
+
+The `@kici-dev/sdk/testing` subpath exports `createTestStepContext()`. It builds a real step context, so a unit test can call a step function with no orchestrator and no agent. Import it from test files, not from a workflow. See [Unit-testing step functions](testing-guide.md#unit-testing-step-functions).
+
 ## `@kici-dev/sdk/internal` is not a supported surface
 
 The package also publishes an `@kici-dev/sdk/internal` subpath. It carries the runtime

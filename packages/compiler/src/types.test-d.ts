@@ -1,12 +1,14 @@
 import { describe, it, expectTypeOf } from 'vitest';
+import { job } from '@kici-dev/sdk';
 import type {
   AptInitConfig,
   CacheSpec,
+  CheckoutOptions,
   GenericInitConfig,
   InitConfig,
   MiseInitConfig,
 } from '@kici-dev/sdk';
-import type { LockCacheSpec, LockInitConfig } from '@kici-dev/engine';
+import type { LockCacheSpec, LockCheckoutOptions, LockInitConfig } from '@kici-dev/engine';
 import type { LockJob } from './types.js';
 
 /**
@@ -95,5 +97,20 @@ describe('engine lock mirrors of SDK shapes', () => {
     expectTypeOf<{ key: number; paths: string[] }>().not.toMatchTypeOf<LockCacheSpec>();
     expectTypeOf<{ run: number }>().not.toMatchTypeOf<LockInitConfig>();
     expectTypeOf<keyof LockCacheSpec>().not.toEqualTypeOf<keyof CacheSpec | 'scope'>();
+  });
+});
+
+describe('job checkout option', () => {
+  it('accepts the object form and refuses a string depth', () => {
+    expectTypeOf(
+      job('x', { runsOn: 'a', steps: [], checkout: { fetchDepth: 3 } }).checkout,
+    ).toEqualTypeOf<boolean | CheckoutOptions | undefined>();
+    // @ts-expect-error — fetchDepth is a number
+    job('y', { runsOn: 'a', steps: [], checkout: { fetchDepth: '3' } });
+  });
+
+  // fails-when: the SDK option grows a key the lock's checkoutOptions cannot carry
+  it('keeps the SDK and lock checkout options key-identical', () => {
+    expectTypeOf<keyof LockCheckoutOptions>().toEqualTypeOf<keyof CheckoutOptions>();
   });
 });

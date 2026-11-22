@@ -78,6 +78,19 @@ export interface ProviderBundle {
    * for every non-local (or non-in-place local) bundle.
    */
   localInPlace?: boolean;
+  /**
+   * Web URL of the GitHub Enterprise Server this bundle's GitHub App lives on,
+   * from the server the source stores. Unset for github.com and for every other
+   * provider. The server a run names, its actors' identity namespace and the
+   * server a workflow-supplied App credential mints at all read it here, never
+   * from a run's provider context, which a registration can write.
+   */
+  githubUrl?: string;
+}
+
+/** The live GitHub App source at a routing key: its server, unset for github.com. */
+export interface GithubSource {
+  githubUrl?: string;
 }
 
 /**
@@ -134,6 +147,18 @@ export class ProviderRegistry {
   getByRoutingKey(routingKey: string): ProviderBundle | undefined {
     const providerType = routingKey.split(':')[0];
     return this.bundles.get(routingKey) ?? this.bundles.get(`${providerType}:default`);
+  }
+
+  /**
+   * The GitHub App source registered at exactly this routing key, naming its
+   * server (none for github.com); undefined when no GitHub bundle is registered
+   * at that key (a removed source, another provider, or a key a type default
+   * would answer — a default never names a server).
+   */
+  githubSourceOf(routingKey: string): GithubSource | undefined {
+    const bundle = this.bundles.get(routingKey);
+    if (!bundle || bundle.normalizer.provider !== 'github') return undefined;
+    return bundle.githubUrl ? { githubUrl: bundle.githubUrl } : {};
   }
 
   /**

@@ -226,6 +226,37 @@ describe('agent install — folder-anchored', () => {
     expect(mockRestrict).not.toHaveBeenCalled();
   });
 
+  it('a compose install with --image-registry renders and records the registry', async () => {
+    // fails-when: agent install takes the flag but the compose file still names quay.io
+    const { detectPlatform } = await import('../../service/index.js');
+    vi.mocked(detectPlatform).mockReturnValueOnce('compose');
+    await runInstall([
+      '--platform',
+      'compose',
+      '--image-registry',
+      'registry.internal.example/kici-dev',
+    ]);
+
+    const cfg = mockInstall.mock.calls[0]![0] as ServiceConfig;
+    expect(cfg.imageRegistry).toBe('registry.internal.example/kici-dev');
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(tmpInstanceDir, '.kici-agent.json'), 'utf-8'),
+    );
+    expect(manifest.imageRegistry).toBe('registry.internal.example/kici-dev');
+  });
+
+  it('refuses --image-registry for a non-compose agent install', async () => {
+    // breaks-if-wrong: without the flag the same systemd install succeeds (every other case)
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('process.exit called');
+    }) as never);
+    await expect(
+      runInstall(['--image-registry', 'registry.internal.example/kici-dev']),
+    ).rejects.toThrow('process.exit called');
+    expect(mockInstall).not.toHaveBeenCalled();
+    exitSpy.mockRestore();
+  });
+
   it('passes component: agent to manager.install()', async () => {
     await runInstall();
 

@@ -182,7 +182,7 @@ For each disabled operation:
 
 - **The control is rendered with a lock-icon prefix**, grayed out, and inert — it leaves the tab order entirely, so no pointer, keyboard, or screen-reader interaction can activate it. Hovering **or keyboard-focusing** the lock reveals a tooltip with the operation name, a one-line explanation, and the exact `kici-admin` invocation needed to perform the action. A copy-to-clipboard button puts the command on the clipboard. The lock itself stays focusable and is announced as an unavailable control, so the CLI equivalent is reachable without a mouse.
 - **The page banner** at the top of any page containing at least one disabled operation lists every disabled op on that page plus the CLI equivalent. If every operation on the page is disabled, the banner escalates to "this page is read-only".
-- **The Security policy page** (Settings → Security → Dashboard policy) renders the full 27-row matrix, grouped by category, with the live state and the `kici-admin` command for each row.
+- **The Security policy page** renders the full 27-row matrix, grouped by category, with the live state and the `kici-admin` command for each row. It is the **Security** tab of an orchestrator's per-cluster view, and **Settings → Orchestrator security** opens it too.
 
 A control disabled by policy is visually distinct from a control disabled by RBAC: the policy lock icon is universal across the org and points at `kici-admin`. The RBAC disable points at the org's role configuration. Both can apply at once — RBAC wins (the user can't see the data).
 

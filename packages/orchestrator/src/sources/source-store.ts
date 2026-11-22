@@ -11,6 +11,7 @@ import type { Database, Source } from '../db/types.js';
 import type { PgSecretStore } from '../secrets/pg-secret-store.js';
 import { createLogger } from '@kici-dev/shared';
 import { rehomeSourceRegistrations } from './source-org.js';
+import { isDefaultGithubUrl } from '../providers/github/github-host.js';
 
 const logger = createLogger({ prefix: 'source-store' });
 
@@ -32,8 +33,48 @@ export interface AddSourceParams {
   webhookSecret?: string;
   /** Extra non-sensitive config */
   config?: Record<string, unknown>;
+  /**
+   * Web URL of the GitHub Enterprise Server the App lives on, already
+   * validated. Stored in the `github_url` column only for a server other than
+   * github.com.
+   */
+  githubUrl?: string;
   /** Customer/org identifier for secret and environment scoping */
   customerId?: string;
+}
+
+/**
+ * A source with this routing key already exists. For a GitHub App, the
+ * routing key is `github:<appId>` on every GitHub server.
+ */
+export class DuplicateSourceError extends Error {
+  constructor(provider: string, appId: string, routingKey: string) {
+    super(
+      provider === 'github'
+        ? `Source with routing key ${routingKey} already exists: an orchestrator holds one source ` +
+            `per GitHub App id; App id ${appId} is already registered as ${routingKey}. A second ` +
+            'App with the same id belongs on another orchestrator, in another organization.'
+        : `Source with routing key ${routingKey} already exists`,
+    );
+    this.name = 'DuplicateSourceError';
+  }
+}
+
+/**
+ * Drop the keys a generic config write must not set: `appId` is derived from
+ * the routing key, and the customer (the source's org) has its own, separately
+ * authorized field. `githubUrl` is dropped too: the server lives in the
+ * `github_url` column, and a `config.githubUrl` is never read.
+ */
+function withoutReservedConfigKeys(config: Record<string, unknown>): Record<string, unknown> {
+  const {
+    appId: _appId,
+    githubUrl: _githubUrl,
+    customerId: _customerId,
+    customer_id: _customerIdColumn,
+    ...rest
+  } = config;
+  return rest;
 }
 
 export interface SourceWithSecrets extends Source {
@@ -65,10 +106,14 @@ export class SourceStore {
       .executeTakeFirst();
 
     if (existing) {
-      throw new Error(`Source with routing key ${routingKey} already exists`);
+      throw new DuplicateSourceError(params.provider, params.appId, routingKey);
     }
 
-    const configJson = JSON.stringify({ ...params.config, appId: params.appId });
+    // breaks-if-wrong: a github.com source's config stays exactly {"appId":"<id>"}
+    const configJson = JSON.stringify({
+      ...withoutReservedConfigKeys(params.config ?? {}),
+      appId: params.appId,
+    });
 
     const source = await this.db
       .insertInto('sources')
@@ -78,6 +123,7 @@ export class SourceStore {
         routing_key: routingKey,
         config: configJson,
         slug: params.slug ?? null,
+        github_url: isDefaultGithubUrl(params.githubUrl) ? null : params.githubUrl,
         ...(params.customerId ? { customer_id: params.customerId } : {}),
       })
       .returningAll()
@@ -164,6 +210,11 @@ export class SourceStore {
       privateKey?: string;
       webhookSecret?: string;
       config?: Record<string, unknown>;
+      /**
+       * New GitHub Enterprise Server web URL, already validated and authorized.
+       * `null` (or github.com) clears it; `undefined` leaves it unchanged.
+       */
+      githubUrl?: string | null;
       /** New customer/org identifier (used for secret + environment scoping). */
       customerId?: string;
     },
@@ -178,12 +229,20 @@ export class SourceStore {
     if (updates.name) dbUpdates.name = updates.name;
     if (updates.slug !== undefined) dbUpdates.slug = updates.slug;
     if (updates.customerId) dbUpdates.customer_id = updates.customerId;
+    if (updates.githubUrl !== undefined) {
+      dbUpdates.github_url =
+        updates.githubUrl === null || isDefaultGithubUrl(updates.githubUrl)
+          ? null
+          : updates.githubUrl;
+    }
     if (updates.config) {
       const existingConfig =
         typeof source.config === 'string' ? JSON.parse(source.config) : source.config;
-      // Strip appId from updates — it's derived from the routing key and must not be overwritten
-      const { appId: _, ...safeConfig } = updates.config;
-      dbUpdates.config = JSON.stringify({ ...existingConfig, ...safeConfig });
+      // fails-when: a scoped token can move a source through the config merge
+      dbUpdates.config = JSON.stringify({
+        ...existingConfig,
+        ...withoutReservedConfigKeys(updates.config),
+      });
     }
 
     // Apply DB updates (always runs -- at minimum updates updated_at)

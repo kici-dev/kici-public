@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import {
   MAX_DELIVERY_PAGES,
   listDeliveriesInWindow,
@@ -9,6 +9,7 @@ import {
   type GithubRequest,
   type GithubWebhookDelivery,
 } from './deliveries.js';
+import { stubGithubFetch, TEST_APP_PRIVATE_KEY } from '../../__test-helpers__/github-fetch.js';
 
 const APP = { appId: '42', privateKey: 'pem' };
 
@@ -54,6 +55,57 @@ function stubOctokit(pages: GithubWebhookDelivery[][], onRedeliver?: (id: number
   });
   return { octokit: { request } as unknown as GithubRequest, request };
 }
+
+describe('a delivery id past the safe integer range', () => {
+  // 2^53 + 1: a JavaScript number cannot hold it.
+  const UNSAFE_ID = '9007199254740993';
+  const window = {
+    since: new Date('2026-09-01T00:00:00Z'),
+    until: new Date('2026-09-02T00:00:00Z'),
+  };
+  const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8' };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** Answer with raw JSON text, so the real Octokit parser decides the id's type. */
+  function stubRawDeliveries(): string[] {
+    const requests: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string | URL, init?: RequestInit) => {
+        const path = new URL(url).pathname;
+        requests.push(`${init?.method ?? 'GET'} ${path}`);
+        if (path.endsWith('/attempts')) {
+          return new Response('{}', { status: 202, headers: JSON_HEADERS });
+        }
+        return new Response(
+          `[{"id":${UNSAFE_ID},"guid":"g-1","delivered_at":"2026-09-01T12:00:00Z","redelivery":false,"event":"push","action":null,"status":"OK","status_code":200,"installation_id":9,"repository_id":7}]`,
+          { status: 200, headers: JSON_HEADERS },
+        );
+      }),
+    );
+    return requests;
+  }
+
+  const app = { appId: '1', privateKey: TEST_APP_PRIVATE_KEY };
+
+  it('a dry run reports every digit in a result the route can serialize', async () => {
+    stubRawDeliveries();
+    const result = await redeliverWindow(app, { ...window, dryRun: true });
+    // fails-when: the result carries the bigint Octokit parsed, and the route answers HTTP 500
+    expect(JSON.parse(JSON.stringify(result)).results[0].deliveryId).toBe(UNSAFE_ID);
+  });
+
+  it('a redelivery asks GitHub for the exact delivery', async () => {
+    const requests = stubRawDeliveries();
+    const result = await redeliverWindow(app, window);
+    // fails-when: the id goes through a number and loses its last digit, resending another delivery
+    expect(requests).toContain(`POST /app/hook/deliveries/${UNSAFE_ID}/attempts`);
+    expect(result).toMatchObject({ redelivered: 1, failed: 0 });
+  });
+});
 
 describe('nextCursorFromLink', () => {
   it('reads the cursor out of the rel="next" link', () => {
@@ -275,5 +327,30 @@ describe('redeliverWindow', () => {
     expect(result.since).toBe(since.toISOString());
     expect(result.until).toBe(until.toISOString());
     expect(result.matched).toBe(0);
+  });
+});
+
+describe('redeliverWindow on the App server', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const window = {
+    since: new Date('2026-09-01T00:00:00Z'),
+    until: new Date('2026-09-02T00:00:00Z'),
+    dryRun: true,
+  };
+
+  // fails-when: the replay lists deliveries at api.github.com for a GHES App
+  // breaks-if-wrong: a github.com App keeps listing at api.github.com
+  it.each([
+    ['https://ghe.corp.example', 'https://ghe.corp.example/api/v3'],
+    [undefined, 'https://api.github.com'],
+  ])('lists deliveries at the server %s', async (githubUrl, base) => {
+    const requests = stubGithubFetch();
+    await redeliverWindow({ appId: '1', privateKey: TEST_APP_PRIVATE_KEY, githubUrl }, window);
+    expect(requests.map((r) => new URL(r.url).origin + new URL(r.url).pathname)).toEqual([
+      `${base}/app/hook/deliveries`,
+    ]);
   });
 });

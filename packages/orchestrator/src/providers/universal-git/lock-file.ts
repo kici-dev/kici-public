@@ -20,6 +20,7 @@
  *     appears in the repo URL / logs.
  *   - SSH: materialized via `prepareSshAuthSync()` and surfaced through
  *     `GIT_SSH_COMMAND`; tempfiles are always cleaned up in a `finally`.
+ *   - Git never asks for a credential: a rejected one fails the command.
  *
  * This fetcher is used at two sites:
  *   - Registration: when a default-branch push arrives for a universal-git
@@ -269,10 +270,25 @@ async function runGit(
     throw new Error('Universal-git lock-file fetch exceeded overall deadline');
   }
   const timeout = Math.min(remaining, GIT_COMMAND_TIMEOUT_MS);
-  await execFileP('git', args, {
-    timeout,
-    env: opts.env ? { ...process.env, ...opts.env } : process.env,
-  });
+  await execFileP('git', args, { timeout, env: nonInteractiveGitEnv(opts.env) });
+}
+
+/**
+ * Git must fail on a rejected source credential, not ask for another one. In a
+ * foreground process git prompts on the terminal, and the prompt waits until
+ * the command timeout. An askpass program from the session runs before that
+ * prompt, and a credential manager can open its own dialog.
+ */
+function nonInteractiveGitEnv(extra: Record<string, string> | undefined): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...extra,
+    GIT_TERMINAL_PROMPT: '0',
+    GCM_INTERACTIVE: 'never',
+  };
+  delete env.GIT_ASKPASS;
+  delete env.SSH_ASKPASS;
+  return env;
 }
 
 /**

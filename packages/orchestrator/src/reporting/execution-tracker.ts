@@ -16,7 +16,8 @@ import { sql, type Kysely, type Updateable } from 'kysely';
 import type { Database, ExecutionJobTable } from '../db/types.js';
 import { JobKind } from '../db/types.js';
 import { aggregateGateStatus } from '../pipeline/invoke-gate.js';
-import { runSummaryFields, statusEpochField } from './run-summary-fields.js';
+import { githubServerFields, runSummaryFields, statusEpochField } from './run-summary-fields.js';
+import type { GithubSource } from '../provider-registry.js';
 import { createLogger, getRequestContext, toErrorMessage } from '@kici-dev/shared';
 import {
   ExecutionJobStatus,
@@ -25,6 +26,7 @@ import {
   type InitFailure,
   RunFailureClass,
   ScalerEventType,
+  SourceProvider,
   TERMINAL_JOB_STATES,
   TERMINAL_RUN_STATES,
   CheckMode,
@@ -281,7 +283,14 @@ function heldRunTriggerDecision(args: {
   return Object.keys(blob).length > 0 ? JSON.stringify(blob) : null;
 }
 
-/** Context passed to onExecutionComplete for commit status updates. */
+/**
+ * The context `onExecutionComplete` reports for commit status updates. It
+ * carries no `githubUrl`: the check-run reporter resolves the source's bundle,
+ * and so its server, by routing key.
+ */
+type ExecutionCompleteContext = Omit<ExecutionContext, 'githubUrl' | 'githubSourceMissing'>;
+
+/** A run's context: forwarded on every status change, and (narrowed) on completion. */
 export interface ExecutionContext {
   workflowName: string;
   provider: string;
@@ -290,6 +299,18 @@ export interface ExecutionContext {
   /** True when the run executed an uploaded local working tree (`kici run remote`). */
   localWorkingTree?: boolean;
   installationId?: number;
+  /**
+   * Web URL of the GitHub Enterprise Server the run's source lives on, read
+   * from that source's live config. Unset for github.com, for every other
+   * provider, and for a run whose source is no longer configured.
+   */
+  githubUrl?: string;
+  /**
+   * True when the run's routing key names a GitHub source that is no longer
+   * configured. Its server is then unknown: the frame names neither the server
+   * nor the actor's identity namespace, and the Platform keeps what it stored.
+   */
+  githubSourceMissing?: true;
   requestId?: string;
   routingKey?: string;
   /**
@@ -393,7 +414,7 @@ export interface ExecutionTrackerDeps {
   onExecutionComplete?: (
     runId: string,
     status: Extract<ExecutionRunStatus, 'success' | 'failed' | 'cancelled'>,
-    context: ExecutionContext,
+    context: ExecutionCompleteContext,
     description?: string,
   ) => void;
   /**
@@ -537,6 +558,14 @@ export interface ExecutionTrackerDeps {
    */
   resolveOrgId?: (routingKey: string) => Promise<string>;
   /**
+   * The live GitHub App source at a routing key, naming its server (none for
+   * github.com), or undefined when none is registered there
+   * (`ProviderRegistry.githubSourceOf`). A run names its server and its
+   * actors' namespace from here, never from its provider context, which a
+   * registration can write.
+   */
+  githubSourceOf?: (routingKey: string) => GithubSource | undefined;
+  /**
    * This coordinator's cluster instance id. Written to
    * `execution_runs.registration_window_instance_id` while this coordinator's
    * dispatch pipeline still has jobs to register for a run, so a sibling that
@@ -584,6 +613,10 @@ interface RunState {
   /** True when the run executed an uploaded local working tree (`kici run remote`). */
   localWorkingTree?: boolean;
   installationId?: number;
+  /** See {@link ExecutionContext.githubUrl}. */
+  githubUrl?: string;
+  /** See {@link ExecutionContext.githubSourceMissing}. */
+  githubSourceMissing?: true;
   requestId?: string;
   routingKey?: string;
   ref?: string;
@@ -819,6 +852,7 @@ export class ExecutionTracker {
   private readonly orgId?: string;
   private readonly jobQueue?: JobQueue;
   private readonly resolveOrgIdFn?: ExecutionTrackerDeps['resolveOrgId'];
+  private readonly githubSourceOf?: ExecutionTrackerDeps['githubSourceOf'];
   private readonly instanceId?: string;
   private readonly livenessGraceMs: number;
   private readonly runs = new Map<string, RunState>();
@@ -875,6 +909,7 @@ export class ExecutionTracker {
     this.orgId = deps.orgId;
     this.jobQueue = deps.jobQueue;
     this.resolveOrgIdFn = deps.resolveOrgId;
+    this.githubSourceOf = deps.githubSourceOf;
     this.instanceId = deps.instanceId;
     this.livenessGraceMs =
       deps.instanceLivenessGraceMs ?? instanceLivenessGraceMs(DEFAULT_RECOVERY_GRACE_MS);
@@ -1024,6 +1059,7 @@ export class ExecutionTracker {
         sha,
         ...(localWorkingTree && { localWorkingTree: true }),
         installationId,
+        ...this.githubServerOf(routingKey),
         requestId: getRequestContext().requestId,
         routingKey,
         ref,
@@ -1141,6 +1177,7 @@ export class ExecutionTracker {
         sha,
         ...(localWorkingTree && { localWorkingTree: true }),
         installationId,
+        ...githubServerFields(run),
         requestId: getRequestContext().requestId,
         routingKey,
         ref,
@@ -1944,6 +1981,7 @@ export class ExecutionTracker {
       installationId,
       requestId: undefined,
       routingKey: dbRun.routing_key ?? undefined,
+      ...this.githubServerOf(dbRun.routing_key),
       ref: dbRun.ref,
       triggerEvent: undefined,
       commitMessage: undefined,
@@ -3346,6 +3384,7 @@ export class ExecutionTracker {
         ...(crossRepoWorkflowRepo && { workflowRepoIdentifier: crossRepoWorkflowRepo }),
         sha: args.sha,
         routingKey: args.routingKey,
+        ...this.githubServerOf(args.routingKey),
         ref: args.ref,
         triggerEvent: args.triggerEvent,
         commitMessage: args.commitMessage,
@@ -3472,6 +3511,7 @@ export class ExecutionTracker {
         isGlobalEvalRound: true,
         sha: args.sha,
         routingKey: args.routingKey,
+        ...this.githubServerOf(args.routingKey),
         ref: args.ref,
         triggerEvent: args.triggerEvent,
         failureClass: RunFailureClass.enum.never_started,
@@ -3665,6 +3705,7 @@ export class ExecutionTracker {
         ...(args.isGlobalEvalRound === true && { isGlobalEvalRound: true }),
         sha: args.sha,
         routingKey: args.routingKey,
+        ...this.githubServerOf(args.routingKey),
         ref: args.ref,
         triggerEvent: args.triggerEvent,
         commitMessage: args.commitMessage,
@@ -3767,6 +3808,7 @@ export class ExecutionTracker {
         isGlobalEvalRound: true,
         sha: row.sha ?? '',
         routingKey: row.routing_key ?? undefined,
+        ...this.githubServerOf(row.routing_key),
         ref: row.ref ?? '',
         ...(failed && { failureClass: RunFailureClass.enum.never_started }),
       },
@@ -3834,6 +3876,7 @@ export class ExecutionTracker {
         ...(row.is_global_eval_round === true && { isGlobalEvalRound: true }),
         sha: row.sha ?? '',
         routingKey: row.routing_key ?? undefined,
+        ...this.githubServerOf(row.routing_key),
         ref: row.ref ?? '',
         failureClass: RunFailureClass.enum.cancelled,
       },
@@ -3896,6 +3939,7 @@ export class ExecutionTracker {
         ...(row.is_global_eval_round === true && { isGlobalEvalRound: true }),
         sha: row.sha ?? '',
         routingKey: row.routing_key ?? undefined,
+        ...this.githubServerOf(row.routing_key),
         ref: row.ref ?? '',
         failureClass: RunFailureClass.enum.cancelled,
       },
@@ -4390,6 +4434,24 @@ export class ExecutionTracker {
   }
 
   /**
+   * The server fields of a run from the source at `routingKey`, read from that
+   * source's live config: its server (none for github.com), or
+   * `githubSourceMissing` when that GitHub source is no longer configured.
+   */
+  private githubServerOf(
+    routingKey: string | null | undefined,
+  ): Pick<ExecutionContext, 'githubUrl' | 'githubSourceMissing'> {
+    if (!routingKey || !this.githubSourceOf) return {};
+    // fails-when: a server named in a registration's provider context reaches a frame
+    const source = this.githubSourceOf(routingKey);
+    if (source) return source.githubUrl ? { githubUrl: source.githubUrl } : {};
+    // fails-when: a run whose GHES source is gone names its actor as a github.com user
+    return routingKey.startsWith(`${SourceProvider.enum.github}:`)
+      ? { githubSourceMissing: true }
+      : {};
+  }
+
+  /**
    * In-memory execution context of a run, for commit status reporting.
    */
   getExecutionContext(runId: string): ExecutionContext | undefined {
@@ -4402,6 +4464,7 @@ export class ExecutionTracker {
       ...(run.workflowRepoIdentifier && { workflowRepoIdentifier: run.workflowRepoIdentifier }),
       sha: run.sha,
       installationId: run.installationId,
+      ...githubServerFields(run),
       routingKey: run.routingKey,
       concurrency: run.concurrency,
       triggerActorUsername: run.triggerActorUsername,
@@ -5333,6 +5396,7 @@ export class ExecutionTracker {
         sha: dbRun.sha,
         installationId,
         routingKey: dbRun.routing_key ?? undefined,
+        ...this.githubServerOf(dbRun.routing_key),
         ref: dbRun.ref,
         parentRunId: dbRun.parent_run_id ?? undefined,
         originalRunId: dbRun.original_run_id ?? undefined,

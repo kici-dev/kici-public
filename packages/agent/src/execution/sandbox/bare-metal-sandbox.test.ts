@@ -19,14 +19,19 @@ vi.mock('node:fs/promises', () => ({
   access: vi.fn().mockResolvedValue(undefined),
 }));
 
-// Mock node:fs for existsSync (used in buildBwrapArgs)
+// Mock node:fs: existsSync (buildBwrapArgs), realpathSync and statSync (the
+// host trust path check). Nothing exists unless a test says so.
 vi.mock('node:fs', () => ({
   existsSync: vi.fn().mockReturnValue(false),
+  realpathSync: vi.fn(() => {
+    throw new Error('ENOENT');
+  }),
+  statSync: vi.fn(),
 }));
 
 import { BareMetalSandbox } from './bare-metal-sandbox.js';
 import { fork, spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync, statSync, type Stats } from 'node:fs';
 import { access } from 'node:fs/promises';
 import type { RunnerToAgentMessage } from './ipc-protocol.js';
 
@@ -155,42 +160,74 @@ describe('BareMetalSandbox', () => {
     });
   });
 
+  /**
+   * Run one job to completion and return the spawn's bwrap args (bwrap only)
+   * and the env the runner child got. `existing` is the one path that exists;
+   * a trust path check sees it as a regular file.
+   */
+  async function runJob(opts: {
+    useBwrap: boolean;
+    existing: string;
+    env?: Record<string, string>;
+    hostTrustPaths?: Record<string, string>;
+    credentialHelperPath?: string;
+  }): Promise<{ args: string[] | undefined; env: Record<string, string> }> {
+    vi.mocked(existsSync).mockImplementation((p) => p === opts.existing);
+    vi.mocked(realpathSync).mockImplementation(((p: string) => {
+      if (p === opts.existing) return p;
+      throw new Error('ENOENT');
+    }) as typeof realpathSync);
+    vi.mocked(statSync).mockReturnValue({
+      isFile: () => true,
+      isDirectory: () => false,
+    } as Stats);
+    mockExecSync.mockReturnValue(Buffer.from('/usr/bin/bwrap\n'));
+    const fakeChild = createFakeChild();
+    vi.mocked(spawn).mockReturnValue(fakeChild);
+    mockFork.mockReturnValue(fakeChild);
+    const sandbox = new BareMetalSandbox({
+      runnerPath: '/opt/kici/runner.js',
+      sandbox: opts.useBwrap,
+      env: opts.env ?? {},
+      ...(opts.hostTrustPaths ? { hostTrustPaths: opts.hostTrustPaths } : {}),
+    });
+    await sandbox.setup({ workDir: '/workspace', env: {} });
+    const execPromise = sandbox.executeJob({
+      dispatch: createTestDispatch(),
+      ...(opts.credentialHelperPath ? { credentialHelperPath: opts.credentialHelperPath } : {}),
+      onStepStatus: vi.fn(),
+      onLogLine: vi.fn(),
+      onEventEmit: vi.fn(),
+      onConcurrencyReport: vi.fn(),
+      signal: new AbortController().signal,
+    });
+    const call = opts.useBwrap ? vi.mocked(spawn).mock.calls[0]! : mockFork.mock.calls[0]!;
+    fakeChild.emit('message', {
+      type: 'job.complete',
+      status: 'success',
+      stepResults: [],
+    } satisfies RunnerToAgentMessage);
+    await execPromise;
+    vi.mocked(existsSync).mockReset().mockReturnValue(false);
+    return {
+      args: opts.useBwrap ? (call[1] as string[]) : undefined,
+      env: (call[2] as { env: Record<string, string> }).env,
+    };
+  }
+
   describe('executeJob: the git credential directory under bwrap', () => {
     const HELPER = '/tmp/kici-gitcred-job-1/git-credential-kici.cjs';
     const bindOf = (args: string[]): number =>
       args.findIndex((a, i) => a === '--ro-bind' && args[i + 1] === '/tmp/kici-gitcred-job-1');
 
-    async function spawnArgs(useBwrap: boolean): Promise<string[] | undefined> {
-      vi.mocked(existsSync).mockImplementation((p) => p === '/tmp/kici-gitcred-job-1');
-      mockExecSync.mockReturnValue(Buffer.from('/usr/bin/bwrap\n'));
-      const fakeChild = createFakeChild();
-      vi.mocked(spawn).mockReturnValue(fakeChild);
-      mockFork.mockReturnValue(fakeChild);
-      const sandbox = new BareMetalSandbox({
-        runnerPath: '/opt/kici/runner.js',
-        sandbox: useBwrap,
-        env: {},
-      });
-      await sandbox.setup({ workDir: '/workspace', env: {} });
-      const execPromise = sandbox.executeJob({
-        dispatch: createTestDispatch(),
-        credentialHelperPath: HELPER,
-        onStepStatus: vi.fn(),
-        onLogLine: vi.fn(),
-        onEventEmit: vi.fn(),
-        onConcurrencyReport: vi.fn(),
-        signal: new AbortController().signal,
-      });
-      const args = useBwrap ? (vi.mocked(spawn).mock.calls[0]![1] as string[]) : undefined;
-      fakeChild.emit('message', {
-        type: 'job.complete',
-        status: 'success',
-        stepResults: [],
-      } satisfies RunnerToAgentMessage);
-      await execPromise;
-      vi.mocked(existsSync).mockReset().mockReturnValue(false);
-      return args;
-    }
+    const spawnArgs = async (useBwrap: boolean): Promise<string[] | undefined> =>
+      (
+        await runJob({
+          useBwrap,
+          existing: '/tmp/kici-gitcred-job-1',
+          credentialHelperPath: HELPER,
+        })
+      ).args;
 
     // fails-when: the directory is not bound — bwrap's private /tmp then hides
     // the helper, its socket and any SSH key from the runner's git.
@@ -205,6 +242,48 @@ describe('BareMetalSandbox', () => {
 
     it('spawns no bwrap without the sandbox', async () => {
       expect(await spawnArgs(false)).toBeUndefined();
+      expect(vi.mocked(spawn)).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('executeJob: host TLS trust paths', () => {
+    const CA = '/etc/pki/tls/certs/ca-bundle.crt';
+    const TARGET = '/run/kici/trust/0/ca-bundle.crt';
+    const runWith = (useBwrap: boolean, existing = CA) =>
+      runJob({
+        useBwrap,
+        existing,
+        env: { GIT_SSL_CAINFO: CA },
+        hostTrustPaths: { GIT_SSL_CAINFO: CA },
+      });
+
+    // fails-when: bwrap's private /etc hides a CA bundle outside /etc/ssl, and
+    // git in the job cannot read the bundle its setting names.
+    it('mounts a host CA path read-only under /run/kici/trust and rewrites the setting', async () => {
+      const { args, env } = await runWith(true);
+      const at = args!.findIndex((a, i) => a === '--ro-bind' && args![i + 1] === CA);
+      expect(args![at + 2]).toBe(TARGET);
+      expect(env.GIT_SSL_CAINFO).toBe(TARGET);
+    });
+
+    // fails-when: the setting reaches the job naming a path bwrap does not
+    // mount (the sanitizer would re-add the host value).
+    it('drops the setting under bwrap when the host path is unusable', async () => {
+      vi.stubEnv('GIT_SSL_CAINFO', CA);
+      try {
+        const { args, env } = await runWith(true, '/elsewhere');
+        expect(env.GIT_SSL_CAINFO).toBeUndefined();
+        expect(args!.includes(CA)).toBe(false);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
+    // breaks-if-wrong: a host job sees the host filesystem, so it keeps the
+    // plain pass-through.
+    it('passes the setting through unchanged without bwrap', async () => {
+      const { env } = await runWith(false);
+      expect(env.GIT_SSL_CAINFO).toBe(CA);
       expect(vi.mocked(spawn)).not.toHaveBeenCalled();
     });
   });

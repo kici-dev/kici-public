@@ -2,6 +2,7 @@ import pc from 'picocolors';
 import { toErrorMessage } from '@kici-dev/core';
 import { PatKind } from '@kici-dev/engine';
 import { loadGlobalConfig } from '../remote/config.js';
+import { platformFetch, type PlatformFetch } from '../remote/platform-fetch.js';
 
 export interface PatCreateOptions {
   /** Token name shown in the dashboard PAT list. Defaults to the agent label. */
@@ -13,7 +14,7 @@ export interface PatCreateOptions {
   /** Days (server default: 120). */
   expiresInDays?: number;
   /** For tests. */
-  fetchImpl?: typeof fetch;
+  fetchImpl?: PlatformFetch;
 }
 
 interface CreatePatResponse {
@@ -31,7 +32,7 @@ interface CreatePatResponse {
  * be retrieved later.
  */
 export async function patCreateCommand(options: PatCreateOptions = {}): Promise<boolean> {
-  const doFetch = options.fetchImpl ?? fetch;
+  const doFetch = options.fetchImpl ?? platformFetch;
   try {
     const config = await loadGlobalConfig();
     const token = config.pat;

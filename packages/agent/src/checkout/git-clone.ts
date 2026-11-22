@@ -27,8 +27,10 @@ interface CloneOptions {
   workDir: string;
   /** Basic goes through `http.extraHeader`; SSH through `GIT_SSH_COMMAND` with a temp key. */
   gitAuth?: GitAuth;
-  /** Defaults to 1 (shallow). */
+  /** 0 = full history (no --depth). Defaults to 1. */
   depth?: number;
+  /** Unset: git's default tags. true: every tag. false: --no-tags. */
+  fetchTags?: boolean;
   /** Later git network operations ask this helper for a freshly minted credential. */
   credentialHelperPath?: string;
   /** Set, the temp SSH key is handed to the job instead of deleted, so a later step can push. */
@@ -76,8 +78,90 @@ function redactSensitive(input: string): string {
     .replace(/\S*kici-ssh-\S+/g, '[REDACTED_SSH_PATH]');
 }
 
+/** `-c http.extraHeader` for Basic auth; SSH auth rides GIT_SSH_COMMAND in the env instead. */
+function authConfigArgs(auth: GitAuth | undefined): string[] {
+  if (auth?.kind !== 'basic') return [];
+  // `x-access-token` is the GitHub App install-token username.
+  const user = auth.user ?? 'x-access-token';
+  const basic = Buffer.from(`${user}:${auth.secret}`).toString('base64');
+  return ['-c', `http.extraHeader=Authorization: Basic ${basic}`];
+}
+
+/** `git clone` argv after the auth `-c`: depth (0 = full history), tag policy, ref, URL, target. */
+function buildCloneArgs(
+  options: Pick<CloneOptions, 'repoUrl' | 'ref' | 'workDir' | 'depth' | 'fetchTags'>,
+): string[] {
+  const { repoUrl, ref, workDir, depth = 1, fetchTags } = options;
+  const args = ['clone'];
+  if (depth > 0) args.push('--depth', String(depth));
+  if (fetchTags === false) args.push('--no-tags');
+  if (ref) args.push('--branch', ref);
+  args.push(repoUrl, workDir);
+  return args;
+}
+
+interface GitRun {
+  workDir: string;
+  auth: GitAuth | undefined;
+  envOpts: { env?: Record<string, string> };
+}
+
+/** A network `git fetch` in the work dir, with the clone's auth and a redacted error. */
+function authFetch(run: GitRun, fetchArgs: string[]): void {
+  try {
+    execFileSync('git', ['-C', run.workDir, ...authConfigArgs(run.auth), 'fetch', ...fetchArgs], {
+      stdio: 'pipe',
+      timeout: 120_000,
+      ...run.envOpts,
+    });
+  } catch (err) {
+    throw sanitizeGitError(err);
+  }
+}
+
+function checkoutSha(run: GitRun, sha: string): void {
+  execFileSync('git', ['-C', run.workDir, 'checkout', sha], {
+    stdio: 'pipe',
+    timeout: 30_000,
+    ...run.envOpts,
+  });
+}
+
+function headSha(run: GitRun): string {
+  return execFileSync('git', ['-C', run.workDir, 'rev-parse', 'HEAD'], {
+    encoding: 'utf-8',
+    timeout: 10_000,
+    ...run.envOpts,
+  }).trim();
+}
+
 /**
- * Shallow-clone at a ref, then verify HEAD is the expected SHA to prevent
+ * Move HEAD to the expected commit when the branch advanced since the webhook.
+ * A full clone (depth 0) usually holds the commit already, so it checks out
+ * first and fetches the commit only if that fails, never with `--depth`
+ * (which would make the repository shallow). A shallow clone deepens by at
+ * least 50 commits, or by its own depth when that is larger.
+ */
+function checkoutExpectedSha(run: GitRun, sha: string, depth: number): void {
+  if (depth === 0) {
+    try {
+      checkoutSha(run, sha);
+    } catch {
+      authFetch(run, ['origin', sha]);
+      checkoutSha(run, sha);
+    }
+  } else {
+    authFetch(run, ['--depth', String(Math.max(50, depth)), 'origin', sha]);
+    checkoutSha(run, sha);
+  }
+  const recheckedSha = headSha(run);
+  if (!recheckedSha.startsWith(sha)) {
+    throw new Error(`SHA mismatch: expected ${sha}, got ${recheckedSha}`);
+  }
+}
+
+/**
+ * Clone at a ref (shallow by default), then verify HEAD is the expected SHA to prevent
  * wrong-ref execution. `-c http.extraHeader` keeps a token out of the URL
  * (`git remote -v`, logs).
  *
@@ -91,13 +175,13 @@ export async function gitClone(options: CloneOptions): Promise<void> {
     workDir,
     gitAuth,
     depth = 1,
+    fetchTags,
     credentialHelperPath,
     sshCleanupRegistry,
   } = options;
 
   const auth: GitAuth | undefined = gitAuth;
 
-  const args: string[] = [];
   const envEntries: Record<string, string> = {};
   let needsCustomEnv = false;
   let safeDirCleanup: (() => Promise<void>) | undefined;
@@ -122,12 +206,7 @@ export async function gitClone(options: CloneOptions): Promise<void> {
 
   let sshSetup: SshAuthSetup | undefined;
   try {
-    if (auth?.kind === 'basic') {
-      // `x-access-token` is the GitHub App install-token username.
-      const user = auth.user ?? 'x-access-token';
-      const basic = Buffer.from(`${user}:${auth.secret}`).toString('base64');
-      args.push('-c', `http.extraHeader=Authorization: Basic ${basic}`);
-    } else if (auth?.kind === 'ssh') {
+    if (auth?.kind === 'ssh') {
       sshSetup = await setupSshAuth({
         privateKey: auth.secret,
         hostKeyPolicy: auth.sshHostKeyPolicy,
@@ -141,17 +220,22 @@ export async function gitClone(options: CloneOptions): Promise<void> {
       ? ({ ...process.env, ...envEntries } as Record<string, string>)
       : undefined;
 
-    if (ref) {
-      args.push('clone', '--depth', String(depth), '--branch', ref, repoUrl, workDir);
-    } else {
-      args.push('clone', '--depth', String(depth), repoUrl, workDir);
-    }
-
-    const { execFileSync } = await import('node:child_process');
+    const args = [
+      ...authConfigArgs(auth),
+      ...buildCloneArgs({ repoUrl, ref, workDir, depth, fetchTags }),
+    ];
     try {
       execFileSync('git', args, { stdio: 'pipe', timeout: 120_000, ...(env && { env }) });
     } catch (err) {
       throw sanitizeGitError(err);
+    }
+
+    const run: GitRun = { workDir, auth, envOpts: env ? { env } : {} };
+
+    // A shallow clone follows only the tags inside its history; fetch every tag
+    // at the same depth. A full clone already holds them.
+    if (fetchTags === true && depth > 0) {
+      authFetch(run, ['--depth', String(depth), '--tags', 'origin']);
     }
 
     // Before the SHA check, which can return early.
@@ -161,48 +245,8 @@ export async function gitClone(options: CloneOptions): Promise<void> {
 
     if (!sha || sha === 'HEAD') return;
 
-    const envOpts = env ? { env } : {};
-
-    const actualSha = execFileSync('git', ['-C', workDir, 'rev-parse', 'HEAD'], {
-      encoding: 'utf-8',
-      timeout: 10_000,
-      ...envOpts,
-    }).trim();
-
-    if (!actualSha.startsWith(sha)) {
-      // The branch may have advanced since the webhook: deepen to the target commit.
-      const fetchArgs: string[] = [];
-      if (auth?.kind === 'basic') {
-        const user = auth.user ?? 'x-access-token';
-        const basic = Buffer.from(`${user}:${auth.secret}`).toString('base64');
-        fetchArgs.push('-c', `http.extraHeader=Authorization: Basic ${basic}`);
-      }
-      // SSH auth rides GIT_SSH_COMMAND in `env`.
-      fetchArgs.push('fetch', '--depth', '50', 'origin', sha);
-
-      try {
-        execFileSync('git', ['-C', workDir, ...fetchArgs], {
-          stdio: 'pipe',
-          timeout: 120_000,
-          ...envOpts,
-        });
-      } catch (err) {
-        throw sanitizeGitError(err);
-      }
-      execFileSync('git', ['-C', workDir, 'checkout', sha], {
-        stdio: 'pipe',
-        timeout: 30_000,
-        ...envOpts,
-      });
-
-      const recheckedSha = execFileSync('git', ['-C', workDir, 'rev-parse', 'HEAD'], {
-        encoding: 'utf-8',
-        timeout: 10_000,
-        ...envOpts,
-      }).trim();
-      if (!recheckedSha.startsWith(sha)) {
-        throw new Error(`SHA mismatch: expected ${sha}, got ${recheckedSha}`);
-      }
+    if (!headSha(run).startsWith(sha)) {
+      checkoutExpectedSha(run, sha, depth);
     }
   } finally {
     if (sshSetup) {

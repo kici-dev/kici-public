@@ -113,7 +113,7 @@ The reconnect counter resets to 0 on successful upstream authentication or agent
 
 - Intentional disconnect (graceful shutdown via `disconnect()`)
 - Normal closure code 1000 initiated by the client
-- Agent auth failure. An `auth.failure` frame from the orchestrator, or a close with code `4010` (`WS_CLOSE_AGENT_AUTH_FAILED` — a revoked or invalid token, or a protocol version below the orchestrator's floor), is permanent: the agent logs `NOT retrying`, never reconnects, and shuts down with a non-zero exit code so a one-shot agent does not hold its runner until the job timeout.
+- Agent auth failure. An `auth.failure` frame from the orchestrator, or a close with code `4010` (`WS_CLOSE_AGENT_AUTH_FAILED` — a revoked or invalid token), is permanent. The agent logs `NOT retrying`, never reconnects, and shuts down with a non-zero exit code, so a one-shot agent does not hold its runner until the job timeout. A protocol version below the orchestrator's floor takes the same path: the orchestrator sends `auth.failure` and closes with code `4005`.
 
 ## Event buffering
 

@@ -16,6 +16,10 @@ The public source mirror carries it, because the tests of the public packages im
   The `vi.mock` call stays in the `src/__test-helpers__/shared-mocks.ts` file of each package,
   because vitest hoists `vi.mock` only in the modules that it transforms. A test file imports
   that file before the module under test.
+- `@kici-dev/test-support/git-repo-snapshot`: `snapshotRepo` returns a fingerprint of a git
+  repository: its objects, refs, index, reflogs, status, stashes and the files of its git
+  directory. Take one before and one after an operation to prove that the operation leaves
+  the repository untouched. Taking a snapshot never writes the repository.
 
 A helper that needs the types of one package stays in the `src/__test-helpers__/` directory of
 that package.

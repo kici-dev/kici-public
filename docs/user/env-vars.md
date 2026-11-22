@@ -3,20 +3,21 @@ title: Environment variables
 description: Environment variable reference for the CLI
 ---
 
-The KiCI CLI reads the following environment variables to customize its behavior. OAuth login (`kici login`) defaults `KICI_PLATFORM_URL`, `KICI_OIDC_ISSUER`, and `KICI_OIDC_CLIENT_ID` to the hosted KiCI Platform, so `kici login` works with no configuration. Set them only to target another KiCI environment (e.g. a testing instance) or a custom OIDC provider.
+The KiCI CLI reads the following environment variables to customize its behavior. OAuth login (`kici login`) defaults `KICI_PLATFORM_URL`, `KICI_OIDC_ISSUER`, and `KICI_OIDC_CLIENT_ID` to the hosted KiCI Platform, so `kici login` works with no configuration. Set them only to target another KiCI environment (e.g. a testing instance) or a custom OIDC provider. With another environment's `KICI_PLATFORM_URL` and no issuer, `kici login` reads the issuer and client ID that environment publishes at `/api/v1/cli/login-config`.
 
 ## Authentication
 
-| Variable              | Description                            | Default                                      |
-| --------------------- | -------------------------------------- | -------------------------------------------- |
-| `KICI_OIDC_ISSUER`    | OIDC issuer URL for authentication     | `https://auth.kici.dev/realms/kici-internal` |
-| `KICI_OIDC_CLIENT_ID` | OIDC client ID for the CLI application | `kici-cli`                                   |
-| `KICI_PLATFORM_URL`   | Platform API base URL                  | `https://api.kici.dev`                       |
-| `KICI_CONFIG_DIR`     | Override the KiCI config directory     | `~/.kici`                                    |
+| Variable                 | Description                                                            | Default                                                                                     |
+| ------------------------ | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `KICI_OIDC_ISSUER`       | OIDC issuer URL for authentication                                     | `https://auth.kici.dev/realms/kici-internal`, or the issuer the named environment publishes |
+| `KICI_OIDC_CLIENT_ID`    | OIDC client ID for the CLI application                                 | `kici-cli`, or the client ID the named environment publishes                                |
+| `KICI_OIDC_EXTRA_SCOPES` | Extra OIDC scopes `kici login` requests, separated by commas or spaces | None. The scopes the named environment publishes follow these                               |
+| `KICI_PLATFORM_URL`      | Platform API base URL                                                  | `https://api.kici.dev`                                                                      |
+| `KICI_CONFIG_DIR`        | Override the KiCI config directory                                     | `~/.kici`                                                                                   |
 
 ## Direct orchestrator target
 
-These send `kici run remote` and `kici types` straight to an orchestrator, without the KiCI Platform (see [Direct mode](./cli/runs-and-approvals.md#direct-mode)). They take precedence over the target saved by `kici connect`; `--orchestrator-url` takes precedence over both.
+These send `kici run remote`, `kici runs cancel` and `kici types` straight to an orchestrator, without the KiCI Platform (see [Direct mode](./cli/runs-and-approvals.md#direct-mode)). They take precedence over the target saved by `kici connect`; `--orchestrator-url` takes precedence over both.
 
 | Variable                  | Description                                                                                                                                                                                          | Default |
 | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
@@ -45,6 +46,7 @@ An empty value counts as unset.
 | Variable          | Description                                                                                                                                                                | Default                             |
 | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
 | `KICI_LOG_FORMAT` | Format of the CLI's log lines: `json`, `plain`, or `auto`. `auto` prints plain text on a terminal and JSON when output is piped. Any other value behaves as `auto`.        | `auto`                              |
+| `KICI_LOG_STDERR` | Any non-empty value sends every log line to stderr, so stdout carries only command output.                                                                                 | unset                               |
 | `KICI_TMPDIR`     | Base directory for the temporary directories the CLI creates, such as the isolated checkout of `kici run <event> --local`. The CLI creates the directory if it is missing. | The operating system temp directory |
 
 ## Local dev plane
@@ -84,12 +86,26 @@ This affects which login flow `kici login` chooses (browser vs device) and wheth
 
 ### Targeting another environment or custom OIDC provider
 
-`kici login` targets the hosted KiCI Platform by default. To point the CLI at another KiCI environment (e.g. a testing instance) or a custom OIDC provider, override the defaults:
+`kici login` targets the hosted KiCI Platform by default. To point the CLI at another KiCI environment (e.g. a testing instance), set its Platform URL. `kici login` then reads the issuer and client ID that environment publishes:
+
+```bash
+export KICI_PLATFORM_URL=https://your-platform.example.com
+kici login
+```
+
+To use a custom OIDC provider, override the defaults:
 
 ```bash
 export KICI_OIDC_ISSUER=https://your-idp.example.com
 export KICI_OIDC_CLIENT_ID=your-client-id
 export KICI_PLATFORM_URL=https://your-platform.example.com
+kici login
+```
+
+When the provider needs an extra scope, such as an API-audience scope, add it with `KICI_OIDC_EXTRA_SCOPES` or `--oidc-scope`:
+
+```bash
+export KICI_OIDC_EXTRA_SCOPES="api://your-api/.default"
 kici login
 ```
 

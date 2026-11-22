@@ -87,7 +87,7 @@ workflow('deploy', {
 
 ## Queue mode
 
-When `cancelInProgress: false`, newer runs will wait until older runs complete:
+When `cancelInProgress: false`, newer runs wait until older runs complete:
 
 ```
 Run #1 starts deploying                -> running
@@ -96,7 +96,7 @@ Run #1 completes                       -> success
 Run #2 starts                          -> running
 ```
 
-In queue mode, the agent that picked up the queued run **stays connected** to the orchestrator and parks on a long-poll wait. When the holder finishes (success, failure, or cancel), the orchestrator dequeues the FIFO-next entry and pushes a `proceed` notification over the same WebSocket; the queued agent then continues with normal step execution against the workspace it already has. The agent's slot is therefore held for the duration of the queue wait — bound by `KICI_CONCURRENCY_WAIT_TIMEOUT_MS` (default 1 hour).
+In queue mode, the agent that picked up the queued run **stays connected** to the orchestrator and parks on a long-poll wait. When the holder finishes (success, failure, or cancel), the orchestrator dequeues the FIFO-next entry and pushes a `proceed` notification over the same WebSocket. The queued agent then continues with normal step execution against the workspace it already has. The agent's slot is therefore held for the duration of the queue wait. The wait timeout is 1 hour by default; an operator changes it with `KICI_CONCURRENCY_WAIT_TIMEOUT_MS`, or on a running cluster with `kici-admin cluster-settings set --concurrency-wait-timeout-ms`.
 
 ```typescript
 workflow('migrate-db', {

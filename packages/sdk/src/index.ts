@@ -189,6 +189,7 @@ export type {
   InferOutputs,
   Job,
   JobOptions,
+  CheckoutOptions,
   GenericInitConfig,
   MiseInitConfig,
   AptInitConfig,

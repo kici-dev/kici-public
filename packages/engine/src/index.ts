@@ -10,6 +10,7 @@
 
 // --- Protocol: version, common messages, auth ---
 export * from './protocol/version.js';
+export * from './protocol/release-version.js';
 export * from './protocol/source-origin.js';
 export * from './provenance/attestation-origin.js';
 export * from './provenance/id-token-event-claims.js';
@@ -180,6 +181,7 @@ export * from './regex-flags.js';
 // --- Trigger matching ---
 export * from './sandbox/capabilities.js';
 export * from './trigger/types.js';
+export * from './trigger/checkout.js';
 export * from './trigger/text-match.js';
 export * from './trigger/trigger-event-type.js';
 export * from './trigger/decision-trace.js';
@@ -379,3 +381,11 @@ export {
   type Permissions,
   type Resource,
 } from './auth/permissions.js';
+
+// --- CLI login settings a Platform publishes (browser-safe, pure Zod) ---
+export {
+  CLI_LOGIN_CONFIG_PATH,
+  CliLoginConfig,
+  CliLoginConfigError,
+  OidcScopeToken,
+} from './cli-login-config.js';

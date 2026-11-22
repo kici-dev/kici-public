@@ -1,6 +1,7 @@
 /** `kici org list|use|current`, backed by the Platform API with PAT auth. */
 
 import pc from 'picocolors';
+import { platformFetch } from '../remote/platform-fetch.js';
 import { loadGlobalConfig, mergeGlobalConfig, type GlobalConfig } from '../remote/config.js';
 
 interface UserOrg {
@@ -11,7 +12,7 @@ interface UserOrg {
 
 async function fetchUserOrgs(config: GlobalConfig): Promise<UserOrg[] | null> {
   const url = `${config.platformEndpoint}/api/v1/user/orgs`;
-  const response = await fetch(url, {
+  const response = await platformFetch(url, {
     headers: {
       Authorization: `Bearer ${config.pat}`,
       'Content-Type': 'application/json',

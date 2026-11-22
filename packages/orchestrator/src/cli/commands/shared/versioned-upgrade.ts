@@ -251,6 +251,8 @@ export async function resolveUpgradeTarget(args: {
     component,
     // Keeps recovery working if the instance index is later lost.
     instanceDir: resolved.instanceDir,
+    // A compose file rendered again pulls from the registry the install named.
+    imageRegistry: resolved.manifest.imageRegistry,
   };
   return {
     config,

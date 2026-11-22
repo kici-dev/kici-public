@@ -15,7 +15,9 @@ The browser flow completes by receiving a callback on `127.0.0.1`. If that callb
 
 After OAuth, the CLI exchanges the OIDC token for a personal access token (PAT) stored in the config directory (`~/.kici/config` by default, overridable with `KICI_CONFIG_DIR`).
 
-`kici login` targets the hosted KiCI Platform by default. `--platform-endpoint` / `--oidc-issuer`, or `KICI_PLATFORM_URL` / `KICI_OIDC_ISSUER`, override the endpoint and the OIDC issuer. Login persists the platform endpoint and OIDC issuer it authenticated against alongside the PAT, so a saved PAT always matches its endpoint. Because the config describes one environment at a time, **switching the endpoint resets the active organization and default clusters** — re-run `kici org use <name>` after switching environments.
+`kici login` targets the hosted KiCI Platform by default. `--platform-endpoint` / `--oidc-issuer`, or `KICI_PLATFORM_URL` / `KICI_OIDC_ISSUER`, override the endpoint and the OIDC issuer. When you name another KiCI environment and no issuer, `kici login` reads the issuer and client ID that environment publishes at `/api/v1/cli/login-config`. If it cannot read them, it stops with an error and does not fall back to the hosted identity provider. It also stops when that environment publishes the hosted identity provider as its own: `kici login` signs in there only for the hosted Platform. `KICI_OIDC_CLIENT_ID` overrides the published client ID. Login persists the platform endpoint and OIDC issuer it authenticated against alongside the PAT, so a saved PAT always matches its endpoint. Because the config describes one environment at a time, **switching the endpoint resets the active organization and default clusters** — re-run `kici org use <name>` after switching environments.
+
+`kici login` requests the scopes `openid profile email`. It asks for no offline session, because it exchanges the sign-in for a personal access token right away. `KICI_OIDC_EXTRA_SCOPES` (separated by commas or spaces) and `--oidc-scope` (repeatable; a value may list several scopes separated by commas or spaces) add scopes after them, such as an API-audience scope your OIDC provider needs. The scopes that another KiCI environment publishes come last, and each scope is requested once. The device flow needs a provider that advertises a device authorization endpoint. If the provider has none, use the browser flow.
 
 After a successful login in an interactive terminal, when an organization is active and the [local dev plane](./authoring-and-local.md#kici-local) is not attached yet, `kici login` asks whether to attach the plane to the Platform (`Attach now? [Y/n]`). An attached plane gives `kici run <event> --local` real Platform secrets and identity. Pass `--no-attach` to skip the prompt in scripted logins. A failed attach does not fail the login; run `kici local attach` later.
 
@@ -25,14 +27,15 @@ kici login [options]
 
 **Environment variables:**
 
-| Variable              | Default                                      | Description                                                            |
-| --------------------- | -------------------------------------------- | ---------------------------------------------------------------------- |
-| `KICI_PLATFORM_URL`   | `https://api.kici.dev`                       | Platform API base URL (override to target another KiCI environment)    |
-| `KICI_OIDC_ISSUER`    | `https://auth.kici.dev/realms/kici-internal` | OIDC issuer URL (override to target another KiCI environment)          |
-| `KICI_OIDC_CLIENT_ID` | `kici-cli`                                   | OIDC client ID (override to target another KiCI environment)           |
-| `KICI_BROWSER_CMD`    | uses `open` package                          | Custom browser command with `{url}` placeholder, or `none` to suppress |
-| `KICI_CALLBACK_PORT`  | random                                       | Fixed port for OAuth PKCE callback server                              |
-| `KICI_CONFIG_DIR`     | `~/.kici`                                    | Override config directory                                              |
+| Variable                 | Default                                      | Description                                                                                   |
+| ------------------------ | -------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `KICI_PLATFORM_URL`      | `https://api.kici.dev`                       | Platform API base URL (override to target another KiCI environment)                           |
+| `KICI_OIDC_ISSUER`       | `https://auth.kici.dev/realms/kici-internal` | OIDC issuer URL (default for another KiCI environment: the issuer that environment publishes) |
+| `KICI_OIDC_CLIENT_ID`    | `kici-cli`                                   | OIDC client ID (overrides the client ID another KiCI environment publishes)                   |
+| `KICI_OIDC_EXTRA_SCOPES` | none                                         | Extra OIDC scopes, separated by commas or spaces                                              |
+| `KICI_BROWSER_CMD`       | the system default browser                   | Custom browser command with `{url}` placeholder, or `none` to suppress                        |
+| `KICI_CALLBACK_PORT`     | random                                       | Fixed port for OAuth PKCE callback server                                                     |
+| `KICI_CONFIG_DIR`        | `~/.kici`                                    | Override config directory                                                                     |
 
 **Examples:**
 
@@ -43,7 +46,10 @@ kici login
 # Force device flow (for SSH/headless)
 kici login --device
 
-# Log in against another KiCI environment (e.g. a testing instance)
+# Log in against another KiCI environment: it publishes its own identity provider
+kici login --platform-endpoint https://platform.example.com
+
+# Name the identity provider yourself (no lookup on the Platform)
 kici login --platform-endpoint https://platform.example.com \
   --oidc-issuer https://auth.example.com/realms/kici-internal
 
@@ -101,7 +107,7 @@ The token comes from standard input with `--token-stdin`, else from `KICI_ORCHES
 kici connect https://ci.example.com
 
 # Pipe it in (scripts, CI)
-echo "$KICI_TOKEN" | kici connect https://ci.example.com --token-stdin
+echo "$TOKEN" | kici connect https://ci.example.com --token-stdin
 ```
 
 The URL is the orchestrator's HTTP address; a base path is kept. See [Direct mode](./runs-and-approvals.md#direct-mode) for what changes when runs go straight to an orchestrator.
@@ -171,7 +177,12 @@ kici init --private-registry https://npm.pkg.github.com/ \
   .kiciignore         # Paths the workflow content hash does not cover
   AGENTS.md           # LLM authoring context (skip with --no-agents-md)
 .kiciignore           # Default exclusion patterns for test uploads
+.gitignore            # Gains .kici/node_modules/ and .kici/.secrets
 ```
+
+`kici init` adds the root `.gitignore` entries only when they are missing. It adds none when the file already ignores all of `.kici/`.
+
+With `--private-registry <url>`, `kici init` also writes two example files: `.kici/workflows/private-registry-example.ts.example`, a workflow with a `registries:` entry for the URL, and `.kici/.npmrc.example`, which reads the registry token from an environment variable. Neither has an effect until you copy it into place, and neither is overwritten when it already exists. See [Private registries](../private-registries.md).
 
 The two `.kiciignore` files are unrelated. The one inside `.kici/` declares which paths the per-workflow content hash skips — see [Lock file and workflow drift](../lock-file-and-drift.md#files-the-content-hash-skips-kicikiciignore). The one at the repo root selects which working-tree files a remote run uploads. Neither is overwritten when it already exists.
 
@@ -190,7 +201,7 @@ In interactive mode (TTY), `kici init` prompts you to:
 
 **First run:** in interactive mode, after setup `kici init` offers to run the scaffolded workflow immediately (`kici run push --local`), defaulting to No. It is skipped in CI, non-interactive shells, `--mjs`, and `--skip-install` (where dependencies are not installed yet).
 
-**Package manager:** the dependency install step uses the package manager detected for your repo — the `packageManager` field in the nearest `package.json` (Corepack convention), then a lockfile in the project root (`pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, `package-lock.json` → npm), then the package manager that invoked `kici` (`pnpm dlx` / `yarn dlx` / `npx`), defaulting to npm. Pass `--package-manager <npm|pnpm|yarn>` to override detection, or `--skip-install` to set up the files and install later yourself.
+**Package manager:** the dependency install step uses the package manager detected for your repo. Detection reads the `packageManager` field in the nearest `package.json` (Corepack convention), then a lockfile in the project root (`pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, `package-lock.json` → npm), then the package manager that invoked `kici` (`pnpm dlx` / `yarn dlx` / `npx`), and defaults to npm. Pass `--package-manager <npm|pnpm|yarn>` to override detection, or `--skip-install` to set up the files and install later yourself.
 
 **Standalone vs workspace member:** by default `kici init` scaffolds a self-contained `.kici/` with its own `package.json` and its own install. When run inside a pnpm, npm, or yarn workspace, it offers to make `.kici/` a workspace member (or pass `--workspace`). In this layout `.kici/` still has its own `package.json`, and `kici init` adds `.kici` to the workspace package list. For pnpm that list is `pnpm-workspace.yaml`, and its comments and other entries stay as they are. For npm and yarn it is the `workspaces` field of the root `package.json`. The install runs at the workspace root, and agents install `.kici/` the same way. Your workflows can `import` your other workspace packages, for example shared build or deploy utilities. Declare each one in `.kici/package.json`: `workspace:*` with pnpm and yarn berry, or the version range of the package with npm and yarn classic. `kici init` does not change the dependencies in your root `package.json`. If the root `package.json` declares `@kici-dev/sdk`, `kici init` names it, and you can remove it when no other package imports the SDK. Run `kici init --workspace` again on an existing `.kici/` to add what is missing, which is a `.kici/package.json` and the workspace entry. Your workflows and the dependencies in your root `package.json` do not change, and the command does nothing when the layout is already complete. It refuses a `.kici/` that has its own `package.json` but is not in the workspace package list. Such a `.kici/` is a standalone project with its own lockfile. Pass `--standalone` to force the self-contained layout even inside a workspace. In CI / non-interactive runs the default is standalone; use `--workspace` to opt in explicitly. `--workspace` and `--standalone` are mutually exclusive, and `--workspace` errors if no workspace is found at or above the current directory.
 
@@ -257,8 +268,8 @@ kici pat create --agent --name "claude-code"
 - `--agent` marks the token as agent-kind. An agent PAT inherits your
   permissions unchanged (it carries provenance, not extra authority) and is the
   **only** credential the MCP server accepts.
-- `--name <label>` sets the token name. For an agent PAT this is the **agent
-  label** recorded on every action the agent takes — required with `--agent`.
+- `--name <label>` sets the token name, and is required. For an agent PAT this
+  is also the **agent label** recorded on every action the agent takes.
 - `--expires-in-days <n>` overrides the default expiry.
 
 The token is printed once — save it immediately; it cannot be retrieved later.
@@ -416,13 +427,14 @@ Synopsis: `kici login [options]`
 
 **Options**
 
-| Option                      | Default | Description                                                                         |
-| --------------------------- | ------- | ----------------------------------------------------------------------------------- |
-| `--device`                  |         | Force device authorization flow (for headless/SSH environments)                     |
-| `--platform-endpoint <url>` |         | Platform relay URL                                                                  |
-| `--oidc-issuer <url>`       |         | OIDC issuer URL (defaults to the hosted KiCI IdP unless a flag/env selects another) |
-| `--routing-key <key>`       |         | Deprecated; saved to the config but never read                                      |
-| `--no-attach`               |         | Skip the post-login prompt to attach the local dev plane                            |
+| Option                      | Default | Description                                                                                                                           |
+| --------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `--device`                  |         | Force device authorization flow (for headless/SSH environments)                                                                       |
+| `--platform-endpoint <url>` |         | Platform API URL (http:// or https://, default https://api.kici.dev)                                                                  |
+| `--oidc-issuer <url>`       |         | OIDC issuer URL (default: the issuer the named Platform publishes, or the hosted KiCI IdP)                                            |
+| `--oidc-scope <scope>`      |         | Extra OIDC scope to request, after KICI_OIDC_EXTRA_SCOPES (repeatable; a value may list several scopes separated by commas or spaces) |
+| `--routing-key <key>`       |         | Deprecated; saved to the config but never read                                                                                        |
+| `--no-attach`               |         | Skip the post-login prompt to attach the local dev plane                                                                              |
 
 ### `kici logout`
 

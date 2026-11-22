@@ -983,3 +983,38 @@ describe('dynamicJob gitCredentials', () => {
     ).not.toThrow();
   });
 });
+
+describe('job() checkout option', () => {
+  it('accepts true, false and the object form', () => {
+    expect(
+      job('a', { runsOn: 'x', steps: [], checkout: { fetchDepth: 0, fetchTags: true } }).checkout,
+    ).toEqual({ fetchDepth: 0, fetchTags: true });
+    expect(job('b', { runsOn: 'x', steps: [], checkout: false }).checkout).toBe(false);
+    expect(job('c', { runsOn: 'x', steps: [], checkout: true }).checkout).toBe(true);
+  });
+
+  it.each([
+    [
+      { fetchDepth: -1 },
+      "job('j'): checkout.fetchDepth must be a non-negative integer (0 = full history), got -1",
+    ],
+    [
+      { fetchDepth: 2.5 },
+      "job('j'): checkout.fetchDepth must be a non-negative integer (0 = full history), got 2.5",
+    ],
+    [{ fetchTags: 'yes' }, `job('j'): checkout.fetchTags must be true or false, got "yes"`],
+    [
+      { fetch_depth: 1 },
+      "job('j'): checkout has unknown option 'fetch_depth'; expected fetchDepth or fetchTags",
+    ],
+    [
+      'shallow',
+      `job('j'): checkout must be true, false or { fetchDepth?, fetchTags? }, got "shallow"`,
+    ],
+  ])('rejects %j', (checkout, message) => {
+    // fails-when: an invalid checkout reaches the lock and the agent clones with a bogus depth
+    expect(() => job('j', { runsOn: 'x', steps: [], checkout: checkout as never })).toThrow(
+      message,
+    );
+  });
+});

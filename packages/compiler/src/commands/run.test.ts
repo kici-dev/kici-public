@@ -1,4 +1,8 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { makeTempDir } from '@kici-dev/core/tmp';
+import { join } from 'node:path';
+import { stripVTControlCharacters } from 'node:util';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { logger } from '@kici-dev/core';
 import {
   runRemoteCommand,
@@ -9,6 +13,7 @@ import {
   withStdoutOnStderr,
 } from './run.js';
 import { requestRunCancel, watchRunHolds } from './run-remote-follow.js';
+import { GitTagMode } from '../remote/shipped-git/git-ship-types.js';
 
 const mockClient = {
   initUpload: vi.fn(),
@@ -54,6 +59,7 @@ vi.mock('../remote/platform-client.js', async (importOriginal) => {
     AuthenticationError: class extends Error {},
     AccessDeniedError: class extends Error {},
     ConnectionError: class extends Error {},
+    HttpStatusError: actual.HttpStatusError,
     NotFoundError: class extends Error {
       constructor(m = 'Resource not found') {
         super(m);
@@ -145,8 +151,15 @@ vi.mock('./compile.js', () => ({
 
 vi.mock('../remote/uploader.js', () => ({
   createOverlayTarball: vi.fn(),
+  gcStaleOverlayDirs: vi.fn(),
   getSizeWarning: vi.fn().mockReturnValue(null),
   uploadTarball: vi.fn(),
+}));
+
+// The real diff reads git; these tests pin what run.ts does with its result.
+const mockComputeRemoteChangedFiles = vi.fn();
+vi.mock('../remote/remote-changed-files.js', () => ({
+  computeRemoteChangedFiles: (...args: unknown[]) => mockComputeRemoteChangedFiles(...args),
 }));
 
 vi.mock('../remote/secret-upload.js', () => ({
@@ -193,13 +206,39 @@ const overlay = {
   manifest: { sha: 'abc123', deletions: [], checksums: {} },
   hasRemote: true,
   warnings: [] as string[],
+  git: {
+    root: '/tmp/overlay-git',
+    files: ['.git/HEAD'],
+    baseSha: 'abc123',
+    workspaceSha: 'abc123',
+    synthetic: false,
+    createdTags: [] as string[],
+    replacedTags: [] as string[],
+    branch: 'main',
+    record: { fetchDepth: 1, allTags: false },
+    warnings: [] as string[],
+  },
+  tempDir: { path: '/tmp/overlay', cleanup: async () => {} },
 };
+
+/** The `n`th log poll read from `position`, carrying the Ctrl-C signal that stops a read in flight. */
+function expectLogPoll(n: number, position: { cursor: number; logCursor?: string }): void {
+  expect(mockClient.runLogs).toHaveBeenNthCalledWith(
+    n,
+    'org_a',
+    'run-123',
+    position,
+    expect.anything(),
+    expect.objectContaining({ signal: expect.any(AbortSignal) }),
+  );
+}
 
 describe('kici run command', () => {
   let loadGlobalConfig: ReturnType<typeof vi.fn>;
   let compileFixtures: ReturnType<typeof vi.fn>;
   let filterFixtures: ReturnType<typeof vi.fn>;
   let createOverlayTarball: ReturnType<typeof vi.fn>;
+  let gcStaleOverlayDirs: ReturnType<typeof vi.fn>;
   let uploadTarball: ReturnType<typeof vi.fn>;
 
   beforeEach(async () => {
@@ -225,6 +264,8 @@ describe('kici run command', () => {
 
     const uploaderMod = await import('../remote/uploader.js');
     createOverlayTarball = uploaderMod.createOverlayTarball as ReturnType<typeof vi.fn>;
+    gcStaleOverlayDirs = uploaderMod.gcStaleOverlayDirs as ReturnType<typeof vi.fn>;
+    gcStaleOverlayDirs.mockResolvedValue([]);
     uploadTarball = uploaderMod.uploadTarball as ReturnType<typeof vi.fn>;
 
     loadGlobalConfig.mockResolvedValue({
@@ -263,6 +304,7 @@ describe('kici run command', () => {
     });
     mockClient.cancel.mockResolvedValue({ cancelled: true });
     mockDetectCurrentBranch.mockReturnValue('feature/x');
+    mockComputeRemoteChangedFiles.mockReturnValue({});
   });
 
   const fixture = {
@@ -277,6 +319,30 @@ describe('kici run command', () => {
       const result = await runRemoteCommand(undefined, { kiciDir: '.kici' });
       expect(result).toBe(true);
       expect(compileFixtures).toHaveBeenCalled();
+    });
+
+    it('reaps stale overlay temp dirs before the overlay, and still runs when that fails', async () => {
+      compileFixtures.mockResolvedValue([fixture]);
+      filterFixtures.mockReturnValue([fixture]);
+      const run = () => runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+
+      expect(await run()).toBe(true);
+      // fails-when: the GC is never called on the remote path, so killed runs leak for good
+      expect(gcStaleOverlayDirs.mock.invocationCallOrder[0]).toBeLessThan(
+        createOverlayTarball.mock.invocationCallOrder[0],
+      );
+
+      gcStaleOverlayDirs.mockRejectedValue(new Error('EACCES: permission denied'));
+      const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+      try {
+        // breaks-if-wrong: a GC failure must not fail the run it precedes
+        expect(await run()).toBe(true);
+        expect(stderr.mock.calls.map((c) => String(c[0])).join('')).toContain(
+          'Could not clean up old overlay temp dirs: EACCES',
+        );
+      } finally {
+        stderr.mockRestore();
+      }
     });
 
     it('uploads then triggers via the Platform client', async () => {
@@ -348,6 +414,184 @@ describe('kici run command', () => {
       } finally {
         stderr.mockRestore();
       }
+    });
+
+    describe('event commits and changed files', () => {
+      const tempRoots: string[] = [];
+
+      /** The overlay temp dir as createOverlayTarball leaves it: the tarball and the shipped repository. */
+      async function shippedOverlay(extra: Record<string, unknown> = {}) {
+        const tempDir = await makeTempDir('overlay');
+        tempRoots.push(tempDir.path);
+        const tarballPath = join(tempDir.path, 'overlay.tar.gz');
+        writeFileSync(tarballPath, 'tarball');
+        const root = join(tempDir.path, 'ship');
+        mkdirSync(join(root, '.git'), { recursive: true });
+        return {
+          ...overlay,
+          tarballPath,
+          tempDir,
+          summary: { ...overlay.summary, sha: 'syn456' },
+          git: {
+            ...overlay.git,
+            root,
+            workspaceSha: 'syn456',
+            parentSha: 'abc123',
+            synthetic: true,
+            ...extra,
+          },
+        };
+      }
+
+      beforeEach(() => {
+        compileFixtures.mockResolvedValue([fixture]);
+        filterFixtures.mockReturnValue([fixture]);
+      });
+
+      afterEach(() => {
+        for (const dir of tempRoots.splice(0)) rmSync(dir, { recursive: true, force: true });
+      });
+
+      it('sends the workspace commit, its parent and the computed changed files', async () => {
+        const shipped = await shippedOverlay();
+        createOverlayTarball.mockResolvedValue(shipped);
+        mockComputeRemoteChangedFiles.mockReturnValue({ files: ['a.txt', 'new.txt'] });
+
+        expect(await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false })).toBe(true);
+
+        const { event } = mockClient.trigger.mock.calls[0][2];
+        // fails-when: the event names the developer's HEAD, not the commit the workspace checks out
+        expect(event.payload.after).toBe('syn456');
+        expect(event.payload.before).toBe('abc123');
+        // fails-when: the computed list is not sent, so the agent diffs against the git host
+        expect(event.changedFiles).toEqual(['a.txt', 'new.txt']);
+        expect(mockComputeRemoteChangedFiles).toHaveBeenCalledWith({
+          repoRoot: expect.stringMatching(/\/mock$/),
+          shipRoot: shipped.git.root,
+          event: expect.objectContaining({ type: 'push', targetBranch: 'main' }),
+          workspaceSha: 'syn456',
+          parentSha: 'abc123',
+        });
+      });
+
+      it('prints the warning and sends no list when none is computed', async () => {
+        createOverlayTarball.mockResolvedValue(await shippedOverlay());
+        mockComputeRemoteChangedFiles.mockReturnValue({ warning: 'no base here' });
+        const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+        try {
+          expect(await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false })).toBe(true);
+          expect(stderr.mock.calls.map((c) => String(c[0])).join('')).toContain('no base here');
+        } finally {
+          stderr.mockRestore();
+        }
+        // breaks-if-wrong: an empty list would read as "nothing changed" and skip path-filtered workflows
+        expect(mockClient.trigger.mock.calls[0][2].event).not.toHaveProperty('changedFiles');
+      });
+
+      it('sends no changed-files list when the .git was skipped', async () => {
+        createOverlayTarball.mockResolvedValue({ ...overlay, git: undefined });
+
+        expect(await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false })).toBe(true);
+
+        // fails-when: a run with no shipped .git diffs the developer repository anyway
+        expect(mockComputeRemoteChangedFiles).not.toHaveBeenCalled();
+        const { event } = mockClient.trigger.mock.calls[0][2];
+        expect(event).not.toHaveProperty('changedFiles');
+        expect(event.payload).not.toHaveProperty('before');
+        expect(event.payload.after).toBe('abc123');
+      });
+
+      it('removes the ship directory after computing changed files', async () => {
+        const shipped = await shippedOverlay();
+        createOverlayTarball.mockResolvedValue(shipped);
+        let presentWhileComputing = false;
+        mockComputeRemoteChangedFiles.mockImplementation(() => {
+          presentWhileComputing = existsSync(shipped.git.root);
+          return { files: [] };
+        });
+
+        expect(await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false })).toBe(true);
+
+        // breaks-if-wrong: the diff reads the shipped objects, so they must exist while it runs
+        expect(presentWhileComputing).toBe(true);
+        // fails-when: the full-history ship .git stays in tmp forever
+        expect(existsSync(shipped.git.root)).toBe(false);
+      });
+
+      it('removes the ship directory when the upload fails', async () => {
+        const shipped = await shippedOverlay();
+        createOverlayTarball.mockResolvedValue(shipped);
+        mockClient.initUpload.mockRejectedValue(new Error('upload refused'));
+
+        expect(await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false })).toBe(false);
+
+        // fails-when: a failed run leaves the shipped history behind
+        expect(existsSync(shipped.git.root)).toBe(false);
+      });
+
+      it.each<[string, () => void, { wait?: boolean }, boolean]>([
+        ['a followed run that succeeds', () => {}, {}, true],
+        [
+          'a followed run that fails',
+          () =>
+            mockClient.runStatus.mockResolvedValue({
+              runId: 'run-123',
+              status: 'failed',
+              jobs: [{ jobId: 'j1', jobName: 'build', status: 'failed' }],
+              done: true,
+            }),
+          {},
+          false,
+        ],
+        ['--no-wait', () => {}, { wait: false }, true],
+        [
+          'an upload error',
+          // Replaces the probe below, so the upload never reads the tarball.
+          () => uploadTarball.mockReset().mockRejectedValue(new Error('PUT failed')),
+          { wait: false },
+          false,
+        ],
+        [
+          'a rejected trigger',
+          () => mockClient.trigger.mockResolvedValue({ runId: 'r', status: 'rejected' }),
+          { wait: false },
+          false,
+        ],
+        [
+          'a trigger error',
+          () => mockClient.trigger.mockRejectedValue(new Error('relay down')),
+          { wait: false },
+          false,
+        ],
+      ])('removes the overlay temp dir after %s', async (_case, arrange, flags, ok) => {
+        const shipped = await shippedOverlay();
+        createOverlayTarball.mockResolvedValue(shipped);
+        let tarballWhileUploading = false;
+        uploadTarball.mockImplementationOnce(async (opts: { tarballPath: string }) => {
+          tarballWhileUploading = existsSync(opts.tarballPath);
+          return { uploadId: 'upload-456', cliPublicKey: Buffer.from('k'), encryptedSize: 1 };
+        });
+        arrange();
+
+        expect(await runRemoteCommand('push-main', { kiciDir: '.kici', ...flags })).toBe(ok);
+
+        // breaks-if-wrong: the upload reads the tarball, so the dir must outlive it
+        expect(tarballWhileUploading).toBe(_case !== 'an upload error');
+        // fails-when: cleanup is skipped on this path, so every run leaves its tarball in tmp
+        expect(existsSync(shipped.tempDir.path)).toBe(false);
+      });
+
+      it('removes the ship directory of a direct workflow run', async () => {
+        const shipped = await shippedOverlay();
+        createOverlayTarball.mockResolvedValue(shipped);
+
+        expect(await runRemoteCommand(undefined, { workflow: 'ci', wait: false })).toBe(true);
+
+        // fails-when: --workflow, which computes no changed files, leaves the overlay behind
+        expect(existsSync(shipped.tempDir.path)).toBe(false);
+        expect(mockComputeRemoteChangedFiles).not.toHaveBeenCalled();
+        expect(mockClient.trigger.mock.calls[0][2].event.payload.after).toBe('syn456');
+      });
     });
 
     it('prints skipped-environment warnings from the accepted trigger response', async () => {
@@ -1140,21 +1384,9 @@ describe('kici run command', () => {
       expect(result).toBe(true);
       // The first poll starts the per-file cursor; this server answers without
       // one, so the second poll falls back to the numeric cursor alone.
-      expect(mockClient.runLogs).toHaveBeenNthCalledWith(
-        1,
-        'org_a',
-        'run-123',
-        { cursor: 0, logCursor: '' },
-        expect.anything(),
-      );
+      expectLogPoll(1, { cursor: 0, logCursor: '' });
       // breaks-if-wrong: an older Platform or orchestrator keeps working
-      expect(mockClient.runLogs).toHaveBeenNthCalledWith(
-        2,
-        'org_a',
-        'run-123',
-        { cursor: 1 },
-        expect.anything(),
-      );
+      expectLogPoll(2, { cursor: 1 });
     });
 
     it('follows the per-file cursor when the server offers one', async () => {
@@ -1171,13 +1403,7 @@ describe('kici run command', () => {
 
       // fails-when: the loop keeps sending the numeric cursor, so a step file
       // that sorts before an already-read file loses lines
-      expect(mockClient.runLogs).toHaveBeenNthCalledWith(
-        2,
-        'org_a',
-        'run-123',
-        { cursor: 1, logCursor: 'c1' },
-        expect.anything(),
-      );
+      expectLogPoll(2, { cursor: 1, logCursor: 'c1' });
     });
 
     it('retries while a freshly triggered run is not yet readable on the Platform', async () => {
@@ -1201,13 +1427,7 @@ describe('kici run command', () => {
       expect(result).toBe(true);
       expect(mockClient.runLogs).toHaveBeenCalledTimes(2);
       // The retry re-reads from the same cursor — no log lines were consumed.
-      expect(mockClient.runLogs).toHaveBeenNthCalledWith(
-        2,
-        'org_a',
-        'run-123',
-        { cursor: 0, logCursor: '' },
-        expect.anything(),
-      );
+      expectLogPoll(2, { cursor: 0, logCursor: '' });
     });
 
     it('surfaces a 404 once the run has already been read', async () => {
@@ -1493,9 +1713,14 @@ describe('kici run command', () => {
       // The default overlay mock has hasRemote: true; the run still requests the
       // full working tree (the orchestrator never clones for a relayed run).
       await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+      // fails-when: the run ships no .git, or one other than a depth-1 default-tags clone
+      // with the synthetic commit on and no synthetic tag
       expect(createOverlayTarball).toHaveBeenCalledWith(
         expect.any(String),
-        expect.objectContaining({ fullWorkingTree: true }),
+        expect.objectContaining({
+          fullWorkingTree: true,
+          git: { depth: 1, tags: GitTagMode.Default, commit: true, syntheticTags: [] },
+        }),
       );
     });
 
@@ -1524,10 +1749,23 @@ describe('kici run command', () => {
     it('emits the working-tree status line in human mode', async () => {
       vi.mocked(logger.info).mockClear();
       await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
-      // The overlay includes `.git`, so git steps work.
+      // The overlay includes a `.git` built like a checkout of the repository.
       const infoCalls = vi.mocked(logger.info).mock.calls.map((c) => String(c[0]));
       expect(infoCalls.some((line) => line.includes('local working tree'))).toBe(true);
-      expect(infoCalls.some((line) => line.includes('git steps work'))).toBe(true);
+      expect(infoCalls.some((line) => line.includes('over a checkout of your repository'))).toBe(
+        true,
+      );
+    });
+
+    it('says no .git ships when the .git build was skipped', async () => {
+      vi.mocked(logger.info).mockClear();
+      createOverlayTarball.mockResolvedValue({ ...overlay, git: undefined });
+      await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+      const infoCalls = vi.mocked(logger.info).mock.calls.map((c) => String(c[0]));
+      // fails-when: the status line claims a .git that the overlay does not carry
+      expect(infoCalls.some((line) => line.includes('over a checkout'))).toBe(false);
+      expect(infoCalls.some((line) => line.includes('Git: '))).toBe(false);
+      expect(infoCalls.some((line) => line.includes('no .git ships'))).toBe(true);
     });
 
     it('prints each overlay warning on stderr, also under --json', async () => {
@@ -1545,6 +1783,292 @@ describe('kici run command', () => {
       }
       // fails-when: a warning is only logged through the stdout logger, which --json silences
       expect(stderr.some((line) => line.includes(warning))).toBe(true);
+    });
+
+    describe('git requirement, status lines and the overlay report', () => {
+      const pushMainTrigger = {
+        _type: 'push',
+        branches: [{ type: 'glob', pattern: 'main' }],
+        paths: [],
+      };
+      const lockJob = (name: string, checkoutOptions?: Record<string, unknown>) => ({
+        _type: 'static',
+        name,
+        steps: [],
+        needs: [],
+        ...(checkoutOptions && { checkoutOptions }),
+      });
+      /** `w1` asks fetchDepth 0, `w2` asks nothing; a push to main matches both. */
+      const SCOPED_LOCK = JSON.stringify({
+        schemaVersion: 4,
+        workflows: [
+          {
+            name: 'w1',
+            contentHash: '',
+            compileSchemaVersion: 0,
+            triggers: [pushMainTrigger],
+            jobs: [lockJob('release', { fetchDepth: 0 })],
+          },
+          {
+            name: 'w2',
+            contentHash: '',
+            compileSchemaVersion: 0,
+            triggers: [pushMainTrigger],
+            jobs: [lockJob('plain')],
+          },
+        ],
+      });
+      const gitOption = (): Record<string, unknown> =>
+        (createOverlayTarball.mock.calls[0][1] as { git: Record<string, unknown> }).git;
+      const plainInfo = (): string[] =>
+        vi.mocked(logger.info).mock.calls.map((c) => stripVTControlCharacters(String(c[0])));
+      /** Serve the real JSON formatter, so stdout carries what a user gets. */
+      const useRealJson = async () => {
+        const actual = await vi.importActual<typeof import('../remote/output/json.js')>(
+          '../remote/output/json.js',
+        );
+        const mod = await import('../remote/output/json.js');
+        vi.mocked(mod.formatJsonResult).mockImplementation(actual.formatJsonResult);
+      };
+      const jsonStdout = async (run: () => Promise<boolean>): Promise<Record<string, any>> => {
+        const lines: string[] = [];
+        const spy = vi.spyOn(console, 'log').mockImplementation((line: unknown) => {
+          lines.push(String(line));
+        });
+        try {
+          await run();
+        } finally {
+          spy.mockRestore();
+        }
+        expect(lines).toHaveLength(1);
+        return JSON.parse(lines[0]);
+      };
+      const reportingOverlay = {
+        ...overlay,
+        summary: { ...overlay.summary, compressedSize: 7777, fileCount: 42, sha: 'syn456' },
+        git: {
+          ...overlay.git,
+          baseSha: 'abc123',
+          workspaceSha: 'syn456',
+          synthetic: true,
+          createdTags: ['v9.9.9'],
+          // What shipped differs from the request (depth 1, default tags).
+          record: { fetchDepth: 3, allTags: true },
+        },
+      };
+      const expectedReport = {
+        compressedSize: 7777,
+        fileCount: 42,
+        git: {
+          depth: 1,
+          tags: GitTagMode.Default,
+          // fails-when: the JSON reports only the request, not the shipped record
+          shipped: { fetchDepth: 3, allTags: true },
+          synthetic: true,
+          workspaceSha: 'syn456',
+          baseSha: 'abc123',
+          syntheticTags: ['v9.9.9'],
+        },
+      };
+
+      it('passes the lock-derived git options to the overlay builder', async () => {
+        mockReadFile.mockResolvedValue(SCOPED_LOCK);
+        await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+        // fails-when: the requirement ignores the lock and ships depth 1
+        expect(createOverlayTarball).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.objectContaining({ git: expect.objectContaining({ depth: 0 }) }),
+        );
+        // The lock is read before the overlay is built, to size its .git.
+        expect(mockReadFile.mock.invocationCallOrder[0]).toBeLessThan(
+          createOverlayTarball.mock.invocationCallOrder[0],
+        );
+      });
+
+      it('lets the flags override the lock per dimension', async () => {
+        mockReadFile.mockResolvedValue(SCOPED_LOCK);
+        await runRemoteCommand('push-main', {
+          kiciDir: '.kici',
+          wait: false,
+          git: { gitDepth: 3, gitTags: false, commit: true, tags: [] },
+        });
+        expect(gitOption()).toEqual(expect.objectContaining({ depth: 3, tags: GitTagMode.None }));
+        expect(plainInfo()).toContain('Git: depth 3, no tags (--git-depth 3; --no-git-tags)');
+      });
+
+      it('scopes the requirement to the fixture workflowName', async () => {
+        mockReadFile.mockResolvedValue(SCOPED_LOCK);
+        const pinned = {
+          ...fixture,
+          fixture: {
+            ...fixture.fixture,
+            options: { ...fixture.fixture.options, workflowName: 'w2' },
+          },
+        };
+        compileFixtures.mockResolvedValue([pinned]);
+        filterFixtures.mockReturnValue([pinned]);
+        await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+        // fails-when: the event match (w1 and w2) sizes the .git instead of the named workflow
+        expect(gitOption().depth).toBe(1);
+      });
+
+      it('scopes the requirement to --workflow on a direct run', async () => {
+        mockReadFile.mockResolvedValue(SCOPED_LOCK);
+        await runRemoteCommand(undefined, { kiciDir: '.kici', workflow: 'w1', wait: false });
+        expect(gitOption().depth).toBe(0);
+        createOverlayTarball.mockClear();
+        await runRemoteCommand(undefined, { kiciDir: '.kici', workflow: 'w2', wait: false });
+        expect(gitOption().depth).toBe(1);
+      });
+
+      it('passes the raw commit flags through', async () => {
+        await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+        // fails-when: the CLI resolves the default message or author itself
+        expect(gitOption().commitMessage).toBeUndefined();
+        expect(gitOption().commitAuthor).toBeUndefined();
+
+        createOverlayTarball.mockClear();
+        const author = { name: 'Ada', email: 'ada@example.com' };
+        await runRemoteCommand('push-main', {
+          kiciDir: '.kici',
+          wait: false,
+          git: { commit: false, commitMessage: 'msg', commitAuthor: author, tags: ['v1'] },
+        });
+        expect(gitOption()).toEqual(
+          expect.objectContaining({
+            commit: false,
+            commitMessage: 'msg',
+            commitAuthor: author,
+            syntheticTags: ['v1'],
+          }),
+        );
+      });
+
+      it('prints the Git and Workspace commit lines in human mode', async () => {
+        vi.mocked(logger.info).mockClear();
+        await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+        expect(plainInfo()).toContain('Git: depth 1, default tags (default)');
+        expect(plainInfo()).toContain('Workspace commit: abc123 (HEAD)');
+        expect(plainInfo()).toContain(
+          'Running your local working tree over a checkout of your repository',
+        );
+      });
+
+      it('names the synthetic commit and its base HEAD', async () => {
+        createOverlayTarball.mockResolvedValue(reportingOverlay);
+        vi.mocked(logger.info).mockClear();
+        await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+        expect(plainInfo()).toContain(
+          'Workspace commit: syn456 (synthetic commit over HEAD abc123)',
+        );
+      });
+
+      it('prints a line per replaced tag, on stderr under --json', async () => {
+        const line = (name: string) =>
+          `Tag '${name}' replaces the tag of that name from your repository in the remote workspace.`;
+        createOverlayTarball.mockResolvedValue({
+          ...overlay,
+          git: { ...overlay.git, createdTags: ['v1', 'v2'], replacedTags: ['v1', 'v2'] },
+        });
+        vi.mocked(logger.info).mockClear();
+        await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+        expect(plainInfo()).toEqual(expect.arrayContaining([line('v1'), line('v2')]));
+
+        const stderr: string[] = [];
+        const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+          stderr.push(stripVTControlCharacters(String(chunk)));
+          return true;
+        });
+        vi.mocked(logger.info).mockClear();
+        try {
+          await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false, json: true });
+        } finally {
+          spy.mockRestore();
+        }
+        // fails-when: --json silences the stdout logger and the replacement goes unreported
+        expect(stderr).toEqual(expect.arrayContaining([`${line('v1')}\n`, `${line('v2')}\n`]));
+        expect(plainInfo().some((l) => l.includes('replaces the tag'))).toBe(false);
+      });
+
+      it('puts the overlay report into --json results', async () => {
+        await useRealJson();
+        createOverlayTarball.mockResolvedValue(reportingOverlay);
+        const parsed = await jsonStdout(() =>
+          runRemoteCommand('push-main', { kiciDir: '.kici', json: true }),
+        );
+        expect(parsed.results[0].overlay).toEqual(expectedReport);
+      });
+
+      it('puts the overlay report into --workflow --json results', async () => {
+        await useRealJson();
+        mockReadFile.mockResolvedValue(SCOPED_LOCK);
+        createOverlayTarball.mockResolvedValue(reportingOverlay);
+        const parsed = await jsonStdout(() =>
+          runRemoteCommand(undefined, { kiciDir: '.kici', workflow: 'w2', json: true }),
+        );
+        // fails-when: only runSingleFixture attaches overlay
+        expect(parsed.results[0].fixtureId).toBe('direct:w2');
+        expect(parsed.results[0].overlay).toEqual(expectedReport);
+      });
+
+      it('hands each programmatic run its own default git flags', async () => {
+        await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+        await runRemoteCommand('push-main', { kiciDir: '.kici', wait: false });
+        const tagsOf = (n: number) =>
+          (createOverlayTarball.mock.calls[n][1] as { git: { syntheticTags: string[] } }).git
+            .syntheticTags;
+        expect(tagsOf(0)).toEqual([]);
+        // fails-when: one module-level default array is shared, so a mutation by one run
+        // leaks into the next
+        expect(tagsOf(0)).not.toBe(tagsOf(1));
+      });
+
+      it('prints the same human-mode lines for a direct --workflow run, and no result document', async () => {
+        mockReadFile.mockResolvedValue(SCOPED_LOCK);
+        vi.mocked(logger.info).mockClear();
+        const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+        try {
+          const ok = await runRemoteCommand(undefined, {
+            kiciDir: '.kici',
+            workflow: 'w2',
+            wait: false,
+          });
+          expect(ok).toBe(true);
+          // fails-when: the human-mode direct run starts rendering a result document
+          expect(spy).not.toHaveBeenCalled();
+        } finally {
+          spy.mockRestore();
+        }
+        // fails-when: a change silently adds, drops or reorders a human-mode line
+        expect(plainInfo()).toEqual([
+          'Platform: https://platform.invalid',
+          'Organization: org_a',
+          'Running workflow "w2" directly (bypassing triggers)',
+          'Creating overlay tarball...',
+          'Running your local working tree over a checkout of your repository',
+          'Git: depth 1, default tags (default)',
+          'Workspace commit: abc123 (HEAD)',
+          '5 files changed, 2 new, 0 deleted (1 KB compressed)',
+          'Initializing upload...',
+          'Uploading overlay...',
+          'Run started: run-123',
+        ]);
+      });
+
+      it('fails before compiling on an invalid --tag', async () => {
+        const compileMod = await import('./compile.js');
+        const result = await runRemoteCommand('push-main', {
+          kiciDir: '.kici',
+          git: { commit: true, tags: ['a..b'] },
+        });
+        expect(result).toBe(false);
+        // fails-when: the tag is only checked once the overlay is being built
+        expect(compileMod.compileCommand).not.toHaveBeenCalled();
+        expect(createOverlayTarball).not.toHaveBeenCalled();
+        expect(logger.error).toHaveBeenCalledWith(
+          expect.stringContaining("--tag 'a..b' is not a valid tag name"),
+        );
+      });
     });
   });
 });

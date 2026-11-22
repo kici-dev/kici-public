@@ -207,7 +207,12 @@ async function groupChunkKeys(
   return groups;
 }
 
-/** One synchronous archive cycle for one adapter, instead of waiting for the hourly tick. */
+/**
+ * One synchronous archive cycle for one adapter, instead of waiting for the
+ * hourly tick. The cycle logs and counts a chunk it fails to write instead of
+ * throwing, so this throws after the summary when any row failed: the CLI then
+ * exits non-zero, and the rows stay in Postgres for the next cycle.
+ */
 async function archiveNow(
   side: ColdStoreAdminSide,
   opts: ColdStoreAdminStoreOpts & { table: string },
@@ -219,6 +224,11 @@ async function archiveNow(
     process.stdout.write(
       `archive-now ${opts.table}: tablesProcessed=${summary.tablesProcessed} chunksWritten=${summary.chunksWritten} rowsArchived=${summary.rowsArchived} rowsFailed=${summary.rowsFailed}\n`,
     );
+    if (summary.rowsFailed > 0) {
+      throw new Error(
+        `archive-now ${opts.table}: ${summary.rowsFailed} row(s) failed to archive and stay in Postgres; the "cold-store chunk archive failed" log lines name each chunk and its error`,
+      );
+    }
   });
 }
 

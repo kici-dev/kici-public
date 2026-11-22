@@ -7,7 +7,7 @@ The [event scaler backend](./event-scaler.md) drives cloud autoscaling through t
 
 ## Reserved event names
 
-The event scaler emits exactly two events:
+The event scaler emits only these events:
 
 - `kici.scaler.scale-up` — Emitted when the scaler decides to provision an agent.
 - `kici.scaler.scale-down` — Emitted when the scaler decides to tear an agent down.
@@ -49,7 +49,7 @@ A `kici.scaler.scale-down` event tells a teardown workflow which instance to del
 
 ### Teardown reasons
 
-The schema accepts six values. The orchestrator emits four of them:
+The orchestrator emits these values of the schema:
 
 - `shutdown` — The agent disconnected, so the orchestrator tore its provision down. A scaler-managed agent stops itself once it goes idle, so an ordinary teardown carries this reason.
 - `heartbeat-timeout` — The agent stopped sending heartbeats, or the coordinator holding it went away. The orchestrator sends it as soon as it drops a silent agent. It also drops an agent that does not acknowledge a dispatch, or whose token is revoked or expires, with the same reason. The orchestrator's sweep for stranded provisions sends it too.

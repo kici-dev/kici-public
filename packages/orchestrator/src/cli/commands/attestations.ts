@@ -5,7 +5,7 @@
  */
 import type { Command } from 'commander';
 import { createLogger, createPool } from '@kici-dev/shared';
-import { loadConfig } from '../../config.js';
+import { ConfigScope, loadConfig } from '../../config.js';
 import { createDb } from '../../db/client.js';
 import { createCacheStorage } from '../../storage/index.js';
 import type { CacheStorage } from '../../storage/types.js';
@@ -111,7 +111,7 @@ export function registerAttestationsCommands(
     .option('--yes', 'Skip the --all confirmation prompt')
     .action(
       cliAction(async (opts: { all?: boolean; databaseUrl?: string; yes?: boolean }) => {
-        const config = loadConfig();
+        const config = loadConfig(ConfigScope.enum.admin);
         const url = resolveDatabaseUrl(opts.databaseUrl ?? (config.databaseUrl || undefined));
         if (opts.all && !opts.yes) {
           const ok = await confirmPrompt(

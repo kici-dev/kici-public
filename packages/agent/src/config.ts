@@ -350,10 +350,12 @@ export const envDef = defineEnv({
 /**
  * Env vars the unknown-KICI_* validator tolerates **only** under `NODE_ENV=test`:
  * `KICI_SKIP_DB_TESTS` is the vitest Postgres harness opt-out
- * (`scripts/db-test-postgres.ts`), also in the orchestrator list. A production
- * boot with a stray one still fails the validator.
+ * (`scripts/db-test-postgres.ts`) and `KICI_SKIP_VISUAL_SNAPSHOTS` the dashboard
+ * component tests' pixel-comparison opt-out, both set by the public mirror's CI for
+ * every package's tests and both also in the orchestrator list. A production boot
+ * with a stray one still fails the validator.
  */
-const TEST_ONLY_ENV_VARS = ['KICI_SKIP_DB_TESTS'];
+const TEST_ONLY_ENV_VARS = ['KICI_SKIP_DB_TESTS', 'KICI_SKIP_VISUAL_SNAPSHOTS'];
 
 /**
  * Load and validate agent configuration from the `KICI_*` environment variables

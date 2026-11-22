@@ -23,6 +23,30 @@ describe('buildFixtureEvent', () => {
     expect(event.payload.after).toBe('feedface');
   });
 
+  it('push fixtures carry before = parentSha', () => {
+    const parentSha = 'fedcba9876543210fedcba9876543210fedcba98';
+    const event = buildFixtureEvent({ event: push() }, { ...HEAD, parentSha });
+    // fails-when: the parent is dropped, so the push names no range before..after
+    expect(event.payload.before).toBe(parentSha);
+    expect(event.payload.after).toBe(HEAD.sha);
+    // breaks-if-wrong: a head with no known parent sends no before rather than an empty one
+    expect(buildFixtureEvent({ event: push() }, HEAD).payload).not.toHaveProperty('before');
+    // A push-shaped payload of another event type is not a push range.
+    expect(
+      buildFixtureEvent({ event: schedule({ cron: '0 0 * * *' }) }, { ...HEAD, parentSha }).payload,
+    ).not.toHaveProperty('before');
+  });
+
+  it('a fixture sha suppresses before', () => {
+    const event = buildFixtureEvent(
+      { event: push(), sha: 'feedface' },
+      { ...HEAD, parentSha: 'fedcba9876543210fedcba9876543210fedcba98' },
+    );
+    // fails-when: the checkout's parent is paired with a commit the fixture pinned
+    expect(event.payload).not.toHaveProperty('before');
+    expect(event.payload.after).toBe('feedface');
+  });
+
   it("falls back to 'main' on a detached HEAD", () => {
     const event = buildFixtureEvent({ event: push() }, { sha: HEAD.sha });
     expect(event.payload.ref).toBe('refs/heads/main');

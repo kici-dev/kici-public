@@ -5,7 +5,7 @@
  *
  * Every command except `source-override` has two modes, as in `maintenance.ts`:
  * HTTP (default; `--url` + `--token`, /api/v1/admin/contexts), and direct-DB
- * when `--database-url` (or KICI_DATABASE_URL / DATABASE_URL) is set, which runs
+ * when `--database-url` (or KICI_DATABASE_URL) is set, which runs
  * the *Direct helpers of @kici-dev/shared so a setup script can seed contexts
  * before the orchestrator is up.
  */
@@ -28,6 +28,7 @@ import { warnIfContextUnbound } from './shared/unbound-context-warning.js';
 import {
   cliAction,
   resolveDirectDbUrl,
+  requireDbOnlyUrl,
   parseIntOption,
   DIRECT_DB_URL_FLAG,
   DIRECT_DB_URL_HELP,
@@ -456,11 +457,7 @@ export function registerContextCommands(program: Command, getClient: () => Admin
     .option('--json', 'Emit JSON output')
     .action(
       cliAction(async (opts) => {
-        const dbUrl = resolveDirectDbUrl(opts.databaseUrl);
-        if (!dbUrl) {
-          console.error('Error: --database-url or KICI_DATABASE_URL is required (direct-DB only)');
-          process.exit(1);
-        }
+        const dbUrl = requireDbOnlyUrl(opts.databaseUrl);
         const result = await purgeContextsDirect(dbUrl, opts.org);
         if (opts.json) {
           console.log(JSON.stringify(result));

@@ -8,6 +8,7 @@
 import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
 import type { CloneTokenProvider } from '@kici-dev/engine';
+import { githubOctokitOptions } from './github-host.js';
 
 /**
  * Configuration required for GitHub App authentication.
@@ -17,6 +18,11 @@ export interface GitHubAppConfig {
   appId: string;
   /** GitHub App private key (PEM format) */
   privateKey: string;
+  /**
+   * Web URL of the GitHub Enterprise Server the App lives on. Unset for a
+   * github.com App.
+   */
+  githubUrl?: string;
 }
 
 /**
@@ -26,9 +32,12 @@ export interface GitHubAppConfig {
  * App-level endpoints — `GET /app`, `GET /app/installations`, and the webhook
  * delivery endpoints under `/app/hook/deliveries` — accept only this
  * credential. Installation tokens are rejected there.
+ *
+ * The client talks to the App's own server (`config.githubUrl`).
  */
 export function createAppOctokit(config: GitHubAppConfig): Octokit {
   return new Octokit({
+    ...githubOctokitOptions(config.githubUrl),
     authStrategy: createAppAuth,
     auth: { appId: config.appId, privateKey: config.privateKey },
   });
@@ -50,8 +59,10 @@ export interface GitHubCredentials {
  *
  * Each call creates a new Octokit instance scoped to the specific installation.
  * The auth-app strategy handles token caching internally per Octokit instance.
+ * The Octokit passes its own request function to the strategy, so the
+ * installation token is minted at the same server the client calls.
  *
- * @param config - GitHub App credentials (appId + privateKey)
+ * @param config - GitHub App credentials (appId + privateKey) and its server
  * @param installationId - GitHub App installation ID for the target account/org
  * @returns Octokit instance with auto-refreshing installation tokens
  */
@@ -60,6 +71,7 @@ export function createInstallationOctokit(
   installationId: number,
 ): Octokit {
   return new Octokit({
+    ...githubOctokitOptions(config.githubUrl),
     authStrategy: createAppAuth,
     auth: {
       appId: config.appId,

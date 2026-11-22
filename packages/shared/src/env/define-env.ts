@@ -226,12 +226,25 @@ function extractDefault(field: ZodLike): string | undefined {
       // Zod 4 exposes a function default (`.default(() => randomUUID())`) as a
       // getter that calls it on every access, so two differing reads mark a
       // computed default; rendering it would make the docs non-deterministic.
-      // `typeof === 'function'` covers the Zod 3 shape.
+      // `typeof === 'function'` covers the Zod 3 shape. Zod 4 also returns a fresh
+      // copy of an array or object default on each read, so the two reads are
+      // compared by their rendered value, not by identity.
       const probe1 = def.defaultValue;
       const probe2 = def.defaultValue;
-      if (typeof probe1 === 'function' || probe1 !== probe2) return '"<computed>"';
+      // A Set or Map renders as `{}`, which would misstate the default.
+      if (typeof probe1 === 'function' || probe1 instanceof Set || probe1 instanceof Map) {
+        return '"<computed>"';
+      }
+      let rendered: string;
+      try {
+        rendered = JSON.stringify(probe1);
+        if (rendered !== JSON.stringify(probe2)) return '"<computed>"';
+      } catch {
+        // A value JSON cannot represent (a BigInt, a cyclic object).
+        return '"<computed>"';
+      }
       if (probe1 === '' || probe1 === undefined) return undefined;
-      return JSON.stringify(probe1);
+      return rendered;
     }
     if (def.in) {
       t = def.in;
@@ -432,6 +445,10 @@ function suggestClosest(name: string, candidates: string[]): string | undefined 
  *   (`hack/lib/vitest-isolation.ts`) so the CLI's `getConfigDir` avoids the
  *   ambient `~/.kici`; a real CLI var every test-spawned service inherits
  *   without reading it.
+ * - `KICI_TEST_RUN_DIR`, `KICI_TEST_RUN_ORIG_TMPDIR`,
+ *   `KICI_TEST_RUN_ORIG_KICI_TMPDIR`: the per-run temp folder the same vitest
+ *   harness creates (`hack/lib/test-run-dir.ts`) and the temp settings from
+ *   before it; every test-spawned service inherits them without reading them.
  * - `KICI_ORCHESTRATOR_TOKEN`: the `kici` CLI's credential for a direct
  *   orchestrator target, exported beside `KICI_ORCHESTRATOR_URL`; no service
  *   reads it, but a service started from that shell inherits it.
@@ -446,6 +463,9 @@ export const RESERVED_NON_SCHEMA_KICI_VARS: readonly string[] = [
   'KICI_DEV',
   'KICI_BUILD_COUNTER_NO_COMMIT',
   'KICI_CONFIG_DIR',
+  'KICI_TEST_RUN_DIR',
+  'KICI_TEST_RUN_ORIG_TMPDIR',
+  'KICI_TEST_RUN_ORIG_KICI_TMPDIR',
   'KICI_ORCHESTRATOR_TOKEN',
 ];
 

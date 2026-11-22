@@ -11,6 +11,14 @@ const { mockPipelineLogger } = vi.hoisted(() => {
   return { mockPipelineLogger };
 });
 
+// Calls through to the real handler; a test reads what it answered.
+const { handleApprovalCommentSpy } = vi.hoisted(() => ({ handleApprovalCommentSpy: vi.fn() }));
+vi.mock('../security/comment-handler.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../security/comment-handler.js')>();
+  handleApprovalCommentSpy.mockImplementation(actual.handleApprovalComment);
+  return { ...actual, handleApprovalComment: handleApprovalCommentSpy };
+});
+
 vi.mock('@kici-dev/shared', async (importOriginal) => {
   const original = (await importOriginal()) as Record<string, unknown>;
   return {
@@ -61,6 +69,7 @@ import { makeGateTracker } from './dispatch-matched-workflow.test-helpers.js';
 import { HeldRunStatus } from '../contexts/held-runs.js';
 import { lockFileFixture, lockWorkflow, staticJob } from '../__test-helpers__/lock-fixtures.js';
 import { mockExecutionTracker } from '../__test-helpers__/tracker.js';
+import { GitHubWebhookNormalizer } from '../providers/github/normalizer.js';
 
 // -- Mock helpers --
 
@@ -163,13 +172,12 @@ function createMockProviderBundle(): ProviderBundle {
         }
         return 'HEAD';
       }),
-      extractCredentials: vi.fn().mockImplementation((payload: unknown) => {
-        const p = payload as Record<string, unknown>;
-        const installation = p.installation as Record<string, unknown> | undefined;
-        const installationId =
-          installation && typeof installation.id === 'number' ? installation.id : null;
-        return { installationId };
-      }),
+      // The real GitHub credential extraction (installation id from the payload).
+      extractCredentials: vi
+        .fn()
+        .mockImplementation((payload: unknown) =>
+          new GitHubWebhookNormalizer().extractCredentials(payload),
+        ),
     },
     lockFileFetcher: {
       provider: 'github' as const,
@@ -4630,6 +4638,59 @@ describe('issue_comment /kici approve hold selection', () => {
     );
     // The org-wide list is never reached — it would return holds from every PR.
     expect(mockHeldRunStore.listByQueueType).not.toHaveBeenCalled();
+  });
+
+  /**
+   * A `/kici approve` delivered by a GitHub App source whose live config names
+   * `githubUrl` (github.com when unset). The delivery's credentials name another
+   * server, which must not count. The commenter's numeric id equals a github.com
+   * identity link's, with admin trust.
+   */
+  async function approveFromServer(githubUrl: string | undefined) {
+    const bundle: ProviderBundle = { ...commentBundle(), ...(githubUrl && { githubUrl }) };
+    (bundle.normalizer.extractCredentials as ReturnType<typeof vi.fn>).mockReturnValue({
+      installationId: 42,
+      githubUrl: 'https://evil.example',
+    });
+    const heldRunStore = { listPendingSecurityHoldsForPr: vi.fn().mockResolvedValue([]) };
+    const { identityLinks } = trustedCommenter();
+    const deps = createDeps({
+      db: { selectFrom: vi.fn() } as any,
+      heldRunStore: heldRunStore as any,
+      providerRegistry: createMockProviderRegistry(bundle),
+      identityLinks,
+      orgMemberPermissions: new Map([['user-1', 'admin' as const]]),
+    });
+    handleApprovalCommentSpy.mockClear();
+    await processWebhook(commentInfo(`delivery-${githubUrl ?? 'dotcom'}`), deps);
+    expect(handleApprovalCommentSpy).toHaveBeenCalledTimes(1);
+    return {
+      args: handleApprovalCommentSpy.mock.calls[0]![0] as { provider: string },
+      result: await handleApprovalCommentSpy.mock.results[0]!.value,
+      heldRunStore,
+    };
+  }
+
+  it('a GHES commenter does not match a github.com identity link with the same id', async () => {
+    const { args, result, heldRunStore } = await approveFromServer('https://ghe.corp.example');
+
+    expect(args.provider).toBe('github:ghe.corp.example');
+    // fails-when: GHES identities are matched against github.com links
+    expect(result).toEqual({ handled: false, reason: 'No identity link for commenter' });
+    // No hold is selected, so none can be released.
+    expect(heldRunStore.listPendingSecurityHoldsForPr).not.toHaveBeenCalled();
+  });
+
+  it('a github.com commenter still matches the github.com identity link', async () => {
+    const { args, heldRunStore } = await approveFromServer(undefined);
+
+    expect(args.provider).toBe('github');
+    // breaks-if-wrong: github.com comment approvals keep working
+    expect(heldRunStore.listPendingSecurityHoldsForPr).toHaveBeenCalledWith(
+      expect.any(String),
+      'myorg/myrepo',
+      5,
+    );
   });
 
   it('uses the resolved org ID (not __default__) for hold selection', async () => {

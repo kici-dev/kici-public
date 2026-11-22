@@ -1,4 +1,5 @@
 import pc from 'picocolors';
+import { ClientNewerThanPlatformError, platformFetch } from '../remote/platform-fetch.js';
 import { loadGlobalConfig, saveGlobalConfig, getConfigPath } from '../remote/config.js';
 import { planeStatus, detachPlane } from '../local-plane/plane-manager.js';
 
@@ -17,7 +18,7 @@ export async function logoutCommand(): Promise<boolean> {
   if (config.patId && config.platformEndpoint) {
     try {
       const url = `${config.platformEndpoint}/api/v1/pats/${config.patId}`;
-      const response = await fetch(url, {
+      const response = await platformFetch(url, {
         method: 'DELETE',
         headers: {
           Authorization: `Bearer ${config.pat}`,
@@ -32,9 +33,13 @@ export async function logoutCommand(): Promise<boolean> {
           pc.yellow('Warning: could not revoke PAT on server (will expire automatically).'),
         );
       }
-    } catch {
+    } catch (err) {
       console.log(
-        pc.yellow('Warning: could not revoke PAT on server (will expire automatically).'),
+        pc.yellow(
+          err instanceof ClientNewerThanPlatformError
+            ? `Warning: could not revoke PAT on server: ${err.message}`
+            : 'Warning: could not revoke PAT on server (will expire automatically).',
+        ),
       );
     }
   }

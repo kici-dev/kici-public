@@ -44,8 +44,6 @@ stale threshold = KICI_JOB_HEARTBEAT_INTERVAL_MS x KICI_STALE_DETECTOR_THRESHOLD
 
 With defaults: `60,000ms x 2 = 120,000ms (2 minutes)`.
 
-This means a job is considered stale if no heartbeat has been received for 2 minutes.
-
 ### Platform tier behaviour (informational)
 
 The Platform tier also performs stale-orchestrator detection: when an orchestrator disconnects from the Platform relay and does not reconnect within ~5 minutes, runs whose routing keys belong to that orchestrator are marked `failed`. This tier is not operator-configurable — its thresholds are managed by the hosted Platform.

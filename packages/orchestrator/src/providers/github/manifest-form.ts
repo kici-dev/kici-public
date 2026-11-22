@@ -6,6 +6,8 @@
  * same shapes.
  */
 
+import { DEFAULT_GITHUB_URL } from './github-host.js';
+
 function escapeHtml(s: string): string {
   return s
     .replace(/&/g, '&amp;')
@@ -15,10 +17,14 @@ function escapeHtml(s: string): string {
     .replace(/'/g, '&#39;');
 }
 
-export function manifestCreateUrl(githubOrg?: string): string {
+/** GitHub's create-from-manifest page, for an organization or the personal account. */
+export function manifestCreateUrl(
+  githubOrg?: string,
+  githubUrl: string = DEFAULT_GITHUB_URL,
+): string {
   return githubOrg
-    ? `https://github.com/organizations/${githubOrg}/settings/apps/new`
-    : 'https://github.com/settings/apps/new';
+    ? `${githubUrl}/organizations/${githubOrg}/settings/apps/new`
+    : `${githubUrl}/settings/apps/new`;
 }
 
 export function renderManifestFormHtml(opts: {

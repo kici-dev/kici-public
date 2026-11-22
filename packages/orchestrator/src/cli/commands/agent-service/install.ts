@@ -36,6 +36,7 @@ import { getInstallBase } from '../shared/versioned-upgrade.js';
 import { ENV_FILE_MODE } from '../shared/env-file-mode.js';
 import { copyFileSecurelySync, writeFileSecurelySync } from '../../../helpers/secure-write.js';
 import { cliAction } from '../shared/cli-action.js';
+import { imageRegistryOption, installImageRegistry } from '../shared/image-registry-option.js';
 
 interface InstallOptions {
   platform?: ServicePlatform;
@@ -51,6 +52,7 @@ interface InstallOptions {
   userLevel?: boolean;
   instanceDir?: string;
   force?: boolean;
+  imageRegistry?: string;
 }
 
 /** `--port` as a TCP port number; exits with an error for anything else. */
@@ -90,8 +92,9 @@ export function registerAgentInstall(agent: Command): void {
       'Deploy folder; the instance manifest is written here (default: current working directory)',
     )
     .option('--force', 'Overwrite an existing same-named foreign instance')
+    .addOption(imageRegistryOption())
     .action(
-      cliAction(async (opts: InstallOptions) => {
+      cliAction(async (opts: InstallOptions, command: Command) => {
         // A standalone kici-admin has no import.meta.resolve, so without --binary
         // it stops here, before the wizard or any file.
         const resolveModule: ModuleResolver | undefined =
@@ -106,12 +109,18 @@ export function registerAgentInstall(agent: Command): void {
         const port = parsePort(opts.port);
 
         const platform = detectPlatform(opts.platform as ServicePlatform | undefined);
+        const imageRegistry = installImageRegistry(
+          platform,
+          opts.imageRegistry,
+          command.getOptionValueSource('imageRegistry'),
+        );
         const userLevel = resolveUserLevel(opts);
         const serviceName = opts.name;
         const instanceDir = path.resolve(opts.instanceDir ?? process.cwd());
         const kiciRoot = kiciConfigRoot(userLevel);
 
         console.log(`Platform: ${platform}`);
+        if (imageRegistry) console.log(`Image registry: ${imageRegistry}`);
         console.log(`Privilege: ${userLevel ? 'user' : 'system'}`);
         console.log(`Service name: ${serviceName}`);
         console.log(`Instance dir: ${instanceDir}`);
@@ -219,6 +228,7 @@ export function registerAgentInstall(agent: Command): void {
           component: 'agent',
           instanceDir,
           restartPolicy: DEFAULT_RESTART_POLICY,
+          imageRegistry,
         };
 
         await manager.install(config);
@@ -237,6 +247,8 @@ export function registerAgentInstall(agent: Command): void {
           installBase: getInstallBase(platform, serviceName),
           createdAt: new Date().toISOString(),
           kiciVersion: readKiciVersion(),
+          // Always set for compose, so a re-install without the flag clears an earlier one.
+          ...(platform === 'compose' && { imageRegistry }),
         };
         const { file: manifestFile, warning: manifestWarning } = writeInstallManifest(
           instanceDir,

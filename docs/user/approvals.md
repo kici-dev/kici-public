@@ -113,7 +113,7 @@ export default workflow('release', {
 
 ### Job-level
 
-A job-level gate holds just that job; other jobs in the run proceed normally:
+A job-level gate holds only that job; other jobs in the run proceed normally:
 
 ```typescript
 job('publish', {
@@ -182,7 +182,7 @@ job('patch-prod', {
 
 Behavior:
 
-- The gate fires **only in apply mode**. In `--check` mode nothing applies, so nothing gates — drift is just reported.
+- The gate fires **only in apply mode**. In `--check` mode nothing applies, so nothing gates — drift is only reported.
 - **Approve** → the step's `run(ctx, drift)` applies the change.
 - **Reject** → fail-stop: the step fails, the job fails, and the `needs:` skip-cascade aborts everything downstream.
 

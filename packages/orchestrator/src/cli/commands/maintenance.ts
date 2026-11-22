@@ -8,7 +8,7 @@
  *
  * HTTP mode (default, `--url` + `--token`) goes through the admin API:
  * preferred while the orchestrator runs, for its structured logs and admin RBAC.
- * Direct-DB mode (`--database-url`, or KICI_DATABASE_URL / DATABASE_URL) runs
+ * Direct-DB mode (`--database-url`, or KICI_DATABASE_URL) runs
  * the SQL on its own pool, for cleanup while the orchestrator is deliberately
  * stopped, so a stale scoped secret cannot crash it on boot.
  */

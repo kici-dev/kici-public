@@ -10,7 +10,8 @@
  */
 
 import { Octokit } from '@octokit/rest';
-import { createAppOctokit, createInstallationOctokit } from './auth.js';
+import { createAppOctokit, createInstallationOctokit, type GitHubAppConfig } from './auth.js';
+import { githubOctokitOptions } from './github-host.js';
 
 export interface GithubManifestInput {
   /** App name shown on GitHub. */
@@ -121,16 +122,26 @@ export interface GithubAppCredentials {
   htmlUrl?: string;
 }
 
+/** Where the manifest code is exchanged. */
+export interface ManifestConversionOptions {
+  /**
+   * The GitHub web URL the App was created on (`--github-url`). Unset means
+   * github.com, whose API is api.github.com; a server's API is `<url>/api/v3`.
+   */
+  githubUrl?: string;
+}
+
 /**
  * Exchange the short-lived manifest `code` for the App's id, private key, and
- * webhook secret. Runs server-to-server directly against GitHub — the private
- * key never transits the Platform.
+ * webhook secret, on the API of the GitHub host the App was created on. Runs
+ * server-to-server directly against GitHub — the private key never transits
+ * the Platform.
  */
 export async function convertManifestCode(
   code: string,
-  deps: { octokit?: Pick<Octokit, 'request'> } = {},
+  deps: ManifestConversionOptions & { octokit?: Pick<Octokit, 'request'> } = {},
 ): Promise<GithubAppCredentials> {
-  const octokit = deps.octokit ?? new Octokit();
+  const octokit = deps.octokit ?? new Octokit(githubOctokitOptions(deps.githubUrl));
   const { data } = await octokit.request('POST /app-manifests/{code}/conversions', { code });
   const d = data as {
     id: number;
@@ -160,6 +171,9 @@ export async function convertManifestCode(
   };
 }
 
+/** What an App-authenticated call needs: the App id, its key and its server. */
+type GithubAppAuth = Pick<GitHubAppConfig, 'appId' | 'privateKey' | 'githubUrl'>;
+
 /** What `GET /app` says about the App: identity plus its grant. */
 export interface GithubAppIdentity {
   name: string;
@@ -181,7 +195,7 @@ export interface GithubAppIdentity {
  * `GET /app` returns, which is what keeps the dashboard name fresh.
  */
 export async function fetchGithubAppIdentity(
-  creds: Pick<GithubAppCredentials, 'appId' | 'privateKey'>,
+  creds: GithubAppAuth,
   deps: { appOctokit?: Pick<Octokit, 'request'> } = {},
 ): Promise<GithubAppIdentity> {
   const octokit = deps.appOctokit ?? createAppOctokit(creds);
@@ -209,7 +223,7 @@ const INSTALLATIONS_PAGE_SIZE = 100;
 
 /** Every installation of the App (`GET /app/installations`, all pages), as the App. */
 export async function listGithubAppInstallations(
-  creds: Pick<GithubAppCredentials, 'appId' | 'privateKey'>,
+  creds: GithubAppAuth,
   deps: { appOctokit?: Pick<Octokit, 'request'> } = {},
 ): Promise<GithubAppInstallationGrant[]> {
   const octokit = deps.appOctokit ?? createAppOctokit(creds);
@@ -309,7 +323,7 @@ export function hasRequirementGaps(gaps: GithubAppRequirementGaps): boolean {
  * returning the first installation's id + account login. Throws on timeout.
  */
 export async function waitForInstallation(
-  creds: Pick<GithubAppCredentials, 'appId' | 'privateKey'>,
+  creds: GithubAppAuth,
   opts: {
     timeoutMs: number;
     pollMs: number;
@@ -339,7 +353,7 @@ export async function waitForInstallation(
  * clone uses at runtime).
  */
 export async function verifyRepoAccess(
-  creds: Pick<GithubAppCredentials, 'appId' | 'privateKey'>,
+  creds: GithubAppAuth,
   installationId: number,
   deps: { octokit?: Pick<Octokit, 'request'> } = {},
 ): Promise<{ repoCount: number }> {

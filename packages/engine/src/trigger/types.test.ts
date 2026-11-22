@@ -18,8 +18,8 @@ describe('lock schema version window', () => {
 
   it('pins the current window (bump floor ONLY on a breaking schema change)', () => {
     // fails-when: the floor drops below 42 — a reader would accept locks compiled
-    // before the current schema — or the additive v44 bump moves the floor.
-    expect(SCHEMA_VERSION).toBe(44);
+    // before the current schema — or the additive v45 bump moves the floor.
+    expect(SCHEMA_VERSION).toBe(45);
     expect(BREAKING_FLOOR).toBe(42);
   });
 
@@ -71,8 +71,8 @@ describe('lock schema version window', () => {
 });
 
 describe('lock approval config', () => {
-  it('SCHEMA_VERSION is 44 (adds the apt init preset)', () => {
-    expect(SCHEMA_VERSION).toBe(44);
+  it('SCHEMA_VERSION is 45 (adds LockJob.checkoutOptions)', () => {
+    expect(SCHEMA_VERSION).toBe(45);
   });
 
   it('LockJob.init carries an apt preset', () => {

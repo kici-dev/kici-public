@@ -206,6 +206,20 @@ describe('executionStatusSchema logBytes', () => {
     expect(executionStatusSchema.parse(msg)).toEqual(msg);
   });
 
+  it('parses a frame with and without repoWebUrl, and keeps the field', () => {
+    const withServer = { ...validExecutionStatus, repoWebUrl: 'https://ghe.corp.example' };
+    // fails-when: the schema strips repoWebUrl, so the Platform never sees the server
+    expect(executionStatusSchema.parse(withServer)).toEqual(withServer);
+    // breaks-if-wrong: a frame without the field still parses
+    expect(executionStatusSchema.parse(validExecutionStatus)).not.toHaveProperty('repoWebUrl');
+    expect(() =>
+      executionStatusSchema.parse({
+        ...validExecutionStatus,
+        repoWebUrl: 'x'.repeat(STATUS_ID_MAX + 1),
+      }),
+    ).toThrow();
+  });
+
   it('bounds the trigger-actor username length', () => {
     expect(() =>
       executionStatusSchema.parse({

@@ -54,6 +54,7 @@ How KiCI packages are distributed and deployed. Covers the distribution channels
 - [Service installation guide](./distribution/service-installation.md) -- systemd, launchd, service management
 - [KiCI packaging guide](./distribution/sea-binaries.md) -- download, verify and run the standalone packages
 - [Release artifacts](./distribution/release-artifacts.md) -- manifest-list digests and npm integrity for the current release
+- [Licensing FAQ](./licensing.md) -- what each license lets you do with the packages you run and redistribute
 
 ## Operations
 

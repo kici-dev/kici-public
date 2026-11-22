@@ -135,7 +135,7 @@ function getRestartMode(config: ServiceConfig): string {
  * (`quay.io/kici-dev/kici-<component>:<version>@sha256:<digest>`, whatever the
  * service is named), falling back to the mutable `:latest` tag only when no
  * recorded digest ships with this package. Quay is the only registry the KiCI
- * images are published to.
+ * images are published to; `config.imageRegistry` names a mirror of it.
  */
 function generateComposeYaml(config: ServiceConfig): string {
   const restartMode = getRestartMode(config);
@@ -147,7 +147,7 @@ function generateComposeYaml(config: ServiceConfig): string {
     '',
     'services:',
     `  ${config.name}:`,
-    `    image: ${resolveImageRef(image)}`,
+    `    image: ${resolveImageRef(image, { registry: config.imageRegistry })}`,
     `    container_name: ${config.name}`,
     `    restart: ${restartMode}`,
     `    stop_grace_period: ${shutdownGraceSeconds(config)}s`,

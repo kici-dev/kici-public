@@ -17,13 +17,30 @@ import type { Role } from './rbac.js';
 const hashToken = sha256;
 
 /**
+ * How often a token's last_used_at is written. A client that polls validates
+ * one token several times a second; one write per validation queues on that
+ * row's lock whenever a commit is slow, and each queued write holds a pool
+ * connection until it lands or hits the statement timeout. A minute is ample
+ * resolution for "when was this token last used".
+ */
+export const LAST_USED_AT_INTERVAL_MS = 60_000;
+
+/**
  * Manages admin API tokens for the secrets management system.
  *
  * Tokens are 32-byte random hex strings (64 chars). Only the SHA-256
  * hash is stored; the plaintext is returned once at generation time.
  */
 export class TokenManager {
-  constructor(private readonly db: Kysely<Database>) {}
+  /** Token id → when this process last started its last_used_at write. */
+  private readonly lastTouchStartedAt = new Map<string, number>();
+  /** Token ids whose last_used_at write has not settled yet. */
+  private readonly touchesInFlight = new Set<string>();
+
+  constructor(
+    private readonly db: Kysely<Database>,
+    private readonly now: () => number = Date.now,
+  ) {}
 
   /**
    * Generate a new admin API token.
@@ -67,7 +84,9 @@ export class TokenManager {
   /**
    * Validate a plaintext token against stored hashes.
    *
-   * On success, fires a non-blocking update to last_used_at.
+   * On success, fires a non-blocking update to last_used_at, at most once per
+   * {@link LAST_USED_AT_INTERVAL_MS} per token and never while the previous one
+   * is still running.
    *
    * @returns Token info if valid, null if invalid/expired/revoked.
    */
@@ -90,18 +109,7 @@ export class TokenManager {
 
     if (!row) return null;
 
-    // Fire-and-forget last_used_at update. A best-effort bookkeeping write must
-    // not fail an authentication that already succeeded -- the row was found and
-    // the credential is valid. Mirrors agent/token-store.ts, which does the same
-    // for agent tokens' last_seen_at.
-    this.db
-      .updateTable('admin_tokens')
-      .set({ last_used_at: sql`now()` })
-      .where('id', '=', row.id)
-      .execute()
-      .catch(() => {
-        // Intentionally swallowed -- last_used_at is best-effort
-      });
+    this.touchLastUsedAt(row.id);
 
     return {
       id: row.id,
@@ -110,6 +118,29 @@ export class TokenManager {
       label: row.label,
       subject: row.subject ?? null,
     };
+  }
+
+  /**
+   * Fire-and-forget last_used_at write. A best-effort bookkeeping write must not
+   * fail an authentication that already succeeded: the row was found and the
+   * credential is valid.
+   */
+  private touchLastUsedAt(tokenId: string): void {
+    if (this.touchesInFlight.has(tokenId)) return;
+    const now = this.now();
+    const last = this.lastTouchStartedAt.get(tokenId);
+    if (last !== undefined && now - last < LAST_USED_AT_INTERVAL_MS) return;
+    this.lastTouchStartedAt.set(tokenId, now);
+    this.touchesInFlight.add(tokenId);
+    this.db
+      .updateTable('admin_tokens')
+      .set({ last_used_at: sql`now()` })
+      .where('id', '=', tokenId)
+      .execute()
+      .catch(() => {
+        // Intentionally swallowed -- last_used_at is best-effort
+      })
+      .finally(() => this.touchesInFlight.delete(tokenId));
   }
 
   async revokeToken(tokenId: string): Promise<void> {

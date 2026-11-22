@@ -6,6 +6,25 @@ vi.mock('node:child_process', () => ({
   execFile: (...args: unknown[]) => mockExecFile(...args),
 }));
 
+const logged = vi.hoisted(() => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+  debug: vi.fn(),
+  error: vi.fn(),
+}));
+vi.mock('@kici-dev/core', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@kici-dev/core')>()),
+  createLogger: () => logged,
+}));
+
+// Identity by default, so the command strings below read `nft …` on any host;
+// a test that checks the resolution wiring overrides it once.
+const mockResolve = vi.fn((name: string) => name);
+vi.mock('./system-binary.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./system-binary.js')>()),
+  resolveSystemBinary: (name: string) => mockResolve(name),
+}));
+
 const {
   buildIsolationRuleOps,
   parseRuleHandles,
@@ -347,6 +366,36 @@ describe('listForwardRules identifier extraction', () => {
     nftFails('No such file or directory');
     await expect(listForwardRules()).resolves.toEqual([]);
   });
+
+  /** Make every `nft` invocation exit 1 with `stderr`, as Node's execFile reports it. */
+  function nftExits1(stderr: string): void {
+    mockExecFile.mockImplementation(
+      (_cmd: string, _args: string[], _opts: unknown, cb: (e: Error | null) => void) =>
+        cb(Object.assign(new Error(`Command failed\n${stderr}`), { code: 1, stderr })),
+    );
+  }
+
+  it('reads a chain that does not exist yet as empty, without a warning', async () => {
+    // fails-when: every failed read warns, so each fresh-host provision logs
+    // "Failed to list forward rules … No such file or directory".
+    logged.warn.mockClear();
+    nftExits1('Error: No such file or directory\nlist chain ip kici forward\n');
+    await expect(listForwardRules()).resolves.toEqual([]);
+    expect(logged.warn).not.toHaveBeenCalled();
+  });
+
+  it('still warns when nft cannot read the chain for another reason', async () => {
+    // breaks-if-wrong: a permission failure or a missing nft binary must stay
+    // visible, or a host that never sweeps reads as a clean one.
+    logged.warn.mockClear();
+    nftExits1('Error: Operation not permitted (you must be root)\n');
+    await expect(listForwardRules()).resolves.toEqual([]);
+    expect(logged.warn).toHaveBeenCalledTimes(1);
+    logged.warn.mockClear();
+    nftFails('spawn nft ENOENT');
+    await expect(listForwardRules()).resolves.toEqual([]);
+    expect(logged.warn).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('parseRuleHandles identifier boundaries', () => {
@@ -626,6 +675,16 @@ describe('probeNftables', () => {
     expect(mockExecFile.mock.calls[0]!.slice(0, 2)).toEqual(['nft', ['list', 'tables']]);
   });
 
+  it('runs the resolved nft path, so a PATH without /usr/sbin still reaches it', async () => {
+    // fails-when: nft() spawns the bare name — `spawn nft ENOENT` on a non-root
+    // host whose PATH leaves out /usr/sbin.
+    mockResolve.mockReturnValueOnce('/usr/sbin/nft');
+    nftReturns('');
+    expect(await probeNftables()).toBeNull();
+    expect(mockResolve).toHaveBeenCalledWith('nft');
+    expect(mockExecFile.mock.calls[0]!.slice(0, 2)).toEqual(['/usr/sbin/nft', ['list', 'tables']]);
+  });
+
   it('runs the probe through sudo -n when requireSudo is set', async () => {
     // fails-when: the probe ignores requireSudo and execs a bare nft, so a
     // non-root orchestrator with a sudoers rule is refused at load.
@@ -656,8 +715,8 @@ describe('validateNftablesAvailability', () => {
   it('names a missing binary', async () => {
     nftFails('spawn nft ENOENT');
     await expect(validateNftablesAvailability()).rejects.toThrow(
-      'nftables binary not found at /usr/sbin/nft. ' +
-        'The orchestrator container image must include nftables (apk add nftables). ' +
+      'nftables binary not found: no nft on PATH or in /usr/local/sbin, /usr/sbin, /sbin. ' +
+        'Install the nftables package on this host or in this image. ' +
         'Network isolation for agents cannot be established without nftables.',
     );
   });

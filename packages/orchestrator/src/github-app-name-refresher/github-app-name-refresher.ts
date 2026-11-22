@@ -29,6 +29,8 @@ import {
   type GithubAppInstallationGrant,
   type GithubAppRequirementGaps,
 } from '../providers/github/manifest.js';
+import type { GitHubAppConfig } from '../providers/github/auth.js';
+import { githubAppConfigOf } from '../sources/github-source-config.js';
 
 const logger = createLogger({ prefix: 'github-app-name-refresher' });
 
@@ -49,6 +51,8 @@ export interface RefreshableSourceStore {
     // already-parsed object on read; only the write path stringifies it. Type it
     // as either so the parse below stays honest.
     config: string | Record<string, unknown>;
+    /** The GitHub Enterprise Server web URL; NULL for github.com. */
+    github_url: string | null;
     privateKey: string;
   } | null>;
   updateSource(
@@ -58,16 +62,12 @@ export interface RefreshableSourceStore {
 }
 
 /** Fetch a GitHub App's authoritative identity. Matches `fetchGithubAppIdentity`. */
-export type FetchGithubAppIdentity = (creds: {
-  appId: string;
-  privateKey: string;
-}) => Promise<GithubAppIdentity>;
+export type FetchGithubAppIdentity = (creds: GitHubAppConfig) => Promise<GithubAppIdentity>;
 
 /** List a GitHub App's installations. Matches `listGithubAppInstallations`. */
-export type FetchGithubAppInstallations = (creds: {
-  appId: string;
-  privateKey: string;
-}) => Promise<GithubAppInstallationGrant[]>;
+export type FetchGithubAppInstallations = (
+  creds: GitHubAppConfig,
+) => Promise<GithubAppInstallationGrant[]>;
 
 /** Outcome of a single source refresh: the name and slug sync plus the requirement gaps. */
 export interface RefreshResult extends GithubAppRequirementGaps {
@@ -106,10 +106,8 @@ export async function refreshResolvedGithubSource(
       `Source ${row.routing_key} has no stored credentials to authenticate with GitHub.`,
     );
   }
-  const config = (
-    typeof withSecrets.config === 'string' ? JSON.parse(withSecrets.config) : withSecrets.config
-  ) as { appId: string };
-  const creds = { appId: config.appId, privateKey: withSecrets.privateKey };
+  // The App's own server answers for it: a GitHub Enterprise Server App is read there.
+  const creds = githubAppConfigOf({ ...withSecrets, routing_key: row.routing_key });
   const identity = await fetchIdentity(creds);
 
   const changed = identity.name !== row.name || identity.slug !== row.slug;
